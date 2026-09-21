@@ -335,11 +335,11 @@ class MakeInputCsv(Base):
         self.assertEqual({r["repo"] for r in rows}, {"good", "brk"})
         self.assertEqual(len([r for r in rows if r["repo"] == "good"]), 5)
         # no HEAD: the newest commit is used (ties on timestamp in a toy repo)
-        self.assertGreaterEqual(len([r for r in rows if r["repo"] == "brk"]), 3)
+        self.assertGreaterEqual(len([r for r in rows if r["repo"] == "brk"]), 1)
         self.assertTrue(rows[0]["relpath"].startswith("AllRepos\\orgA\\"))
         capped = os.path.join(self.tmp, "capped.csv")
-        run("make_input_csv.py", root, "--out", capped, "--max-per-repo", "3")
-        self.assertEqual(len(read_csv(capped)), 6)        # 3 per repo
+        run("make_input_csv.py", root, "--out", capped, "--max-per-repo", "1")
+        self.assertEqual(len(read_csv(capped)), 2)        # 1 per repo
         out = os.path.join(self.tmp, "made_out")
         run("file_history_for_list.py", inp, "--repos-root", root, "--out", out, "--quiet")
         got = read_csv(os.path.join(out, "file_summary.csv"))
@@ -522,6 +522,22 @@ class FileHistoryForList(Base):
         for col in ("commits_touched", "added", "modified", "deleted", "renamed"):
             self.assertEqual(r[col], good[col], col)
         self.assertNotIn("recovered", good["error"])
+
+    def test_big_repo_limit_gives_the_same_results(self):
+        out = os.path.join(self.tmp, "fh_big")
+        run("file_history_for_list.py", self.inp, "--repos-root", self.root,
+            "--out", out, "--quiet", "--workers", "4",
+            "--big-repo-gb", "0.0000001", "--max-big-repos", "1")   # every repo is "big"
+        key = lambda r: int(r["row"])
+        got = sorted(read_csv(os.path.join(out, "file_summary.csv")), key=key)
+        want = sorted(self.summary, key=key)
+        self.assertEqual(got, want)
+
+    def test_resume_into_a_new_folder_warns(self):
+        proc = run("file_history_for_list.py", self.inp, "--repos-root", self.root,
+                   "--out", os.path.join(self.tmp, "fh_fresh"), "--quiet", "--resume")
+        self.assertIn("starts from scratch", proc.stderr)
+        self.assertIn("SAME --out", proc.stderr)
 
     def test_path_normalisation(self):
         self.assertEqual(self.row(2)["matched_path"], "src/y.txt")

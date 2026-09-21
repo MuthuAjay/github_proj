@@ -109,6 +109,9 @@ def _spawn(cmd, **kw):
     return proc
 
 
+spawn = _spawn          # public name: a Popen registered with the thread's job
+
+
 class _Done:
     def __init__(self, returncode, stdout, stderr):
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
@@ -586,7 +589,8 @@ def _parse_log_record(part):
     return sha, changes
 
 
-def changes_from_git(repo, revs, since, until, limit, stdin_file=None):
+def changes_from_git(repo, revs, since, until, limit, stdin_file=None,
+                     oldest_first=True):
     """(sha, changes) per commit, oldest first (parents before children),
     streamed from ONE `git log` over the object store - no commit folders, no
     file content. Merges are diffed against their first parent and renames are
@@ -595,7 +599,8 @@ def changes_from_git(repo, revs, since, until, limit, stdin_file=None):
     # no usable refs, where --all would find nothing)
     cmd = GIT + ["-C", repo, "log"] + (["--stdin"] if stdin_file else
                                        revs if revs else ["--all", "--reflog"])
-    cmd += ["--topo-order", "--reverse", "--raw", "-z", "-M", "--no-abbrev",
+    cmd += ["--topo-order"] + (["--reverse"] if oldest_first else [])
+    cmd += ["--raw", "-z", "-M", "--no-abbrev",
             "--diff-merges=first-parent", "--format=%x1e%H"]
     if since:
         cmd.append("--since=" + since)

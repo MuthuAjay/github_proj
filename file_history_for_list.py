@@ -91,7 +91,7 @@ from contextlib import nullcontext
 from explore_input_csv import detect_delimiter, is_repo_dir
 from extract_commits import (GIT, Progress, bind_job, branch_membership,
                              changes_from_git, commit_metadata, live_refs,
-                             run_tracked)
+                             run_tracked, spawn)
 
 SUMMARY_HEADER = ["row", "org", "repo", "relpath", "filename", "sha256",
                   "matched_path", "status", "present_at_head",
@@ -122,6 +122,7 @@ class RepoJob:
         self.start, self.phase = None, "queued"
         self.expired = False
         self.warned = False
+        self.big = False
         self._procs, self._lock = [], threading.Lock()
 
     def register(self, proc):
@@ -141,6 +142,17 @@ class RepoJob:
 
     def elapsed(self):
         return time.time() - self.start if self.start else 0.0
+
+
+def pack_bytes(repo_path):
+    """Size of the repo's pack files: a cheap stand-in for how heavy it is."""
+    gitdir = os.path.join(repo_path, ".git")
+    pack = os.path.join(gitdir if os.path.isdir(gitdir) else repo_path, "objects", "pack")
+    try:
+        with os.scandir(pack) as it:
+            return sum(e.stat().st_size for e in it if e.is_file())
+    except OSError:
+        return 0
 
 
 def fmt_dur(sec):
@@ -245,18 +257,24 @@ class RecoveredRepo:
                 text = fh.read().strip()
             if text.startswith("ref: ") or re.fullmatch(r"[0-9a-f]{40}", text):
                 shutil.copy(head, os.path.join(self.tmp, "HEAD"))
-        out = run_tracked(
-            GIT + ["-C", self.tmp, "cat-file", "--batch-all-objects",
-                   "--batch-check=%(objectname) %(objecttype)"])
-        if out.returncode != 0:
-            raise RuntimeError("cannot read objects: "
-                               + out.stderr.decode("utf-8", "replace")[:200])
+        # Stream the object list and keep only the commits: a big repo has
+        # millions of objects, and --unordered is much faster than sorted output.
         self.revs = os.path.join(self.tmp, "revs.txt")
-        with open(self.revs, "w") as fh:
-            for line in out.stdout.decode("ascii", "replace").splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[1] == "commit":
-                    fh.write(parts[0] + "\n")
+        with tempfile.TemporaryFile() as err:
+            proc = spawn(GIT + ["-C", self.tmp, "cat-file", "--batch-all-objects",
+                                "--unordered",
+                                "--batch-check=%(objectname) %(objecttype)"],
+                         stdout=subprocess.PIPE, stderr=err)
+            with open(self.revs, "w") as fh:
+                for raw in proc.stdout:
+                    parts = raw.split()
+                    if len(parts) == 2 and parts[1] == b"commit":
+                        fh.write(parts[0].decode("ascii") + "\n")
+            proc.wait()
+            if proc.returncode != 0:
+                err.seek(0)
+                raise RuntimeError("cannot read objects: "
+                                   + err.read().decode("utf-8", "replace")[:200])
         return self
 
     def add_all_commits_as_refs(self):
@@ -354,21 +372,18 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
         wanted = {c for *_x, cands in prepared for c in cands}
 
         job.phase = "reading renames (pass 1/2)"
-        # pass 1: rename edges (new path -> old paths), so a wanted file's
-        # earlier names are tracked in pass 2
-        edges = defaultdict(set)
-        for _sha, changes in changes_from_git(gp, [], None, None, None, feed):
+        # pass 1: walk newest first (children before parents); whenever a
+        # tracked path was created by a rename, its old name is tracked too.
+        # Nothing but the tracked set is kept, so memory stays small even for
+        # repos with millions of renames.
+        track = set(wanted)
+        for _sha, changes in changes_from_git(gp, [], None, None, None, feed,
+                                              oldest_first=False):
             for c in changes:
-                if c["status"][:1] == "R" and c["old_path"]:
-                    edges[c["path"]].add(c["old_path"])
-        track, stack = set(wanted), list(wanted)
-        while stack:
-            for old in edges.get(stack.pop(), ()):
-                if old not in track:
-                    track.add(old)
-                    stack.append(old)
+                if (c["status"][:1] == "R" and c["old_path"]
+                        and c["path"] in track):
+                    track.add(c["old_path"])
 
-        job.phase = "reading history (pass 2/2)"
         # pass 2: oldest first, keep only tracked paths; a rename moves the
         # old name's record onto the new name
         recs, needed = {}, set()
@@ -528,6 +543,13 @@ def main():
     ap.add_argument("--history", action="store_true",
                     help="also write file_history.csv (one row per change to "
                          "each matched file)")
+    ap.add_argument("--big-repo-gb", type=float, default=1.0, metavar="GB",
+                    help="a repo whose pack files total at least this much counts "
+                         "as big (default 1)")
+    ap.add_argument("--max-big-repos", type=int, default=0, metavar="N",
+                    help="run at most N big repos at the same time, so that "
+                         "several huge repos cannot exhaust memory (default 0 = "
+                         "one quarter of --workers, at least 1)")
     ap.add_argument("--repo-timeout", type=float, default=0, metavar="SECONDS",
                     help="give up on a repo that runs longer than this: its git "
                          "processes are killed, its rows get status `timeout` "
@@ -560,6 +582,10 @@ def main():
     if resuming and os.path.exists(done_path):
         with open(done_path, encoding="utf-8") as fh:
             done = {tuple(ln.rstrip("\n").split("\t")) for ln in fh if ln.strip()}
+    if args.resume and not resuming:
+        print("warning: --resume given but %s does not exist, so this starts from "
+              "scratch. --resume only continues an earlier run in the SAME --out "
+              "folder." % sum_path, file=sys.stderr)
     mode = "a" if resuming else "w"
     out_cols = CORE_COLUMNS + (DETAIL_COLUMNS if args.details else [])
     pick = [SUMMARY_HEADER.index(c) for c in out_cols]
@@ -596,12 +622,33 @@ def main():
         repos_done = len(done)
         timed_out, interrupted = [], False
 
+        max_big = args.max_big_repos or max(1, args.workers // 4)
+        big_bytes = args.big_repo_gb * 1024 ** 3
+        deferred = []                   # big repos waiting for a free big slot
+
+        def next_repo():
+            big_running = sum(1 for j in jobs.values() if j.big)
+            while True:
+                key = next(todo_iter, None)
+                if key is None:
+                    break
+                if pack_bytes(os.path.join(args.repos_root, *key)) >= big_bytes:
+                    if big_running < max_big:
+                        return key, True
+                    deferred.append(key)
+                    continue
+                return key, False
+            if deferred and big_running < max_big:
+                return deferred.pop(0), True
+            return None, False
+
         def submit_next():              # keep the queue short: 2 repos per worker
             while len(jobs) < args.workers * 2:
-                key = next(todo_iter, None)
+                key, big = next_repo()
                 if key is None:
                     return
                 job = RepoJob(key[0], key[1], len(groups[key]))
+                job.big = big
                 jobs[pool.submit(process_repo, args.repos_root, key[0], key[1],
                                  groups[key], args.history, args.details,
                                  job)] = job
@@ -619,7 +666,9 @@ def main():
 
         try:
             submit_next()
-            while jobs:
+            while jobs or deferred:
+                if not jobs:
+                    submit_next()
                 finished, _ = wait(list(jobs), timeout=1, return_when=FIRST_COMPLETED)
                 for fut in finished:
                     job = jobs.pop(fut)
