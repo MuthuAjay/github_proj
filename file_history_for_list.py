@@ -35,6 +35,9 @@ status is one of:
                       present_at_head = no); the new name's history includes it
   repo_missing        <repos-root>/<org>/<repo> is not a git repo
   repo_error          git failed on that repo (message in `error`)
+  timeout             the repo ran past --repo-timeout and was abandoned; the
+                      phase it was in is in `error`, and it is listed in
+                      timed_out_repos.tsv
   bad_row             org or repo blank, or no usable path
 
 first_seen / first_commit is the earliest commit of the file by real (UTC) commit
@@ -59,6 +62,11 @@ relpath/filename. Backslashes, a leading "./" or "/" and doubled slashes are
 normalised; if the path is not found and starts with "<repo>/", the path
 without that prefix is tried as well.
 
+While it runs, the bar shows how many repos are in flight and the slowest one
+with its current phase; a repo running longer than --warn-after seconds also
+gets its own SLOW line. Ctrl+C once stops cleanly (running git processes are
+killed, finished repos stay saved) - rerun with --resume.
+
 Usage:
     python file_history_for_list.py input.tsv --repos-root /data/workarea/archive \\
         --out out_dir --workers 8
@@ -73,15 +81,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import nullcontext
 
 from explore_input_csv import detect_delimiter, is_repo_dir
-from extract_commits import (GIT, Progress, branch_membership,
-                             changes_from_git, commit_metadata, live_refs)
+from extract_commits import (GIT, Progress, bind_job, branch_membership,
+                             changes_from_git, commit_metadata, live_refs,
+                             run_tracked)
 
 SUMMARY_HEADER = ["row", "org", "repo", "relpath", "filename", "sha256",
                   "matched_path", "status", "present_at_head",
@@ -101,6 +111,42 @@ HISTORY_HEADER = ["org", "repo", "path", "commit", "commit_date", "author",
                   "subject", "status", "nth_change", "old_path", "old_blob",
                   "new_blob"]
 DONE_FILE = ".done_repos"
+
+
+class RepoJob:
+    """Bookkeeping for one repo being processed: when it started, which phase
+    it is in, and its live git processes, so a watchdog can kill them."""
+
+    def __init__(self, org, repo, rows):
+        self.org, self.repo, self.rows = org, repo, rows
+        self.start, self.phase = None, "queued"
+        self.expired = False
+        self.warned = False
+        self._procs, self._lock = [], threading.Lock()
+
+    def register(self, proc):
+        with self._lock:
+            self._procs = [p for p in self._procs if p.poll() is None] + [proc]
+            if self.expired:
+                proc.kill()
+
+    def kill(self):
+        with self._lock:
+            self.expired = True
+            for p in self._procs:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+    def elapsed(self):
+        return time.time() - self.start if self.start else 0.0
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    return "%dm%02ds" % (sec // 60, sec % 60) if sec < 3600 else \
+        "%dh%02dm" % (sec // 3600, sec % 3600 // 60)
 
 
 def full_path(rel, fname, org="", repo="", strip_root=True):
@@ -145,9 +191,8 @@ def candidates(path, repo, raw=""):
 
 def head_paths(repo_path):
     """Set of paths in HEAD's tree, or None if HEAD can't be resolved."""
-    proc = subprocess.run(GIT + ["-C", repo_path, "ls-tree", "-r", "-z",
-                                 "--name-only", "HEAD"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = run_tracked(GIT + ["-C", repo_path, "ls-tree", "-r", "-z",
+                              "--name-only", "HEAD"])
     if proc.returncode != 0:
         return None
     return set(proc.stdout.decode("utf-8", "surrogateescape").split("\0")) - {""}
@@ -184,8 +229,8 @@ class RecoveredRepo:
         if not os.path.isdir(objects):
             raise RuntimeError("no objects/ directory in %s" % gitdir)
         self.tmp = tempfile.mkdtemp(prefix="fhl_")
-        subprocess.run(GIT + ["init", "--bare", "-q", self.tmp], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if run_tracked(GIT + ["init", "--bare", "-q", self.tmp]).returncode != 0:
+            raise RuntimeError("git init failed")
         with open(os.path.join(self.tmp, "objects", "info", "alternates"), "w") as fh:
             fh.write(os.path.abspath(objects) + "\n")
         if os.path.isdir(os.path.join(gitdir, "refs")):
@@ -200,10 +245,9 @@ class RecoveredRepo:
                 text = fh.read().strip()
             if text.startswith("ref: ") or re.fullmatch(r"[0-9a-f]{40}", text):
                 shutil.copy(head, os.path.join(self.tmp, "HEAD"))
-        out = subprocess.run(
+        out = run_tracked(
             GIT + ["-C", self.tmp, "cat-file", "--batch-all-objects",
-                   "--batch-check=%(objectname) %(objecttype)"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                   "--batch-check=%(objectname) %(objecttype)"])
         if out.returncode != 0:
             raise RuntimeError("cannot read objects: "
                                + out.stderr.decode("utf-8", "replace")[:200])
@@ -214,6 +258,24 @@ class RecoveredRepo:
                 if len(parts) == 2 and parts[1] == "commit":
                     fh.write(parts[0] + "\n")
         return self
+
+    def add_all_commits_as_refs(self):
+        """Give every commit object a ref (refs/recovered/<sha>) in packed-refs
+        so that plain `git log --all` walks the whole store; used by callers
+        that run several separate git commands against one recovered repo."""
+        packed = os.path.join(self.tmp, "packed-refs")
+        keep = []
+        if os.path.isfile(packed):
+            with open(packed, encoding="utf-8", errors="replace") as fh:
+                keep = [ln.rstrip("\n") for ln in fh if not ln.startswith("#")]
+        with open(self.revs) as fh:
+            shas = [ln.strip() for ln in fh if ln.strip()]
+        with open(packed, "w") as fh:
+            fh.write("# pack-refs with: peeled fully-peeled\n")
+            for ln in keep:
+                fh.write(ln + "\n")
+            for sha in shas:
+                fh.write("%s refs/recovered/%s\n" % (sha, sha))
 
     def __exit__(self, *exc):
         if self.tmp:
@@ -235,11 +297,10 @@ def commit_dates(repo_path, shas, chunk=4000):
     commit messages (all that the default output needs)."""
     out = {}
     for i in range(0, len(shas), chunk):
-        proc = subprocess.run(
+        proc = run_tracked(
             GIT + ["-C", repo_path, "log", "--no-walk", "--stdin",
                    "--format=%H%x1f%cI"],
-            input="\n".join(shas[i:i + chunk]).encode(),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            input="\n".join(shas[i:i + chunk]).encode())
         if proc.returncode != 0:
             raise RuntimeError("git log failed: "
                                + proc.stderr.decode("utf-8", "replace")[:300])
@@ -255,10 +316,14 @@ def new_rec():
             "first_sha": "", "last_sha": "", "last_type": "", "hist": []}
 
 
-def process_repo(root, org, repo, rows, want_history=False, details=False):
+def process_repo(root, org, repo, rows, want_history=False, details=False,
+                 job=None):
     """-> (summary_rows, history_rows) for one repo. `rows` is a list of
     (rowno, relpath, filename, sha256)."""
     rp = os.path.join(root, org, repo)
+    job = job or RepoJob(org, repo, len(rows))
+    job.start = time.time()
+    bind_job(job)
     prepared = []
     for rowno, rel, fname, sha in rows:
         p = full_path(rel, fname, org, repo)
@@ -277,15 +342,18 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
 
     if not is_repo_dir(rp):
         return blank_rows("repo_missing")
+    job.phase = "opening repo"
     recovery = None if git_can_open(rp) else RecoveredRepo(rp)
     try:
         if recovery:
+            job.phase = "recovering repo (listing objects)"
             recovery.__enter__()
             gp, feed = recovery.tmp, recovery.revs
         else:
             gp, feed = rp, None
         wanted = {c for *_x, cands in prepared for c in cands}
 
+        job.phase = "reading renames (pass 1/2)"
         # pass 1: rename edges (new path -> old paths), so a wanted file's
         # earlier names are tracked in pass 2
         edges = defaultdict(set)
@@ -300,6 +368,7 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
                     track.add(old)
                     stack.append(old)
 
+        job.phase = "reading history (pass 2/2)"
         # pass 2: oldest first, keep only tracked paths; a rename moves the
         # old name's record onto the new name
         recs, needed = {}, set()
@@ -330,18 +399,25 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
                     if want_history else (sha, c["status"]))
                 needed.add(sha)
 
+        job.phase = "reading commit dates"
         if not needed:
             meta = {}
         elif details or want_history:
             meta = commit_metadata(gp, sorted(needed))
         else:
             meta = commit_dates(gp, sorted(needed))
+        job.phase = "counting branches"
         member = (branch_membership(gp, live_refs(gp), needed)
                   if needed else {})
+        job.phase = "listing current files"
         head = head_paths(gp)
     except Exception as exc:                       # noqa: BLE001 - per-repo isolation
+        if job.expired:
+            return blank_rows("timeout", "gave up after %s during: %s"
+                              % (fmt_dur(job.elapsed()), job.phase))
         return blank_rows("repo_error", "%s: %s" % (type(exc).__name__, str(exc)[:200]))
     finally:
+        bind_job(None)
         if recovery:
             recovery.__exit__()
 
@@ -452,6 +528,13 @@ def main():
     ap.add_argument("--history", action="store_true",
                     help="also write file_history.csv (one row per change to "
                          "each matched file)")
+    ap.add_argument("--repo-timeout", type=float, default=0, metavar="SECONDS",
+                    help="give up on a repo that runs longer than this: its git "
+                         "processes are killed, its rows get status `timeout` "
+                         "and the run carries on (default 0 = never)")
+    ap.add_argument("--warn-after", type=float, default=300, metavar="SECONDS",
+                    help="print a SLOW line for a repo running longer than this "
+                         "(default 300, 0 = off)")
     ap.add_argument("--quiet", action="store_true", help="no progress bar")
     args = ap.parse_args()
 
@@ -506,39 +589,111 @@ def main():
             counts["bad_row"] += len(bad)
         rows_done += len(bad)
 
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futs = {pool.submit(process_repo, args.repos_root, org, repo,
-                                groups[(org, repo)], args.history,
-                                args.details): (org, repo)
-                    for org, repo in todo}
-            repos_done = len(done)
-            for fut in as_completed(futs):
-                org, repo = futs[fut]
-                summary, history = fut.result()
-                sw.writerows([[r[i] for i in pick] for r in summary])
-                if hw:
-                    hw.writerows(history)
-                for r in summary:
-                    counts[r[SUMMARY_HEADER.index("status")]] += 1
-                hist_rows += len(history)
-                sf.flush()
-                if hw:
-                    hf.flush()
-                df.write("%s\t%s\n" % (org, repo))
-                df.flush()
-                repos_done += 1
-                rows_done += len(summary)
-                bar.update(rows_done, "%d/%d repos" % (repos_done, len(groups)))
-        bar.close("%d/%d repos" % (len(groups), len(groups)))
+        status_ix = SUMMARY_HEADER.index("status")
+        pool = ThreadPoolExecutor(max_workers=args.workers)
+        jobs = {}                       # future -> RepoJob, only repos in flight
+        todo_iter = iter(todo)
+        repos_done = len(done)
+        timed_out, interrupted = [], False
+
+        def submit_next():              # keep the queue short: 2 repos per worker
+            while len(jobs) < args.workers * 2:
+                key = next(todo_iter, None)
+                if key is None:
+                    return
+                job = RepoJob(key[0], key[1], len(groups[key]))
+                jobs[pool.submit(process_repo, args.repos_root, key[0], key[1],
+                                 groups[key], args.history, args.details,
+                                 job)] = job
+
+        def status_text():
+            run = [j for j in jobs.values() if j.start]
+            text = "%s/%s repos" % (f"{repos_done:,}", f"{len(groups):,}")
+            if run:
+                slow = max(run, key=RepoJob.elapsed)
+                name = "%s/%s" % (slow.org, slow.repo)
+                name = name if len(name) <= 32 else name[:31] + "~"
+                text += " | %d running, slowest %s %s [%s]" % (
+                    len(run), name, fmt_dur(slow.elapsed()), slow.phase)
+            return text
+
+        try:
+            submit_next()
+            while jobs:
+                finished, _ = wait(list(jobs), timeout=1, return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    job = jobs.pop(fut)
+                    summary, history = fut.result()
+                    sw.writerows([[r[i] for i in pick] for r in summary])
+                    if hw:
+                        hw.writerows(history)
+                    for r in summary:
+                        counts[r[status_ix]] += 1
+                    if summary and summary[0][status_ix] == "timeout":
+                        timed_out.append((job, summary[0][SUMMARY_HEADER.index("error")]))
+                    hist_rows += len(history)
+                    sf.flush()
+                    if hw:
+                        hf.flush()
+                    df.write("%s\t%s\n" % (job.org, job.repo))
+                    df.flush()
+                    repos_done += 1
+                    rows_done += len(summary)
+                submit_next()
+                for job in jobs.values():            # watchdog + slow warnings
+                    if not job.start or job.expired:
+                        continue
+                    if args.repo_timeout and job.elapsed() > args.repo_timeout:
+                        job.kill()
+                    elif (args.warn_after and job.elapsed() > args.warn_after
+                          and not job.warned):
+                        job.warned = True
+                        print(("\n" if bar.tty else "") + "SLOW      %s/%s running %s "
+                              "(%s rows) [%s]" % (job.org, job.repo,
+                                                  fmt_dur(job.elapsed()),
+                                                  f"{job.rows:,}", job.phase),
+                              file=sys.stderr, flush=True)
+                bar.update(rows_done, status_text())
+            bar.close("%s/%s repos" % (f"{repos_done:,}", f"{len(groups):,}"))
+        except KeyboardInterrupt:
+            interrupted = True
+            for job in list(jobs.values()):     # stop every running git process
+                job.kill()
+            pool.shutdown(wait=False, cancel_futures=True)
+        finally:
+            pool.shutdown(wait=True)
+            sf.flush()
+            if hw:
+                hf.flush()
+            df.flush()
+            if timed_out:
+                mode_t = "a" if resuming and os.path.exists(
+                    os.path.join(args.out, "timed_out_repos.tsv")) else "w"
+                with open(os.path.join(args.out, "timed_out_repos.tsv"), mode_t,
+                          encoding="utf-8") as tf:
+                    if mode_t == "w":
+                        tf.write("org\trepo\trows\tdetail\n")
+                    for job, detail in timed_out:
+                        tf.write("%s\t%s\t%d\t%s\n" % (job.org, job.repo,
+                                                         job.rows, detail))
+
+    if interrupted:
+        print("\ninterrupted: %s of %s repo(s) finished and are saved in %s.\n"
+              "Run the same command with --resume to carry on."
+              % (f"{repos_done:,}", f"{len(groups):,}", args.out), file=sys.stderr)
+        return 130
 
     print("\ndone      %s row(s)%s -> %s"
           % (f"{sum(counts.values()):,}",
              (", %s history row(s)" % f"{hist_rows:,}") if args.history else "",
              args.out))
     for k in ("found", "in_head_no_history", "not_found", "repo_missing",
-              "repo_error", "bad_row"):
+              "repo_error", "timeout", "bad_row"):
         if counts[k]:
             print("  %-20s %12s" % (k, f"{counts[k]:,}"))
+    if timed_out:
+        print("  %d repo(s) timed out (see timed_out_repos.tsv); rerun those rows "
+              "with a larger --repo-timeout" % len(timed_out))
     print("  %.1fs" % (time.time() - t0))
     return 0
 

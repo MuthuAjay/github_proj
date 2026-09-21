@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
@@ -90,10 +91,41 @@ def _plausible_branch(name):
 # git helpers
 # --------------------------------------------------------------------------
 
+_ctx = threading.local()
+
+
+def bind_job(job):
+    """Have every git process this thread starts through git_out /
+    commit_metadata / changes_from_git registered with `job` (an object with a
+    register(proc) method), so a watchdog can kill them. None to unbind."""
+    _ctx.job = job
+
+
+def _spawn(cmd, **kw):
+    proc = subprocess.Popen(cmd, **kw)
+    job = getattr(_ctx, "job", None)
+    if job is not None:
+        job.register(proc)
+    return proc
+
+
+class _Done:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def run_tracked(cmd, input=None):
+    """subprocess.run(cmd, input=..., capture stdout/stderr) that registers the
+    process with the current thread's job (see bind_job)."""
+    proc = _spawn(cmd, stdin=subprocess.PIPE if input is not None else None,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate(input)
+    return _Done(proc.returncode, out, err)
+
+
 def git_out(repo, args, check=True):
     """Run a git command, return stdout as text."""
-    proc = subprocess.run(GIT + ["-C", repo] + args,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = run_tracked(GIT + ["-C", repo] + args)
     if check and proc.returncode != 0:
         raise RuntimeError("git %s failed (%d): %s"
                            % (" ".join(args[:3]), proc.returncode,
@@ -285,11 +317,10 @@ def commit_metadata(repo, shas, chunk=4000):
     meta = {}
     for i in range(0, len(shas), chunk):
         batch = shas[i:i + chunk]
-        proc = subprocess.run(
+        proc = run_tracked(
             GIT + ["-C", repo, "log", "--no-walk", "--stdin",
                    "--format=" + LOG_FMT],
-            input="\n".join(batch).encode(),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            input="\n".join(batch).encode())
         if proc.returncode != 0:
             raise RuntimeError("git log failed: %s"
                                % proc.stderr.decode("utf-8", "replace")[:400])
@@ -574,8 +605,7 @@ def changes_from_git(repo, revs, since, until, limit, stdin_file=None):
         cmd.append("--max-count=%d" % limit)
     with tempfile.TemporaryFile() as err, \
             (open(stdin_file, "rb") if stdin_file else nullcontext()) as feed:
-        proc = subprocess.Popen(cmd, stdin=feed, stdout=subprocess.PIPE,
-                                stderr=err)
+        proc = _spawn(cmd, stdin=feed, stdout=subprocess.PIPE, stderr=err)
         buf = b""
         for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
             buf += chunk
@@ -752,7 +782,9 @@ class Progress:
                    f"{self.total:,}", f"{rate:,.0f}", _hms(elapsed),
                    _hms(eta), (" | " + extra) if extra else ""))
         if self.tty:
-            print("\r" + line.ljust(110), end="\n" if final else "",
+            cols = shutil.get_terminal_size((120, 20)).columns
+            line = line[:cols - 1]
+            print("\r" + line.ljust(cols - 1), end="\n" if final else "",
                   file=sys.stderr, flush=True)
         else:
             print(line, file=sys.stderr, flush=True)

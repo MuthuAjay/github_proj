@@ -13,9 +13,11 @@ import csv
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,9 +40,9 @@ def write(repo, rel, text):
         fh.write(text)
 
 
-def run(script, *args, check=True):
+def run(script, *args, check=True, env=None):
     proc = subprocess.run([PY, os.path.join(HERE, script)] + list(args),
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=env)
     if check and proc.returncode != 0:
         raise AssertionError("%s failed (%d)\nSTDOUT:\n%s\nSTDERR:\n%s"
                              % (script, proc.returncode, proc.stdout, proc.stderr))
@@ -244,6 +246,136 @@ class ExploreInputCsv(Base):
         proc = run("explore_input_csv.py", path, check=False)
         self.assertEqual(proc.returncode, 2)
         self.assertIn("missing column", proc.stderr)
+
+
+class SlowRepoHandling(Base):
+    """A repo whose git commands hang: timeout, SLOW warning, Ctrl+C, resume.
+    A fake `git` first on PATH sleeps for 60s when the repo is called slowrepo."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = os.path.join(cls.tmp, "root")
+        for name in ("slowrepo", "fastrepo"):
+            os.makedirs(os.path.join(cls.root, "orgA"), exist_ok=True)
+            shutil.copytree(cls.repo, os.path.join(cls.root, "orgA", name))
+        fake = os.path.join(cls.tmp, "fakebin")
+        os.makedirs(fake)
+        with open(os.path.join(fake, "git"), "w") as fh:
+            fh.write('#!/bin/sh\ncase "$*" in\n *slowrepo*) case "$*" in '
+                     '*" log "*|*cat-file*) exec sleep 60;; esac;;\nesac\n'
+                     'exec %s "$@"\n' % shutil.which("git"))
+        os.chmod(os.path.join(fake, "git"), 0o755)
+        cls.env = dict(os.environ, PATH=fake + os.pathsep + os.environ["PATH"])
+        cls.inp = os.path.join(cls.tmp, "slow.tsv")
+        with open(cls.inp, "w", newline="") as fh:
+            w = csv.writer(fh, delimiter="\t")
+            w.writerow(["org", "repo", "relpath", "filename", "sha256"])
+            for repo in ("slowrepo", "fastrepo"):
+                for f in ("b.txt", "c.txt"):
+                    w.writerow(["orgA", repo, f, f, ""])
+
+    def test_timeout_kills_the_stuck_repo_and_carries_on(self):
+        out = os.path.join(self.tmp, "t_out")
+        t0 = time.time()
+        proc = run("file_history_for_list.py", self.inp, "--repos-root", self.root,
+                   "--out", out, "--workers", "2", "--repo-timeout", "3",
+                   "--warn-after", "1", env=self.env)
+        self.assertLess(time.time() - t0, 30)            # not the 60s the sleep wanted
+        got = {(r["repo"], r["filename"]): r["status"]
+               for r in read_csv(os.path.join(out, "file_summary.csv"))}
+        self.assertEqual({v for k, v in got.items() if k[0] == "slowrepo"}, {"timeout"})
+        self.assertEqual({v for k, v in got.items() if k[0] == "fastrepo"}, {"found"})
+        detail = next(r for r in read_csv(os.path.join(out, "file_summary.csv"))
+                      if r["repo"] == "slowrepo")["error"]
+        self.assertIn("gave up after", detail)
+        self.assertIn("reading", detail)                  # names the phase it was in
+        with open(os.path.join(out, "timed_out_repos.tsv")) as fh:
+            self.assertIn("slowrepo", fh.read())
+        self.assertIn("SLOW", proc.stderr)
+        self.assertIn("orgA/slowrepo", proc.stderr)
+        self.assertIn("timeout", proc.stdout)
+
+    def test_ctrl_c_stops_cleanly_and_resume_finishes(self):
+        out = os.path.join(self.tmp, "c_out")
+        args = [PY, os.path.join(HERE, "file_history_for_list.py"), self.inp,
+                "--repos-root", self.root, "--out", out, "--workers", "2", "--quiet"]
+        p = subprocess.Popen(args, env=self.env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        time.sleep(2.5)                                   # slowrepo is stuck by now
+        p.send_signal(signal.SIGINT)
+        try:
+            _, err = p.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            self.fail("did not stop after one Ctrl+C")
+        self.assertEqual(p.returncode, 130)
+        self.assertIn("--resume", err)
+        # finish the job with a working git: every input row exactly once
+        run("file_history_for_list.py", self.inp, "--repos-root", self.root,
+            "--out", out, "--workers", "2", "--quiet", "--resume")
+        rows = read_csv(os.path.join(out, "file_summary.csv"))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({r["status"] for r in rows}, {"found"})
+
+
+class MakeInputCsv(Base):
+    def test_generated_input_feeds_the_history_script(self):
+        root = os.path.join(self.tmp, "mroot")
+        os.makedirs(os.path.join(root, "orgA"))
+        shutil.copytree(self.repo, os.path.join(root, "orgA", "good"))
+        broken = os.path.join(root, "orgA", "brk")
+        shutil.copytree(self.repo, broken)                 # objects only: no HEAD, no refs
+        os.remove(os.path.join(broken, ".git", "HEAD"))
+        shutil.rmtree(os.path.join(broken, ".git", "refs"))
+        inp = os.path.join(self.tmp, "made.csv")
+        proc = run("make_input_csv.py", root, "--out", inp)
+        self.assertIn("1 repo(s) had no HEAD", proc.stdout)
+        rows = read_csv(inp)
+        self.assertEqual({r["repo"] for r in rows}, {"good", "brk"})
+        self.assertEqual(len([r for r in rows if r["repo"] == "good"]), 5)
+        # no HEAD: the newest commit is used (ties on timestamp in a toy repo)
+        self.assertGreaterEqual(len([r for r in rows if r["repo"] == "brk"]), 3)
+        self.assertTrue(rows[0]["relpath"].startswith("AllRepos\\orgA\\"))
+        capped = os.path.join(self.tmp, "capped.csv")
+        run("make_input_csv.py", root, "--out", capped, "--max-per-repo", "3")
+        self.assertEqual(len(read_csv(capped)), 6)        # 3 per repo
+        out = os.path.join(self.tmp, "made_out")
+        run("file_history_for_list.py", inp, "--repos-root", root, "--out", out, "--quiet")
+        got = read_csv(os.path.join(out, "file_summary.csv"))
+        self.assertEqual(len(got), len(rows))
+        self.assertEqual({r["status"] for r in got}, {"found"})
+
+
+class SimpleFileInfo(Base):
+    def test_counts_and_root_replacement(self):
+        root = os.path.join(self.tmp, "sroot")
+        os.makedirs(os.path.join(root, "orgA"))
+        shutil.copytree(self.repo, os.path.join(root, "orgA", "repoX"))
+        inp = os.path.join(self.tmp, "simple.csv")
+        with open(inp, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["org", "repo", "relpath", "filename"])
+            w.writerow(["orgA", "repoX", "AllRepos\\orgA\\repoX\\b.txt", "b.txt"])
+            w.writerow(["orgA", "repoX", "AllRepos\\orgA\\repoX\\src\\y.txt", "y.txt"])
+            w.writerow(["orgA", "repoX", "AllRepos\\orgA\\repoX\\nope.txt", "nope.txt"])
+            w.writerow(["orgA", "gone", "AllRepos\\orgA\\gone\\x.txt", "x.txt"])
+        out = os.path.join(self.tmp, "simple_out.csv")
+        loud = run("simple_file_info.py", inp, "--root", root, "--out", out)
+        self.assertIn("100.0%", loud.stderr)
+        self.assertIn("found 2", loud.stderr)
+        quiet = run("simple_file_info.py", inp, "--root", root, "--out",
+                    os.path.join(self.tmp, "simple_q.csv"), "--quiet")
+        self.assertNotIn("%", quiet.stderr)
+        rows = read_csv(out)
+        b, y, nope, gone = rows
+        self.assertEqual((b["status"], b["commits"], b["added"], b["renamed"]),
+                         ("found", "5", "1", "1"))       # the merge commit is not counted
+        self.assertEqual((y["status"], y["commits"], y["renamed"]), ("found", "2", "1"))
+        self.assertEqual(nope["status"], "not_found")
+        self.assertTrue(gone["status"].startswith("repo_error"))
+        self.assertTrue(b["repo_path"].endswith("sroot/orgA/repoX"))
+        self.assertEqual(list(rows[0])[:4], ["org", "repo", "relpath", "filename"])
 
 
 class HashActive(Base):
