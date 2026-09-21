@@ -8,8 +8,12 @@ Given a repo path, writes:
       manifest.json          run parameters, totals, timings
       commits.csv            one row per commit
       refs.csv               every branch/tag - live, or recovered from reflogs
-      <commit-sha>/
-        metadata.json        author, committer, parents, tree, refs, counts
+      file_churn.csv         every path ranked by commits that touched it, plus
+                             branch_count (and branch names with --branch-list)
+      tree_churn.csv         every directory ranked by commits that touched it
+      file_history.csv       repo / tree / commit / file path / nth change, per change
+      <commit-sha>/          (not written with --churn-only)
+        metadata.json        author, committer, parents, tree, refs, branches, counts
         tree.csv             every path at that commit: path, mode, blob, size
         changes.csv          what the commit touched vs its first parent
         files/               file content (see --content)
@@ -42,6 +46,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -205,9 +210,45 @@ def names_from_merge_subjects(meta):
     return found
 
 
-def reachable_commits(repo, revs, since, until, limit):
-    """Commits reachable from refs and the reflog, newest first."""
+def branch_refs(live):
+    """{branch name: (ref, tip commit)} for local and remote-tracking branches.
+    Tags and the symbolic origin/HEAD are skipped."""
+    out = {}
+    for r in live:
+        ref = r["ref"]
+        if ref.startswith("refs/heads/"):
+            name = ref[len("refs/heads/"):]
+        elif ref.startswith("refs/remotes/") and not ref.endswith("/HEAD"):
+            name = ref[len("refs/"):]           # remotes/origin/foo
+        else:
+            continue
+        out[name] = (ref, r["commit"])
+    return out
+
+
+def branch_membership(repo, live, wanted):
+    """{commit sha: {branch names that contain it}}. A commit belongs to a
+    branch if it is reachable from that branch's tip, so history shared with
+    main shows up under every branch that descends from it. Only commits in
+    `wanted` are kept."""
+    member = {}
+    for name, (ref, _tip) in branch_refs(live).items():
+        try:
+            shas = git_out(repo, ["rev-list", ref]).split()
+        except RuntimeError:
+            continue
+        for sha in shas:
+            if sha in wanted:
+                member.setdefault(sha, set()).add(name)
+    return member
+
+
+def reachable_commits(repo, revs, since, until, limit, oldest_first=False):
+    """Commits reachable from refs and the reflog, newest first (or, with
+    oldest_first, parents strictly before children)."""
     args = ["rev-list"]
+    if oldest_first:
+        args += ["--topo-order", "--reverse"]
     args += revs if revs else ["--all", "--reflog"]
     if since:
         args.append("--since=" + since)
@@ -293,7 +334,7 @@ def diff_tree(repo, sha, parents):
     merge introduced onto the branch it landed on, which is what a per-commit
     view wants.
     """
-    args = ["diff-tree", "-r", "-z", "--no-commit-id"]
+    args = ["diff-tree", "-r", "-z", "-M", "--no-commit-id"]
     args += [parents[0], sha] if parents else ["--root", sha]
     proc = subprocess.run(GIT + ["-C", repo] + args,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -463,6 +504,204 @@ def process_commit(repo, sha, folder, meta, refs_at, content):
 
 
 # --------------------------------------------------------------------------
+# file churn
+# --------------------------------------------------------------------------
+
+def changes_from_folders(ordered, folder_for):
+    """(sha, changes) per commit, read back from each commit folder's
+    changes.csv. Commits whose folder has no changes.csv are skipped."""
+    for sha in ordered:
+        path = os.path.join(folder_for(sha), "changes.csv")
+        try:
+            with open(path, newline="", encoding="utf-8",
+                      errors="surrogateescape") as fh:
+                yield sha, list(csv.DictReader(fh))
+        except OSError:
+            continue
+
+
+def _parse_log_record(part):
+    """One `git log --raw -z` record -> (sha, [change dicts])."""
+    toks = part.decode("utf-8", "surrogateescape").split("\0")
+    sha = toks[0].strip()
+    changes, i = [], 1
+    while i < len(toks):
+        head = toks[i].lstrip("\n")
+        if not head.startswith(":"):
+            i += 1
+            continue
+        fields = head[1:].split()
+        if len(fields) < 5:
+            i += 1
+            continue
+        old_mode, new_mode, old_blob, new_blob, status = fields[:5]
+        if status[0] in ("R", "C"):
+            old_path = toks[i + 1] if i + 1 < len(toks) else ""
+            path = toks[i + 2] if i + 2 < len(toks) else ""
+            i += 3
+        else:
+            old_path = ""
+            path = toks[i + 1] if i + 1 < len(toks) else ""
+            i += 2
+        changes.append({"status": status, "path": path, "old_path": old_path,
+                        "old_mode": old_mode, "new_mode": new_mode,
+                        "old_blob": old_blob, "new_blob": new_blob})
+    return sha, changes
+
+
+def changes_from_git(repo, revs, since, until, limit):
+    """(sha, changes) per commit, oldest first (parents before children),
+    streamed from ONE `git log` over the object store - no commit folders, no
+    file content. Merges are diffed against their first parent and renames are
+    detected (-M), exactly as diff_tree() does per commit."""
+    cmd = GIT + ["-C", repo, "log"] + (revs if revs else ["--all", "--reflog"])
+    cmd += ["--topo-order", "--reverse", "--raw", "-z", "-M", "--no-abbrev",
+            "--diff-merges=first-parent", "--format=%x1e%H"]
+    if since:
+        cmd.append("--since=" + since)
+    if until:
+        cmd.append("--until=" + until)
+    if limit:
+        cmd.append("--max-count=%d" % limit)
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        buf = b""
+        for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
+            buf += chunk
+            parts = buf.split(b"\x1e")
+            buf = parts.pop()
+            for part in parts:
+                if part.strip():
+                    yield _parse_log_record(part)
+        if buf.strip():
+            yield _parse_log_record(buf)
+        proc.wait()
+        if proc.returncode != 0:
+            err.seek(0)
+            raise RuntimeError("git log failed: "
+                               + err.read().decode("utf-8", "replace")[:400])
+
+
+def write_file_churn(out, changes_iter, meta, repo_name="",
+                     commit_branches=None, branch_list=False,
+                     changed_counts=None):
+    """Rank paths by how many commits touched them, into file_churn.csv.
+
+    Built from `changes_iter`, a stream of (sha, changes) over reachable commits
+    only (dangling ones would double-count work already on a branch). It comes
+    either from the per-commit changes.csv files or straight from git (see
+    changes_from_folders / changes_from_git) and must be oldest-first, parents
+    before children (git --topo-order), so renames are applied in the order
+    they happened. If given, `changed_counts` is filled with {sha: number of
+    changed paths}.
+    A rename (R) moves the old path's history onto the new path, so a renamed
+    file keeps one row under its latest name. Merges count only what they
+    changed against their first parent, as in changes.csv.
+
+    Also writes, from the same pass:
+      tree_churn.csv    one row per directory (a git "tree"): how many commits
+                        changed anything under it, and how many file changes.
+                        "tree" is "." for the repo root.
+      file_history.csv  one row per (commit, file change): repo, tree (the
+                        file's directory), commit, path, status, and nth_change
+                        - how many times that file had changed up to and
+                        including this commit (renames carry the count over).
+    file_churn.csv also carries branch_count: how many branches contain at least
+    one commit that changed the file (see branch_membership). With branch_list
+    it gets an extra `branches` column naming them, joined with "|".
+    Returns (files, trees, history_rows).
+    """
+    commit_branches = commit_branches or {}
+    stats = {}
+    trees = {}
+    hist_rows = 0
+    hist_fh = open(os.path.join(out, "file_history.csv"), "w", newline="",
+                   encoding="utf-8", errors="surrogateescape")
+    hist = csv.writer(hist_fh)
+    hist.writerow(["repo", "tree", "commit", "commit_date", "author", "subject",
+                   "path", "old_path", "status", "nth_change",
+                   "old_blob", "new_blob"])
+
+    def dirs_of(path):
+        """'a/b/c.txt' -> ['.', 'a', 'a/b']"""
+        parts = path.split("/")[:-1]
+        return ["."] + ["/".join(parts[:i + 1]) for i in range(len(parts))]
+
+    def tree_rec(d):
+        return trees.setdefault(d, {"commits": 0, "changes": 0, "files": set(),
+                                    "first": "", "last": ""})
+
+    def rec(path):
+        return stats.setdefault(path, {
+            "commits": 0, "added": 0, "modified": 0, "deleted": 0,
+            "renamed": 0, "first": "", "last": "",
+            "branches": set()})
+
+    for sha, changes in changes_iter:
+        date = meta.get(sha, {}).get("committer_date", "")
+        if changed_counts is not None:
+            changed_counts[sha] = len(changes)
+        touched = set()
+        m = meta.get(sha, {})
+        for c in changes:
+            status, p, old = c["status"][:1], c["path"], c["old_path"]
+            if status == "R" and old and old in stats:
+                moved = stats.pop(old)
+                cur = rec(p)
+                for k in ("commits", "added", "modified", "deleted", "renamed"):
+                    cur[k] += moved[k]
+                cur["first"] = min(x for x in (cur["first"], moved["first"]) if x) \
+                    if (cur["first"] or moved["first"]) else ""
+                cur["branches"] |= moved["branches"]
+            r = rec(p)
+            r["commits"] += 1
+            key = {"A": "added", "D": "deleted", "R": "renamed"}.get(status, "modified")
+            r[key] += 1
+            r["first"] = r["first"] or date
+            r["last"] = date
+            r["branches"] |= commit_branches.get(sha, frozenset())
+
+            for d in dict.fromkeys(dirs_of(p) + (dirs_of(old) if old else [])):
+                t = tree_rec(d)
+                t["changes"] += 1
+                t["files"].add(p)
+                t["first"] = t["first"] or date
+                t["last"] = date
+                touched.add(d)
+            hist.writerow([repo_name, "/".join(p.split("/")[:-1]) or ".", sha,
+                           date, m.get("author_name", ""),
+                           (m.get("subject", "") or "").replace("\n", " "),
+                           p, old, c["status"], r["commits"],
+                           c["old_blob"], c["new_blob"]])
+            hist_rows += 1
+        for d in touched:
+            trees[d]["commits"] += 1
+    hist_fh.close()
+
+    with open(os.path.join(out, "tree_churn.csv"), "w", newline="",
+              encoding="utf-8", errors="surrogateescape") as fh:
+        w = csv.writer(fh)
+        w.writerow(["repo", "tree", "commits_touched", "file_changes",
+                    "distinct_files", "first_changed", "last_changed"])
+        for d, t in sorted(trees.items(), key=lambda kv: (-kv[1]["commits"], kv[0])):
+            w.writerow([repo_name, d, t["commits"], t["changes"],
+                        len(t["files"]), t["first"], t["last"]])
+
+    with open(os.path.join(out, "file_churn.csv"), "w", newline="",
+              encoding="utf-8", errors="surrogateescape") as fh:
+        w = csv.writer(fh)
+        w.writerow(["path", "commits_touched", "added", "modified", "deleted",
+                    "renamed", "first_seen", "last_changed",
+                    "branch_count"] + (["branches"] if branch_list else []))
+        for p, r in sorted(stats.items(), key=lambda kv: (-kv[1]["commits"], kv[0])):
+            w.writerow([p, r["commits"], r["added"], r["modified"], r["deleted"],
+                        r["renamed"], r["first"], r["last"],
+                        len(r["branches"])] +
+                       (["|".join(sorted(r["branches"]))] if branch_list else []))
+    return len(stats), len(trees), hist_rows
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -471,6 +710,72 @@ def human(n):
         if n < 1024 or unit == "TB":
             return "%.2f %s" % (n, unit)
         n /= 1024.0
+
+
+def write_commits_csv(out, commits, meta, refs_at, membership, reachable_set,
+                      extras):
+    """commits.csv. extras(sha) -> (file_count, total_bytes, changed_files,
+    folder, error) for the columns that depend on extraction."""
+    with open(os.path.join(out, "commits.csv"), "w", newline="",
+              encoding="utf-8", errors="surrogateescape") as fh:
+        w = csv.writer(fh)
+        w.writerow(["seq", "sha", "parents", "is_merge", "is_root",
+                    "author_name", "author_email", "author_date",
+                    "committer_date", "tree", "subject",
+                    "file_count", "total_bytes", "changed_files",
+                    "refs", "branch_count", "branches", "reachable", "folder",
+                    "error"])
+        for i, sha in enumerate(commits):
+            m = meta.get(sha, {})
+            files, nbytes, changed, folder, error = extras(sha)
+            w.writerow([
+                i, sha, " ".join(m.get("parents", [])),
+                int(len(m.get("parents", [])) > 1),
+                int(not m.get("parents", [])),
+                m.get("author_name", ""), m.get("author_email", ""),
+                m.get("author_date", ""), m.get("committer_date", ""),
+                m.get("tree", ""), (m.get("subject", "") or "").replace("\n", " "),
+                files, nbytes, changed,
+                " ".join(refs_at.get(sha, [])),
+                len(membership.get(sha, ())),
+                "|".join(sorted(membership.get(sha, ()))),
+                int(sha in reachable_set), folder, error,
+            ])
+
+
+def run_churn_only(args, repo, gdir, t0, commits, reachable_set, meta,
+                   membership, refs_at, live, recovered, inferred):
+    """--churn-only: build the summary CSVs straight from the object store.
+    No commit folders, no file content, no per-commit CSVs."""
+    counts = {}
+    stream = changes_from_git(repo, args.rev, args.since, args.until, args.limit)
+    n_files, n_trees, n_hist = write_file_churn(
+        args.out, stream, meta, os.path.basename(repo), membership,
+        args.branch_list, counts)
+    print("churn     %d file(s) -> file_churn.csv, %d tree(s) -> tree_churn.csv, "
+          "%d change row(s) -> file_history.csv" % (n_files, n_trees, n_hist))
+
+    # file_count / total_bytes / folder need a tree walk or an extraction, so
+    # they stay blank rather than showing a misleading 0.
+    write_commits_csv(args.out, commits, meta, refs_at, membership,
+                      reachable_set,
+                      lambda sha: ("", "", counts.get(sha, 0), "", ""))
+    manifest = {
+        "repo": repo, "git_dir": gdir, "generated": int(t0),
+        "elapsed_seconds": round(time.time() - t0, 1),
+        "mode": "churn-only",
+        "commits_total": len(commits),
+        "commits_reachable": len(reachable_set),
+        "refs_live": len(live), "refs_recovered_from_reflog": len(recovered),
+        "refs_inferred_from_prose": len(inferred),
+        "revs": args.rev or ["--all", "--reflog"],
+    }
+    with open(os.path.join(args.out, "manifest.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+    print("\ndone  %d commits (churn only, nothing extracted) -> %s"
+          % (len(commits), args.out))
+    print("      %.1fs" % (time.time() - t0))
 
 
 def main():
@@ -494,6 +799,17 @@ def main():
     ap.add_argument("--layout", choices=["sha", "seq"], default="sha",
                     help="folder name: full sha, or NNNNN_<short sha> in "
                          "reverse-chronological order (default: sha)")
+    ap.add_argument("--churn-only", action="store_true",
+                    help="write only the summary CSVs (commits, refs, "
+                         "file/tree churn, file history), read straight from "
+                         "the object store with one git log - no commit "
+                         "folders, no file content. Merges are diffed against "
+                         "the first parent, renames are detected. Ignores "
+                         "--content, --layout, --resume and --dangling.")
+    ap.add_argument("--branch-list", action="store_true",
+                    help="add a `branches` column to file_churn.csv naming the "
+                         "branches each file changed on (default: only the "
+                         "branch_count)")
     ap.add_argument("--jobs", type=int, default=8, help="parallel workers")
     ap.add_argument("--resume", action="store_true",
                     help="skip commit folders already marked complete")
@@ -504,6 +820,12 @@ def main():
                     help="abort before extracting if the projection exceeds "
                          "this many GB")
     args = ap.parse_args()
+    if args.churn_only:
+        if args.dangling:
+            print("note: --dangling is ignored with --churn-only "
+                  "(churn covers reachable commits only)")
+            args.dangling = False
+        args.content = "none"
 
     repo = os.path.abspath(args.repo)
     if not os.path.isdir(repo):
@@ -542,7 +864,8 @@ def main():
         sys.exit("no commits found - empty repository?")
 
     # ---- projection -------------------------------------------------------
-    sample = commits[::max(1, len(commits) // 25)][:25]
+    sample = ([] if args.content == "none"
+              else commits[::max(1, len(commits) // 25)][:25])
     sizes = []
     for sha in sample:
         try:
@@ -556,7 +879,8 @@ def main():
         projected = avg * len(commits) * 0.02      # rough: touched paths only
     else:
         projected = 0
-    print("avg tree  %s across %d sampled commits" % (human(avg), len(sizes)))
+    if args.content != "none":
+        print("avg tree  %s across %d sampled commits" % (human(avg), len(sizes)))
     print("projected %s on disk with --content %s"
           % (human(projected), args.content))
     if args.content == "full" and len(commits) > 1:
@@ -573,6 +897,11 @@ def main():
 
     # ---- metadata ---------------------------------------------------------
     meta = commit_metadata(repo, commits)
+
+    # Which branches contain each commit (a commit records no branch of its
+    # own; membership is reachability from a branch tip). Reflog-only and
+    # dangling commits belong to none.
+    membership = branch_membership(repo, live, set(commits))
 
     # ---- refs.csv ---------------------------------------------------------
     # Three tiers of confidence: refs that exist, refs whose log outlived them,
@@ -622,6 +951,11 @@ def main():
     for r in live:
         refs_at.setdefault(r["commit"], []).append(r["ref"])
 
+    if args.churn_only:
+        return run_churn_only(args, repo, gdir, t0, commits, reachable_set,
+                              meta, membership, refs_at, live, recovered,
+                              inferred)
+
     order = {sha: i for i, sha in enumerate(commits)}
 
     def folder_for(sha):
@@ -666,32 +1000,40 @@ def main():
                       % (done, len(futures), errors, "" if errors == 1 else "s"),
                       flush=True)
 
-    # ---- commits.csv ------------------------------------------------------
+    # ---- branches into each commit's metadata.json --------------------------
+    # Done after extraction so commit folders skipped by --resume get it too.
+    for sha in commits:
+        mpath = os.path.join(folder_for(sha), "metadata.json")
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                rec = json.load(fh)
+            names = sorted(membership.get(sha, ()))
+            if rec.get("branches") != names:
+                rec["branches"] = names
+                rec["branch_count"] = len(names)
+                with open(mpath, "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, indent=2, ensure_ascii=False)
+        except (OSError, ValueError):
+            pass
+
+    # ---- commits.csv + churn ----------------------------------------------
     by_sha = {r["sha"]: r for r in results}
-    with open(os.path.join(args.out, "commits.csv"), "w", newline="",
-              encoding="utf-8", errors="surrogateescape") as fh:
-        w = csv.writer(fh)
-        w.writerow(["seq", "sha", "parents", "is_merge", "is_root",
-                    "author_name", "author_email", "author_date",
-                    "committer_date", "tree", "subject",
-                    "file_count", "total_bytes", "changed_files",
-                    "refs", "reachable", "folder", "error"])
-        for i, sha in enumerate(commits):
-            m = meta.get(sha, {})
-            r = by_sha.get(sha, {})
-            w.writerow([
-                i, sha, " ".join(m.get("parents", [])),
-                int(len(m.get("parents", [])) > 1),
-                int(not m.get("parents", [])),
-                m.get("author_name", ""), m.get("author_email", ""),
-                m.get("author_date", ""), m.get("committer_date", ""),
-                m.get("tree", ""), (m.get("subject", "") or "").replace("\n", " "),
-                r.get("files", 0), r.get("bytes", 0), r.get("changed", 0),
-                " ".join(refs_at.get(sha, [])),
-                int(sha in reachable_set),
-                os.path.relpath(folder_for(sha), args.out),
-                r.get("error", ""),
-            ])
+
+    def extras(sha):
+        r = by_sha.get(sha, {})
+        return (r.get("files", 0), r.get("bytes", 0), r.get("changed", 0),
+                os.path.relpath(folder_for(sha), args.out), r.get("error", ""))
+
+    write_commits_csv(args.out, commits, meta, refs_at, membership,
+                      reachable_set, extras)
+
+    churn_order = reachable_commits(repo, args.rev, args.since, args.until,
+                                    args.limit, oldest_first=True)
+    n_files, n_trees, n_hist = write_file_churn(
+        args.out, changes_from_folders(churn_order, folder_for), meta,
+        os.path.basename(repo), membership, args.branch_list)
+    print("churn     %d file(s) -> file_churn.csv, %d tree(s) -> tree_churn.csv, "
+          "%d change row(s) -> file_history.csv" % (n_files, n_trees, n_hist))
 
     total_bytes = sum(r.get("bytes", 0) for r in results)
     manifest = {
