@@ -155,6 +155,18 @@ def pack_bytes(repo_path):
         return 0
 
 
+def mem_available_gb():
+    """GiB of memory the system says is available (Linux /proc/meminfo), or None."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024 ** 2
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def fmt_dur(sec):
     sec = int(sec)
     return "%dm%02ds" % (sec // 60, sec % 60) if sec < 3600 else \
@@ -377,21 +389,26 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
         # Nothing but the tracked set is kept, so memory stays small even for
         # repos with millions of renames.
         track = set(wanted)
+
+        def renamed_from_tracked(status, path, old_path):
+            return status[:1] == "R" and bool(old_path) and path in track
+
         for _sha, changes in changes_from_git(gp, [], None, None, None, feed,
-                                              oldest_first=False):
+                                              oldest_first=False,
+                                              keep=renamed_from_tracked):
             for c in changes:
-                if (c["status"][:1] == "R" and c["old_path"]
-                        and c["path"] in track):
-                    track.add(c["old_path"])
+                track.add(c["old_path"])
 
         # pass 2: oldest first, keep only tracked paths; a rename moves the
         # old name's record onto the new name
         recs, needed = {}, set()
-        for sha, changes in changes_from_git(gp, [], None, None, None, feed):
+        # only changes to tracked paths are ever built; the rest are dropped
+        # while git's output is being read
+        for sha, changes in changes_from_git(
+                gp, [], None, None, None, feed,
+                keep=lambda status, path, old: path in track or old in track):
             for c in changes:
                 st, p, old = c["status"][:1], c["path"], c["old_path"]
-                if p not in track and old not in track:
-                    continue
                 if st == "R" and old in recs:
                     if old in wanted:
                         # the old path may still exist elsewhere (renamed on
@@ -550,6 +567,10 @@ def main():
                     help="run at most N big repos at the same time, so that "
                          "several huge repos cannot exhaust memory (default 0 = "
                          "one quarter of --workers, at least 1)")
+    ap.add_argument("--min-free-gb", type=float, default=16, metavar="GB",
+                    help="do not start another repo while the system has less than "
+                         "this much memory available (repos already running are "
+                         "left to finish; one always runs). Default 16, 0 = off")
     ap.add_argument("--repo-timeout", type=float, default=0, metavar="SECONDS",
                     help="give up on a repo that runs longer than this: its git "
                          "processes are killed, its rows get status `timeout` "
@@ -644,6 +665,10 @@ def main():
 
         def submit_next():              # keep the queue short: 2 repos per worker
             while len(jobs) < args.workers * 2:
+                avail = mem_available_gb()
+                if (args.min_free_gb and jobs and avail is not None
+                        and avail < args.min_free_gb):
+                    return              # wait for memory to come back
                 key, big = next_repo()
                 if key is None:
                     return
@@ -656,6 +681,9 @@ def main():
         def status_text():
             run = [j for j in jobs.values() if j.start]
             text = "%s/%s repos" % (f"{repos_done:,}", f"{len(groups):,}")
+            avail = mem_available_gb()
+            if avail is not None:
+                text += " | %.0fG free" % avail
             if run:
                 slow = max(run, key=RepoJob.elapsed)
                 name = "%s/%s" % (slow.org, slow.repo)

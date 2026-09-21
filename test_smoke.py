@@ -21,6 +21,7 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 PY = sys.executable
 
 GIT_ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
@@ -347,6 +348,65 @@ class MakeInputCsv(Base):
         self.assertEqual({r["status"] for r in got}, {"found"})
 
 
+class LogStreamParser(unittest.TestCase):
+    """parse_log_stream reads `git log --raw -z` output as a stream and can drop
+    unwanted changes before building anything for them."""
+
+    @staticmethod
+    def stream(n_noise=0):
+        import io
+        sha1, sha2, sha3 = "a" * 40, "b" * 40, "c" * 40
+        z = b"\0"
+        raw = [b"\x1e" + sha1.encode() + z,
+               b"\n:000000 100644 " + b"0" * 40 + b" " + b"1" * 40 + b" A" + z + b"keep/one.txt" + z]
+        for i in range(n_noise):
+            raw.append(b":000000 100644 " + b"0" * 40 + b" " + b"2" * 40 + b" A" + z
+                       + b"node_modules/p%d/index.js" % i + z)
+        raw += [b"\x1e" + sha2.encode() + z,                      # a commit with no changes
+                b"\x1e" + sha3.encode() + z,
+                b"\n:100644 100644 " + b"3" * 40 + b" " + b"3" * 40 + b" R100" + z
+                + b"old name.txt" + z + "n\u00e9w\nname.txt".encode() + z,
+                b":100644 100644 " + b"4" * 40 + b" " + b"5" * 40 + b" M" + z + b"keep/one.txt" + z]
+        return io.BytesIO(b"".join(raw))
+
+    def test_parses_adds_renames_odd_names_and_empty_commits(self):
+        from extract_commits import parse_log_stream
+        got = list(parse_log_stream(self.stream()))
+        self.assertEqual([s[0] for s, _ in [(g, 0) for g in got]], ["a" * 40, "b" * 40, "c" * 40])
+        self.assertEqual(got[1][1], [])                            # empty commit kept
+        ren = got[2][1][0]
+        self.assertEqual((ren["status"], ren["old_path"], ren["path"]),
+                         ("R100", "old name.txt", "n\u00e9w\nname.txt"))
+        self.assertEqual(got[2][1][1]["status"], "M")
+
+    def test_keep_filter_drops_changes_before_they_are_built(self):
+        from extract_commits import parse_log_stream
+        got = list(parse_log_stream(self.stream(50),
+                                    keep=lambda st, p, old: p.startswith("keep/")))
+        self.assertEqual([len(c) for _, c in got], [1, 0, 1])
+        self.assertEqual(got[0][1][0]["path"], "keep/one.txt")
+
+    def test_filtering_keeps_memory_flat_for_a_huge_commit(self):
+        import tracemalloc
+        from extract_commits import parse_log_stream
+        n = 200000
+        for keep, label in ((lambda st, p, old: p.startswith("keep/"), "filtered"),
+                            (None, "unfiltered")):
+            s = self.stream(n)                         # built before measuring
+            tracemalloc.start()
+            list(parse_log_stream(s, keep=keep))
+            peak = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+            if label == "filtered":
+                filtered = peak
+            else:
+                unfiltered = peak
+        self.assertLess(filtered, 8 * 1024 * 1024)               # a few MB at most
+        self.assertGreater(unfiltered, 20 * filtered)            # unfiltered is far bigger
+        print("\n    peak memory, %d changes in one commit: filtered %.1f MB, "
+              "unfiltered %.1f MB" % (n, filtered / 1e6, unfiltered / 1e6))
+
+
 class DiagnoseRepo(Base):
     def test_report_on_a_repo_git_cannot_open(self):
         broken = os.path.join(self.tmp, "dx")
@@ -552,6 +612,15 @@ class FileHistoryForList(Base):
         got = sorted(read_csv(os.path.join(out, "file_summary.csv")), key=key)
         want = sorted(self.summary, key=key)
         self.assertEqual(got, want)
+
+    def test_memory_guard_never_deadlocks(self):
+        out = os.path.join(self.tmp, "fh_mem")
+        # an impossible threshold: repos must still run, one at a time
+        run("file_history_for_list.py", self.inp, "--repos-root", self.root,
+            "--out", out, "--quiet", "--workers", "4", "--min-free-gb", "1000000")
+        key = lambda r: int(r["row"])
+        self.assertEqual(sorted(read_csv(os.path.join(out, "file_summary.csv")), key=key),
+                         sorted(self.summary, key=key))
 
     def test_resume_into_a_new_folder_warns(self):
         proc = run("file_history_for_list.py", self.inp, "--repos-root", self.root,

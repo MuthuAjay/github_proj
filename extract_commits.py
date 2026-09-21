@@ -560,41 +560,66 @@ def changes_from_folders(ordered, folder_for):
             continue
 
 
-def _parse_log_record(part):
-    """One `git log --raw -z` record -> (sha, [change dicts])."""
-    toks = part.decode("utf-8", "surrogateescape").split("\0")
-    sha = toks[0].strip()
-    changes, i = [], 1
-    while i < len(toks):
-        head = toks[i].lstrip("\n")
-        if not head.startswith(":"):
-            i += 1
-            continue
-        fields = head[1:].split()
-        if len(fields) < 5:
-            i += 1
-            continue
-        old_mode, new_mode, old_blob, new_blob, status = fields[:5]
-        if status[0] in ("R", "C"):
-            old_path = toks[i + 1] if i + 1 < len(toks) else ""
-            path = toks[i + 2] if i + 2 < len(toks) else ""
-            i += 3
-        else:
-            old_path = ""
-            path = toks[i + 1] if i + 1 < len(toks) else ""
-            i += 2
-        changes.append({"status": status, "path": path, "old_path": old_path,
-                        "old_mode": old_mode, "new_mode": new_mode,
-                        "old_blob": old_blob, "new_blob": new_blob})
-    return sha, changes
+def _nul_tokens(stream, size=1 << 20):
+    """NUL-separated tokens from a binary stream, without holding more than one
+    chunk (plus a partial token) in memory."""
+    buf = b""
+    while True:
+        chunk = stream.read(size)
+        if not chunk:
+            break
+        buf += chunk
+        parts = buf.split(b"\0")
+        buf = parts.pop()
+        yield from parts
+    if buf:
+        yield buf
+
+
+def parse_log_stream(stream, keep=None):
+    """(sha, changes) per commit, read from the output of
+    `git log --raw -z --format=%x1e%H` as a stream.
+
+    keep(status, path, old_path) -> bool, if given, is asked about each change
+    BEFORE anything is built for it, so files the caller does not care about
+    cost no memory: a commit that touches two million files but only two
+    wanted ones yields a list of two."""
+    sha, changes = None, []
+    tokens = _nul_tokens(stream)
+    for tok in tokens:
+        if tok.startswith(b"\n"):
+            tok = tok[1:]
+        if tok.startswith(b"\x1e"):
+            if sha is not None:
+                yield sha, changes
+            sha, changes = tok[1:].decode("ascii", "replace").strip(), []
+        elif tok.startswith(b":") and sha is not None:
+            fields = tok[1:].decode("ascii", "replace").split()
+            if len(fields) < 5:
+                continue
+            old_mode, new_mode, old_blob, new_blob, status = fields[:5]
+            if status[0] in ("R", "C"):
+                old_path = next(tokens, b"").decode("utf-8", "surrogateescape")
+                path = next(tokens, b"").decode("utf-8", "surrogateescape")
+            else:
+                old_path = ""
+                path = next(tokens, b"").decode("utf-8", "surrogateescape")
+            if keep is None or keep(status, path, old_path):
+                changes.append({"status": status, "path": path,
+                                "old_path": old_path, "old_mode": old_mode,
+                                "new_mode": new_mode, "old_blob": old_blob,
+                                "new_blob": new_blob})
+    if sha is not None:
+        yield sha, changes
 
 
 def changes_from_git(repo, revs, since, until, limit, stdin_file=None,
-                     oldest_first=True, renames=True):
+                     oldest_first=True, renames=True, keep=None):
     """(sha, changes) per commit, oldest first (parents before children),
     streamed from ONE `git log` over the object store - no commit folders, no
     file content. Merges are diffed against their first parent and renames are
-    detected (-M), exactly as diff_tree() does per commit."""
+    detected (-M), exactly as diff_tree() does per commit. `keep` filters
+    changes while they are read (see parse_log_stream)."""
     # stdin_file: a file of commit shas to start from (used for repos that have
     # no usable refs, where --all would find nothing)
     cmd = GIT + ["-C", repo, "log"] + (["--stdin"] if stdin_file else
@@ -611,16 +636,7 @@ def changes_from_git(repo, revs, since, until, limit, stdin_file=None,
     with tempfile.TemporaryFile() as err, \
             (open(stdin_file, "rb") if stdin_file else nullcontext()) as feed:
         proc = _spawn(cmd, stdin=feed, stdout=subprocess.PIPE, stderr=err)
-        buf = b""
-        for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
-            buf += chunk
-            parts = buf.split(b"\x1e")
-            buf = parts.pop()
-            for part in parts:
-                if part.strip():
-                    yield _parse_log_record(part)
-        if buf.strip():
-            yield _parse_log_record(buf)
+        yield from parse_log_stream(proc.stdout, keep)
         proc.wait()
         if proc.returncode != 0:
             err.seek(0)
