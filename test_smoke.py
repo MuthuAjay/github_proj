@@ -347,6 +347,26 @@ class MakeInputCsv(Base):
         self.assertEqual({r["status"] for r in got}, {"found"})
 
 
+class DiagnoseRepo(Base):
+    def test_report_on_a_repo_git_cannot_open(self):
+        broken = os.path.join(self.tmp, "dx")
+        shutil.copytree(self.repo, broken)
+        os.remove(os.path.join(broken, ".git", "HEAD"))
+        shutil.rmtree(os.path.join(broken, ".git", "refs"))
+        out = run("diagnose_repo.py", broken).stdout
+        self.assertIn("git CANNOT open it", out)
+        self.assertIn("commits found in the object store", out)
+        self.assertIn("history WITHOUT rename detection", out)
+        self.assertIn("history WITH rename detection", out)
+        self.assertIn("nothing unusual", out)               # a 10-commit repo is not slow
+        self.assertNotIn("STOPPED", out)
+
+    def test_early_stop_reports_progress(self):
+        out = run("diagnose_repo.py", self.repo, "--max-seconds", "0").stdout
+        self.assertIn("git opens it directly", out)
+        self.assertIn("verdict", out)
+
+
 class SimpleFileInfo(Base):
     def test_counts_and_root_replacement(self):
         root = os.path.join(self.tmp, "sroot")
