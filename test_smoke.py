@@ -285,5 +285,133 @@ class HashActive(Base):
         self.assertEqual(len(read_csv(out)[0]), 8 + 7)   # 7 columns appended
 
 
+class FileHistoryForList(Base):
+    """file_history_for_list.py against <root>/orgA/repoX (a copy of the repo)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = os.path.join(cls.tmp, "root")
+        os.makedirs(os.path.join(cls.root, "orgA"))
+        shutil.copytree(cls.repo, os.path.join(cls.root, "orgA", "repoX"))
+        cls.inp = os.path.join(cls.tmp, "list.tsv")
+        rows = [
+            ["orgA", "repoX", "b.txt", "b.txt", "wrong-hash"],       # renamed file
+            ["orgA", "repoX", "src", "y.txt", ""],                    # folder-only relpath
+            ["orgA", "repoX", "src\\y.txt", "y.txt", ""],             # backslashes, dup path
+            ["orgA", "repoX", "./wip.txt", "wip.txt", ""],            # unmerged branch only
+            ["orgA", "repoX", "feat.txt", "feat.txt", ""],
+            ["orgA", "repoX", "repoX/c.txt", "c.txt", ""],            # repo-name prefix
+            ["orgA", "repoX", "a.txt", "a.txt", ""],                  # old name, renamed to b.txt
+            ["orgA", "repoX", "nope.txt", "nope.txt", ""],
+            ["orgA", "gone", "x.txt", "x.txt", ""],                   # repo missing
+            ["", "repoX", "b.txt", "b.txt", ""],                      # blank org
+        ]
+        with open(cls.inp, "w", newline="") as fh:
+            w = csv.writer(fh, delimiter="\t")
+            w.writerow(["org", "repo", "relpath", "filename", "sha256"])
+            w.writerows(rows)
+        cls.out = os.path.join(cls.tmp, "fh")
+        cls.run1 = run("file_history_for_list.py", cls.inp, "--repos-root",
+                       cls.root, "--out", cls.out, "--workers", "2")
+        cls.summary = read_csv(os.path.join(cls.out, "file_summary.csv"))
+        cls.out2 = os.path.join(cls.tmp, "fh_full")
+        run("file_history_for_list.py", cls.inp, "--repos-root", cls.root,
+            "--out", cls.out2, "--workers", "2", "--details", "--history",
+            "--quiet")
+        cls.detailed = read_csv(os.path.join(cls.out2, "file_summary.csv"))
+
+    def row(self, n):
+        return next(r for r in self.summary if r["row"] == str(n))
+
+    def drow(self, n):
+        return next(r for r in self.detailed if r["row"] == str(n))
+
+    def test_default_output_is_just_the_churn_columns(self):
+        self.assertEqual(
+            list(self.summary[0]),
+            ["row", "org", "repo", "relpath", "filename", "sha256",
+             "matched_path", "status", "present_at_head", "commits_touched",
+             "added", "modified", "deleted", "renamed", "first_seen",
+             "last_changed", "branch_count", "error"])
+        self.assertFalse(os.path.exists(os.path.join(self.out, "file_history.csv")))
+        self.assertIn("first_subject", self.detailed[0])
+        self.assertTrue(os.path.exists(os.path.join(self.out2, "file_history.csv")))
+        self.assertEqual(len(self.summary), len(self.detailed))
+
+    def test_every_input_row_gets_one_summary_row(self):
+        self.assertEqual(sorted(int(r["row"]) for r in self.summary), list(range(1, 11)))
+
+    def test_statuses(self):
+        got = {int(r["row"]): r["status"] for r in self.summary}
+        self.assertEqual(got, {1: "found", 2: "found", 3: "found", 4: "found",
+                               5: "found", 6: "found", 7: "found",
+                               8: "not_found", 9: "repo_missing", 10: "bad_row"})
+
+    def test_renamed_file_keeps_full_history(self):
+        b = self.drow(1)
+        self.assertEqual(b["commits_touched"], "6")
+        self.assertEqual(b["renamed"], "1")
+        self.assertEqual(b["present_at_head"], "yes")
+        self.assertEqual(b["sha256"], "wrong-hash")          # carried, not used
+        self.assertEqual(b["first_subject"], "c1")
+        self.assertEqual(b["last_subject"], "Merge side")
+        hist = [h for h in read_csv(os.path.join(self.out2, "file_history.csv"))
+                if h["path"] == "b.txt"]
+        self.assertEqual([h["nth_change"] for h in hist], ["1", "2", "3", "4", "5", "6"])
+        self.assertEqual(hist[2]["old_path"], "a.txt")
+
+    def test_old_name_keeps_history_up_to_the_rename(self):
+        a = self.drow(7)                                 # a.txt, renamed to b.txt
+        self.assertEqual(a["present_at_head"], "no")
+        self.assertEqual(a["commits_touched"], "2")      # add, edit (the rename
+        self.assertEqual(a["last_change_type"], "M")     # is recorded on b.txt)
+
+    def test_path_normalisation(self):
+        self.assertEqual(self.row(2)["matched_path"], "src/y.txt")
+        self.assertEqual(self.row(3)["matched_path"], "src/y.txt")
+        self.assertEqual(self.row(4)["matched_path"], "wip.txt")
+        self.assertEqual(self.row(6)["matched_path"], "c.txt")   # "repoX/" prefix dropped
+
+    def test_branch_count(self):
+        self.assertEqual(self.row(4)["branch_count"], "1")       # wip only
+        self.assertEqual(self.row(5)["branch_count"], "2")       # side + master
+
+    def test_history_written_once_per_distinct_path(self):
+        hist = [h for h in read_csv(os.path.join(self.out2, "file_history.csv"))
+                if h["path"] == "src/y.txt"]
+        self.assertEqual(len(hist), 2)                            # rows 2 and 3 share it
+
+    def test_matches_file_churn_from_extract_commits(self):
+        churn = os.path.join(self.tmp, "churn_ref")
+        run("extract_commits.py", os.path.join(self.root, "orgA", "repoX"),
+            "--out", churn, "--churn-only", "--quiet")
+        ref = {r["path"]: r for r in read_csv(os.path.join(churn, "file_churn.csv"))}
+        for n, path in ((1, "b.txt"), (2, "src/y.txt"), (5, "feat.txt"), (4, "wip.txt")):
+            for col in ("commits_touched", "added", "modified", "deleted",
+                        "renamed", "branch_count"):
+                self.assertEqual(self.row(n)[col], ref[path][col], (path, col))
+
+    def test_resume_does_not_duplicate_rows(self):
+        out = os.path.join(self.tmp, "fh_resume")
+        args = [self.inp, "--repos-root", self.root, "--out", out, "--quiet"]
+        run("file_history_for_list.py", *args)
+        n1 = len(read_csv(os.path.join(out, "file_summary.csv")))
+        run("file_history_for_list.py", *args, "--resume")
+        self.assertEqual(len(read_csv(os.path.join(out, "file_summary.csv"))), n1)
+
+    def test_bad_columns_fail_cleanly(self):
+        bad = os.path.join(self.tmp, "bad_cols.csv")
+        with open(bad, "w") as fh:
+            fh.write("a,b\n1,2\n")
+        proc = run("file_history_for_list.py", bad, "--repos-root", self.root,
+                   "--out", os.path.join(self.tmp, "x"), check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("missing column", proc.stderr + proc.stdout)
+
+    def test_progress_bar(self):
+        self.assertIn("100.0%", self.run1.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
