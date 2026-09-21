@@ -226,13 +226,16 @@ def branch_refs(live):
     return out
 
 
-def branch_membership(repo, live, wanted):
+def branch_membership(repo, live, wanted, progress=None):
     """{commit sha: {branch names that contain it}}. A commit belongs to a
     branch if it is reachable from that branch's tip, so history shared with
     main shows up under every branch that descends from it. Only commits in
     `wanted` are kept."""
     member = {}
-    for name, (ref, _tip) in branch_refs(live).items():
+    branches = branch_refs(live)
+    for i, (name, (ref, _tip)) in enumerate(branches.items(), 1):
+        if progress:
+            progress.update(i - 1)
         try:
             shas = git_out(repo, ["rev-list", ref]).split()
         except RuntimeError:
@@ -240,6 +243,8 @@ def branch_membership(repo, live, wanted):
         for sha in shas:
             if sha in wanted:
                 member.setdefault(sha, set()).add(name)
+    if progress:
+        progress.close()
     return member
 
 
@@ -705,6 +710,69 @@ def write_file_churn(out, changes_iter, meta, repo_name="",
 # main
 # --------------------------------------------------------------------------
 
+class Progress:
+    """One-line progress bar on stderr: [####----] 42% 630/1,495 | 210/s | ETA.
+
+    Redraws in place on a terminal; when stderr is not a terminal (log file,
+    pipe) it prints a plain line every few seconds instead. `enabled=False`
+    (--quiet) makes every call a no-op."""
+
+    def __init__(self, label, total, enabled=True):
+        self.label, self.total, self.enabled = label, max(total, 0), enabled
+        self.tty = sys.stderr.isatty()
+        self.start = self.last = time.time()
+        self.gap = 0.2 if self.tty else 5.0
+        self.done = 0
+
+    def update(self, done, extra=""):
+        self.done = done
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self.last < self.gap or done >= self.total:
+            return                      # the last frame is drawn by close()
+        self.last = now
+        self._draw(extra, final=False)
+
+    def _draw(self, extra, final):
+        elapsed = time.time() - self.start
+        rate = self.done / elapsed if elapsed > 0 else 0
+        frac = min(1.0, self.done / self.total) if self.total else 1.0
+        eta = (self.total - self.done) / rate if rate and self.total else 0
+        width = 24
+        bar = "#" * int(width * frac) + "-" * (width - int(width * frac))
+        line = ("%-10s [%s] %5.1f%% %s/%s | %s/s | %s ETA %s%s"
+                % (self.label, bar, frac * 100, f"{self.done:,}",
+                   f"{self.total:,}", f"{rate:,.0f}", _hms(elapsed),
+                   _hms(eta), (" | " + extra) if extra else ""))
+        if self.tty:
+            print("\r" + line.ljust(110), end="\n" if final else "",
+                  file=sys.stderr, flush=True)
+        else:
+            print(line, file=sys.stderr, flush=True)
+
+    def close(self, extra=""):
+        if self.enabled:
+            self.done = max(self.done, self.total)
+            self._draw(extra, final=True)
+
+
+def _hms(sec):
+    sec = int(sec)
+    return "%d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60)
+
+
+def with_progress(stream, progress):
+    """Pass a (sha, changes) stream through, ticking the bar per commit."""
+    n = files = 0
+    for sha, changes in stream:
+        n += 1
+        files += len(changes)
+        progress.update(n, "%s change(s)" % f"{files:,}")
+        yield sha, changes
+    progress.close("%s change(s)" % f"{files:,}")
+
+
 def human(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -748,7 +816,9 @@ def run_churn_only(args, repo, gdir, t0, commits, reachable_set, meta,
     """--churn-only: build the summary CSVs straight from the object store.
     No commit folders, no file content, no per-commit CSVs."""
     counts = {}
-    stream = changes_from_git(repo, args.rev, args.since, args.until, args.limit)
+    stream = with_progress(
+        changes_from_git(repo, args.rev, args.since, args.until, args.limit),
+        Progress("churn", len(reachable_set), not args.quiet))
     n_files, n_trees, n_hist = write_file_churn(
         args.out, stream, meta, os.path.basename(repo), membership,
         args.branch_list, counts)
@@ -806,6 +876,8 @@ def main():
                          "folders, no file content. Merges are diffed against "
                          "the first parent, renames are detected. Ignores "
                          "--content, --layout, --resume and --dangling.")
+    ap.add_argument("--quiet", action="store_true",
+                    help="no progress bars (the summary lines still print)")
     ap.add_argument("--branch-list", action="store_true",
                     help="add a `branches` column to file_churn.csv naming the "
                          "branches each file changed on (default: only the "
@@ -881,8 +953,9 @@ def main():
         projected = 0
     if args.content != "none":
         print("avg tree  %s across %d sampled commits" % (human(avg), len(sizes)))
-    print("projected %s on disk with --content %s"
-          % (human(projected), args.content))
+    if not args.churn_only:
+        print("projected %s on disk with --content %s"
+              % (human(projected), args.content))
     if args.content == "full" and len(commits) > 1:
         print("          (--content changed would be roughly %s)"
               % human(avg * len(commits) * 0.02))
@@ -901,7 +974,9 @@ def main():
     # Which branches contain each commit (a commit records no branch of its
     # own; membership is reachability from a branch tip). Reflog-only and
     # dangling commits belong to none.
-    membership = branch_membership(repo, live, set(commits))
+    membership = branch_membership(
+        repo, live, set(commits),
+        Progress("branches", len(branch_refs(live)), not args.quiet))
 
     # ---- refs.csv ---------------------------------------------------------
     # Three tiers of confidence: refs that exist, refs whose log outlived them,
@@ -966,7 +1041,7 @@ def main():
     # ---- extract ----------------------------------------------------------
     print("extracting %d commits with %d workers ..." % (len(commits), args.jobs))
     results, done, errors = [], 0, 0
-    tick = time.time()
+    bar = Progress("extract", len(commits), not args.quiet)
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {}
@@ -994,11 +1069,8 @@ def main():
                        "files": 0, "bytes": 0, "changed": 0, "skipped": False}
             results.append(res)
             done += 1
-            if time.time() - tick > 2:
-                tick = time.time()
-                print("  %d/%d  (%d error%s)"
-                      % (done, len(futures), errors, "" if errors == 1 else "s"),
-                      flush=True)
+            bar.update(done, "%d error%s" % (errors, "" if errors == 1 else "s"))
+        bar.close("%d error%s" % (errors, "" if errors == 1 else "s"))
 
     # ---- branches into each commit's metadata.json --------------------------
     # Done after extraction so commit folders skipped by --resume get it too.
@@ -1030,7 +1102,10 @@ def main():
     churn_order = reachable_commits(repo, args.rev, args.since, args.until,
                                     args.limit, oldest_first=True)
     n_files, n_trees, n_hist = write_file_churn(
-        args.out, changes_from_folders(churn_order, folder_for), meta,
+        args.out,
+        with_progress(changes_from_folders(churn_order, folder_for),
+                      Progress("churn", len(churn_order), not args.quiet)),
+        meta,
         os.path.basename(repo), membership, args.branch_list)
     print("churn     %d file(s) -> file_churn.csv, %d tree(s) -> tree_churn.csv, "
           "%d change row(s) -> file_history.csv" % (n_files, n_trees, n_hist))
