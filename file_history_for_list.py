@@ -45,6 +45,15 @@ differ (yours is the earlier first_seen and the later last_changed). A file
 that was renamed away on some other branch but still exists at HEAD keeps its
 own history here; file_churn.csv can lose it.
 
+relpath may be a full path like AllRepos\\<org>\\<repo>\\Library\\x.prefs; the
+folders up to and including <org>\\<repo> are dropped before matching.
+
+A repo folder that git refuses to open (a .git with the objects but no HEAD or
+refs) is recovered automatically: its history is built from every commit
+object in the store, and each of its rows carries a "recovered: ..." note in
+the `error` column. branch_count is 0 for such a repo unless some refs survive,
+and present_at_head is blank without a usable HEAD.
+
 The path is relpath when it already ends with the filename, otherwise
 relpath/filename. Backslashes, a leading "./" or "/" and doubled slashes are
 normalised; if the path is not found and starts with "<repo>/", the path
@@ -59,8 +68,11 @@ Usage:
 import argparse
 import csv
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
@@ -91,13 +103,23 @@ HISTORY_HEADER = ["org", "repo", "path", "commit", "commit_date", "author",
 DONE_FILE = ".done_repos"
 
 
-def full_path(rel, fname):
-    """The repo-relative, forward-slash path a row refers to."""
+def full_path(rel, fname, org="", repo="", strip_root=True):
+    """The repo-relative, forward-slash path a row refers to.
+
+    relpath may be a full path such as AllRepos\\<org>\\<repo>\\Library\\x.prefs:
+    everything up to and including the <org>/<repo> folders is dropped."""
     rel = (rel or "").strip().replace("\\", "/")
     fname = (fname or "").strip().replace("\\", "/")
     while rel.startswith("./"):
         rel = rel[2:]
     rel = rel.lstrip("/")
+    if strip_root and org and repo:
+        segs = rel.split("/")
+        low = [x.lower() for x in segs]
+        for i in range(len(segs) - 1):
+            if low[i] == org.lower() and low[i + 1] == repo.lower():
+                rel = "/".join(segs[i + 2:])
+                break
     if rel == ".":
         rel = ""
     if fname and (rel == fname or rel.endswith("/" + fname)):
@@ -112,10 +134,12 @@ def full_path(rel, fname):
     return p
 
 
-def candidates(path, repo):
+def candidates(path, repo, raw=""):
     out = [path] if path else []
     if path.startswith(repo + "/"):
         out.append(path[len(repo) + 1:])
+    if raw and raw not in out:
+        out.append(raw)          # in case the "root" folders were part of the repo
     return out
 
 
@@ -127,6 +151,73 @@ def head_paths(repo_path):
     if proc.returncode != 0:
         return None
     return set(proc.stdout.decode("utf-8", "surrogateescape").split("\0")) - {""}
+
+
+def git_can_open(repo_path):
+    return subprocess.run(GIT + ["-C", repo_path, "rev-parse", "--git-dir"],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
+class RecoveredRepo:
+    """A stand-in git repo for a folder git refuses to open (typically a .git
+    with the objects intact but HEAD and/or refs gone).
+
+    It is a fresh bare repo that uses the broken repo's object store as an
+    alternate, plus a copy of whatever refs / packed-refs / HEAD survive.
+    Commits are then every commit object in the store - reachable or not - so
+    the history is complete, but branch_count is 0 when no refs survive and
+    present_at_head is blank when there is no usable HEAD."""
+
+    NOTE = ("recovered: git could not open this repo (no valid HEAD/refs); "
+            "history built from every commit object in the store")
+
+    def __init__(self, repo_path):
+        self.repo_path = repo_path
+        self.tmp = None
+
+    def __enter__(self):
+        gitdir = os.path.join(self.repo_path, ".git")
+        if not os.path.isdir(gitdir):
+            gitdir = self.repo_path
+        objects = os.path.join(gitdir, "objects")
+        if not os.path.isdir(objects):
+            raise RuntimeError("no objects/ directory in %s" % gitdir)
+        self.tmp = tempfile.mkdtemp(prefix="fhl_")
+        subprocess.run(GIT + ["init", "--bare", "-q", self.tmp], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(self.tmp, "objects", "info", "alternates"), "w") as fh:
+            fh.write(os.path.abspath(objects) + "\n")
+        if os.path.isdir(os.path.join(gitdir, "refs")):
+            shutil.copytree(os.path.join(gitdir, "refs"),
+                            os.path.join(self.tmp, "refs"), dirs_exist_ok=True)
+        packed = os.path.join(gitdir, "packed-refs")
+        if os.path.isfile(packed):
+            shutil.copy(packed, os.path.join(self.tmp, "packed-refs"))
+        head = os.path.join(gitdir, "HEAD")
+        if os.path.isfile(head):
+            with open(head, encoding="utf-8", errors="replace") as fh:
+                text = fh.read().strip()
+            if text.startswith("ref: ") or re.fullmatch(r"[0-9a-f]{40}", text):
+                shutil.copy(head, os.path.join(self.tmp, "HEAD"))
+        out = subprocess.run(
+            GIT + ["-C", self.tmp, "cat-file", "--batch-all-objects",
+                   "--batch-check=%(objectname) %(objecttype)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if out.returncode != 0:
+            raise RuntimeError("cannot read objects: "
+                               + out.stderr.decode("utf-8", "replace")[:200])
+        self.revs = os.path.join(self.tmp, "revs.txt")
+        with open(self.revs, "w") as fh:
+            for line in out.stdout.decode("ascii", "replace").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == "commit":
+                    fh.write(parts[0] + "\n")
+        return self
+
+    def __exit__(self, *exc):
+        if self.tmp:
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 def utc(iso):
@@ -170,8 +261,9 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
     rp = os.path.join(root, org, repo)
     prepared = []
     for rowno, rel, fname, sha in rows:
-        p = full_path(rel, fname)
-        prepared.append((rowno, rel, fname, sha, p, candidates(p, repo)))
+        p = full_path(rel, fname, org, repo)
+        prepared.append((rowno, rel, fname, sha, p,
+                         candidates(p, repo, full_path(rel, fname, strip_root=False))))
 
     def blank_rows(status, err=""):
         out = []
@@ -185,13 +277,19 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
 
     if not is_repo_dir(rp):
         return blank_rows("repo_missing")
+    recovery = None if git_can_open(rp) else RecoveredRepo(rp)
     try:
+        if recovery:
+            recovery.__enter__()
+            gp, feed = recovery.tmp, recovery.revs
+        else:
+            gp, feed = rp, None
         wanted = {c for *_x, cands in prepared for c in cands}
 
         # pass 1: rename edges (new path -> old paths), so a wanted file's
         # earlier names are tracked in pass 2
         edges = defaultdict(set)
-        for _sha, changes in changes_from_git(rp, [], None, None, None):
+        for _sha, changes in changes_from_git(gp, [], None, None, None, feed):
             for c in changes:
                 if c["status"][:1] == "R" and c["old_path"]:
                     edges[c["path"]].add(c["old_path"])
@@ -205,7 +303,7 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
         # pass 2: oldest first, keep only tracked paths; a rename moves the
         # old name's record onto the new name
         recs, needed = {}, set()
-        for sha, changes in changes_from_git(rp, [], None, None, None):
+        for sha, changes in changes_from_git(gp, [], None, None, None, feed):
             for c in changes:
                 st, p, old = c["status"][:1], c["path"], c["old_path"]
                 if p not in track and old not in track:
@@ -235,14 +333,17 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
         if not needed:
             meta = {}
         elif details or want_history:
-            meta = commit_metadata(rp, sorted(needed))
+            meta = commit_metadata(gp, sorted(needed))
         else:
-            meta = commit_dates(rp, sorted(needed))
-        member = (branch_membership(rp, live_refs(rp), needed)
+            meta = commit_dates(gp, sorted(needed))
+        member = (branch_membership(gp, live_refs(gp), needed)
                   if needed else {})
-        head = head_paths(rp)
+        head = head_paths(gp)
     except Exception as exc:                       # noqa: BLE001 - per-repo isolation
         return blank_rows("repo_error", "%s: %s" % (type(exc).__name__, str(exc)[:200]))
+    finally:
+        if recovery:
+            recovery.__exit__()
 
     def m(sha, key):
         return meta.get(sha, {}).get(key, "")
@@ -259,6 +360,8 @@ def process_repo(root, org, repo, rows, want_history=False, details=False):
     for rowno, rel, fname, sha256, p, cands in prepared:
         r = [""] * len(SUMMARY_HEADER)
         r[:6] = [rowno, org, repo, rel, fname, sha256]
+        if recovery:
+            r[SUMMARY_HEADER.index("error")] = RecoveredRepo.NOTE
         if not p:
             r[SUMMARY_HEADER.index("status")] = "bad_row"
             summary.append(r)

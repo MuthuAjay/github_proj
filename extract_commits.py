@@ -49,6 +49,7 @@ import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 
 # Repos on foreign-uid mounts (Windows drives under /mnt, network shares) trip
 # git's "detected dubious ownership" check, which aborts every plumbing call
@@ -554,12 +555,15 @@ def _parse_log_record(part):
     return sha, changes
 
 
-def changes_from_git(repo, revs, since, until, limit):
+def changes_from_git(repo, revs, since, until, limit, stdin_file=None):
     """(sha, changes) per commit, oldest first (parents before children),
     streamed from ONE `git log` over the object store - no commit folders, no
     file content. Merges are diffed against their first parent and renames are
     detected (-M), exactly as diff_tree() does per commit."""
-    cmd = GIT + ["-C", repo, "log"] + (revs if revs else ["--all", "--reflog"])
+    # stdin_file: a file of commit shas to start from (used for repos that have
+    # no usable refs, where --all would find nothing)
+    cmd = GIT + ["-C", repo, "log"] + (["--stdin"] if stdin_file else
+                                       revs if revs else ["--all", "--reflog"])
     cmd += ["--topo-order", "--reverse", "--raw", "-z", "-M", "--no-abbrev",
             "--diff-merges=first-parent", "--format=%x1e%H"]
     if since:
@@ -568,8 +572,10 @@ def changes_from_git(repo, revs, since, until, limit):
         cmd.append("--until=" + until)
     if limit:
         cmd.append("--max-count=%d" % limit)
-    with tempfile.TemporaryFile() as err:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+    with tempfile.TemporaryFile() as err, \
+            (open(stdin_file, "rb") if stdin_file else nullcontext()) as feed:
+        proc = subprocess.Popen(cmd, stdin=feed, stdout=subprocess.PIPE,
+                                stderr=err)
         buf = b""
         for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
             buf += chunk

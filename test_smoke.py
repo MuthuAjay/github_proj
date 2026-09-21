@@ -294,6 +294,11 @@ class FileHistoryForList(Base):
         cls.root = os.path.join(cls.tmp, "root")
         os.makedirs(os.path.join(cls.root, "orgA"))
         shutil.copytree(cls.repo, os.path.join(cls.root, "orgA", "repoX"))
+        # a repo git cannot open: objects intact, HEAD and refs gone
+        broken = os.path.join(cls.root, "orgA", "brk")
+        shutil.copytree(cls.repo, broken)
+        os.remove(os.path.join(broken, ".git", "HEAD"))
+        shutil.rmtree(os.path.join(broken, ".git", "refs"))
         cls.inp = os.path.join(cls.tmp, "list.tsv")
         rows = [
             ["orgA", "repoX", "b.txt", "b.txt", "wrong-hash"],       # renamed file
@@ -306,6 +311,8 @@ class FileHistoryForList(Base):
             ["orgA", "repoX", "nope.txt", "nope.txt", ""],
             ["orgA", "gone", "x.txt", "x.txt", ""],                   # repo missing
             ["", "repoX", "b.txt", "b.txt", ""],                      # blank org
+            ["orgA", "repoX", "AllRepos\\orgA\\repoX\\src\\y.txt", "y.txt", ""],  # full Windows path
+            ["orgA", "brk", "AllRepos\\orgA\\brk\\b.txt", "b.txt", ""],   # broken repo
         ]
         with open(cls.inp, "w", newline="") as fh:
             w = csv.writer(fh, delimiter="\t")
@@ -340,13 +347,14 @@ class FileHistoryForList(Base):
         self.assertEqual(len(self.summary), len(self.detailed))
 
     def test_every_input_row_gets_one_summary_row(self):
-        self.assertEqual(sorted(int(r["row"]) for r in self.summary), list(range(1, 11)))
+        self.assertEqual(sorted(int(r["row"]) for r in self.summary), list(range(1, 13)))
 
     def test_statuses(self):
         got = {int(r["row"]): r["status"] for r in self.summary}
         self.assertEqual(got, {1: "found", 2: "found", 3: "found", 4: "found",
                                5: "found", 6: "found", 7: "found",
-                               8: "not_found", 9: "repo_missing", 10: "bad_row"})
+                               8: "not_found", 9: "repo_missing", 10: "bad_row",
+                               11: "found", 12: "found"})
 
     def test_renamed_file_keeps_full_history(self):
         b = self.drow(1)
@@ -357,7 +365,7 @@ class FileHistoryForList(Base):
         self.assertEqual(b["first_subject"], "c1")
         self.assertEqual(b["last_subject"], "Merge side")
         hist = [h for h in read_csv(os.path.join(self.out2, "file_history.csv"))
-                if h["path"] == "b.txt"]
+                if h["repo"] == "repoX" and h["path"] == "b.txt"]
         self.assertEqual([h["nth_change"] for h in hist], ["1", "2", "3", "4", "5", "6"])
         self.assertEqual(hist[2]["old_path"], "a.txt")
 
@@ -366,6 +374,22 @@ class FileHistoryForList(Base):
         self.assertEqual(a["present_at_head"], "no")
         self.assertEqual(a["commits_touched"], "2")      # add, edit (the rename
         self.assertEqual(a["last_change_type"], "M")     # is recorded on b.txt)
+
+    def test_full_windows_path_is_reduced_to_repo_relative(self):
+        r = self.row(11)
+        self.assertEqual(r["matched_path"], "src/y.txt")
+        self.assertEqual(r["commits_touched"], self.row(2)["commits_touched"])
+
+    def test_broken_repo_is_recovered(self):
+        r = self.row(12)                     # git cannot open this repo at all
+        self.assertEqual(r["status"], "found")
+        self.assertIn("recovered", r["error"])
+        self.assertEqual(r["present_at_head"], "")            # no HEAD to check
+        self.assertEqual(r["branch_count"], "0")              # no refs survived
+        good = self.row(1)                                    # same file, intact repo
+        for col in ("commits_touched", "added", "modified", "deleted", "renamed"):
+            self.assertEqual(r[col], good[col], col)
+        self.assertNotIn("recovered", good["error"])
 
     def test_path_normalisation(self):
         self.assertEqual(self.row(2)["matched_path"], "src/y.txt")
@@ -379,7 +403,7 @@ class FileHistoryForList(Base):
 
     def test_history_written_once_per_distinct_path(self):
         hist = [h for h in read_csv(os.path.join(self.out2, "file_history.csv"))
-                if h["path"] == "src/y.txt"]
+                if h["repo"] == "repoX" and h["path"] == "src/y.txt"]
         self.assertEqual(len(hist), 2)                            # rows 2 and 3 share it
 
     def test_matches_file_churn_from_extract_commits(self):
