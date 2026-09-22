@@ -539,6 +539,14 @@ class FileHistoryForList(Base):
             "--out", cls.out2, "--workers", "2", "--details", "--history",
             "--quiet")
         cls.detailed = read_csv(os.path.join(cls.out2, "file_summary.csv"))
+        cls.out_rn = os.path.join(cls.tmp, "fh_renames")
+        run("file_history_for_list.py", cls.inp, "--repos-root", cls.root,
+            "--out", cls.out_rn, "--workers", "2", "--details", "--history",
+            "--follow-renames", "--quiet")
+        cls.renamed = read_csv(os.path.join(cls.out_rn, "file_summary.csv"))
+
+    def rnrow(self, n):
+        return next(r for r in self.renamed if r["row"] == str(n))
 
     def row(self, n):
         return next(r for r in self.summary if r["row"] == str(n))
@@ -568,24 +576,48 @@ class FileHistoryForList(Base):
                                8: "not_found", 9: "repo_missing", 10: "bad_row",
                                11: "found", 12: "found"})
 
-    def test_renamed_file_keeps_full_history(self):
+    def test_rename_shows_as_plain_delete_and_add_by_default(self):
+        # default (no --follow-renames): b.txt's own history only - the rename
+        # commit itself, plus edits made directly to the name "b.txt". The
+        # a.txt->b.txt rename is NOT followed, so a.txt's earlier add+edit
+        # are not folded in.
         b = self.drow(1)
-        self.assertEqual(b["commits_touched"], "6")
-        self.assertEqual(b["renamed"], "1")
+        self.assertEqual(b["commits_touched"], "4")     # add(rename), M(c4), M(side1), M(merge)
+        self.assertEqual(b["renamed"], "0")
+        self.assertEqual(b["added"], "1")
+        self.assertEqual(b["modified"], "3")
         self.assertEqual(b["present_at_head"], "yes")
         self.assertEqual(b["sha256"], "wrong-hash")          # carried, not used
-        self.assertEqual(b["first_subject"], "c1")
+        self.assertEqual(b["first_subject"], "rename")       # not c1: a.txt not followed
         self.assertEqual(b["last_subject"], "Merge side")
         hist = [h for h in read_csv(os.path.join(self.out2, "file_history.csv"))
                 if h["repo"] == "repoX" and h["path"] == "b.txt"]
+        self.assertEqual([h["nth_change"] for h in hist], ["1", "2", "3", "4"])
+        self.assertEqual([h["old_path"] for h in hist], ["", "", "", ""])   # no R status at all
+
+    def test_old_name_gets_its_own_unlinked_history_by_default(self):
+        a = self.drow(7)                                 # a.txt, renamed to b.txt at "rename"
+        self.assertEqual(a["present_at_head"], "no")
+        self.assertEqual(a["commits_touched"], "3")      # add(c1), edit(c2), delete(rename)
+        self.assertEqual(a["added"], "1")
+        self.assertEqual(a["modified"], "1")
+        self.assertEqual(a["deleted"], "1")
+        self.assertEqual(a["last_change_type"], "D")
+
+    def test_follow_renames_flag_restores_the_old_linked_behaviour(self):
+        b = self.rnrow(1)
+        self.assertEqual(b["commits_touched"], "6")
+        self.assertEqual(b["renamed"], "1")
+        self.assertEqual(b["first_subject"], "c1")          # a.txt's own history included
+        self.assertEqual(b["last_subject"], "Merge side")
+        hist = [h for h in read_csv(os.path.join(self.out_rn, "file_history.csv"))
+                if h["repo"] == "repoX" and h["path"] == "b.txt"]
         self.assertEqual([h["nth_change"] for h in hist], ["1", "2", "3", "4", "5", "6"])
         self.assertEqual(hist[2]["old_path"], "a.txt")
-
-    def test_old_name_keeps_history_up_to_the_rename(self):
-        a = self.drow(7)                                 # a.txt, renamed to b.txt
+        a = self.rnrow(7)                                   # a.txt, renamed to b.txt
         self.assertEqual(a["present_at_head"], "no")
-        self.assertEqual(a["commits_touched"], "2")      # add, edit (the rename
-        self.assertEqual(a["last_change_type"], "M")     # is recorded on b.txt)
+        self.assertEqual(a["commits_touched"], "2")          # add, edit (the rename
+        self.assertEqual(a["last_change_type"], "M")         # is recorded on b.txt)
 
     def test_full_windows_path_is_reduced_to_repo_relative(self):
         r = self.row(11)
@@ -639,19 +671,36 @@ class FileHistoryForList(Base):
         self.assertEqual(self.row(5)["branch_count"], "2")       # side + master
 
     def test_history_written_once_per_distinct_path(self):
+        # rows 2 and 3 both resolve to src/y.txt (folder-only relpath vs.
+        # backslashes); the history is written once for that path, and
+        # (without --follow-renames) it's just the one add at the rename
+        # commit - the src/x/f.txt side of the rename is untracked and dropped
         hist = [h for h in read_csv(os.path.join(self.out2, "file_history.csv"))
                 if h["repo"] == "repoX" and h["path"] == "src/y.txt"]
-        self.assertEqual(len(hist), 2)                            # rows 2 and 3 share it
+        self.assertEqual(len(hist), 1)
 
-    def test_matches_file_churn_from_extract_commits(self):
+    def test_matches_file_churn_from_extract_commits_for_non_renamed_files(self):
+        # extract_commits.py's file_churn.csv always uses -M, so it only
+        # agrees with our default (no-rename) output on files that were never
+        # renamed; feat.txt and wip.txt qualify, b.txt/src-y.txt do not.
         churn = os.path.join(self.tmp, "churn_ref")
+        run("extract_commits.py", os.path.join(self.root, "orgA", "repoX"),
+            "--out", churn, "--churn-only", "--quiet")
+        ref = {r["path"]: r for r in read_csv(os.path.join(churn, "file_churn.csv"))}
+        for n, path in ((5, "feat.txt"), (4, "wip.txt")):
+            for col in ("commits_touched", "added", "modified", "deleted",
+                        "renamed", "branch_count"):
+                self.assertEqual(self.row(n)[col], ref[path][col], (path, col))
+
+    def test_matches_file_churn_with_follow_renames(self):
+        churn = os.path.join(self.tmp, "churn_ref2")
         run("extract_commits.py", os.path.join(self.root, "orgA", "repoX"),
             "--out", churn, "--churn-only", "--quiet")
         ref = {r["path"]: r for r in read_csv(os.path.join(churn, "file_churn.csv"))}
         for n, path in ((1, "b.txt"), (2, "src/y.txt"), (5, "feat.txt"), (4, "wip.txt")):
             for col in ("commits_touched", "added", "modified", "deleted",
                         "renamed", "branch_count"):
-                self.assertEqual(self.row(n)[col], ref[path][col], (path, col))
+                self.assertEqual(self.rnrow(n)[col], ref[path][col], (path, col))
 
     def test_resume_does_not_duplicate_rows(self):
         out = os.path.join(self.tmp, "fh_resume")

@@ -62,6 +62,11 @@ own history here; file_churn.csv can lose it.
 relpath may be a full path like AllRepos\\<org>\\<repo>\\Library\\x.prefs; the
 folders up to and including <org>\\<repo> are dropped before matching.
 
+branch_count is how many branches contain at least one commit that changed the
+file. Working it out means walking every branch of the repo, which is usually
+the slowest phase and keeps one integer per commit; --no-branch-count leaves
+the column blank and skips it.
+
 A repo folder that git refuses to open (a .git with the objects but no HEAD or
 refs) is recovered automatically: its history is built from every commit
 object in the store, and each of its rows carries a "recovered: ..." note in
@@ -78,10 +83,26 @@ with its current phase; a repo running longer than --warn-after seconds also
 gets its own SLOW line. Ctrl+C once stops cleanly (running git processes are
 killed, finished repos stay saved) - rerun with --resume.
 
+Memory. Nothing in a repo's pass grows with how many CHANGES it contains: a
+tracked path keeps running totals, a branch bitmask and its earliest/latest
+commit, and history rows (--history) are spilled to a temp file (TMPDIR) and
+replayed straight into file_history.csv rather than collected. What does scale
+is the input list itself - the rows are grouped by (org, repo) up front, about
+400 bytes a row, and each repo's rows are released as it finishes - and, per
+repo in flight, one record per listed path plus one integer per commit for
+branch_count (--no-branch-count skips the latter, and it is also the slowest
+git phase). If a run is still too heavy, lower --workers first: peak memory
+is roughly the input list plus --workers times the largest repo.
+
 Usage:
     python file_history_for_list.py input.tsv --repos-root /data/workarea/archive \\
         --out out_dir --workers 8
     (re-run the same command with --resume after an interruption)
+
+    # 5.8M rows over an archive with some very large repos
+    python file_history_for_list.py input.tsv --repos-root /data/workarea/archive \\
+        --out out_dir --workers 6 --max-big-repos 2 --min-free-gb 24 \\
+        --no-branch-count
 """
 
 import argparse
@@ -100,9 +121,10 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import nullcontext
 
 from explore_input_csv import detect_delimiter, is_repo_dir
-from extract_commits import (GIT, Progress, bind_job, branch_membership,
-                             changes_from_git, commit_metadata, live_refs,
+from extract_commits import (GIT, BranchIndex, Progress, bind_job,
+                             branch_membership, changes_from_git, live_refs,
                              run_tracked, spawn)
+from extract_commits import _nul_tokens as nul_tokens
 
 SUMMARY_HEADER = ["row", "org", "repo", "relpath", "filename", "sha256",
                   "matched_path", "status", "present_at_head",
@@ -224,13 +246,31 @@ def candidates(path, repo, raw=""):
     return out
 
 
-def head_paths(repo_path):
-    """Set of paths in HEAD's tree, or None if HEAD can't be resolved."""
-    proc = run_tracked(GIT + ["-C", repo_path, "ls-tree", "-r", "-z",
-                              "--name-only", "HEAD"])
-    if proc.returncode != 0:
-        return None
-    return set(proc.stdout.decode("utf-8", "surrogateescape").split("\0")) - {""}
+def head_paths(repo_path, wanted=None):
+    """Which of `wanted` exist in HEAD's tree (every path if wanted is None),
+    or None if HEAD can't be resolved.
+
+    Read as a stream and filtered on the way in. The question being asked is
+    only ever "is this listed path still there", and a repo can have millions
+    of files: building a set of all of them to answer it for a few hundred
+    costs hundreds of megabytes per repo, times every worker.
+    """
+    with tempfile.TemporaryFile() as err:
+        proc = spawn(GIT + ["-C", repo_path, "ls-tree", "-r", "-z",
+                            "--name-only", "HEAD"],
+                     stdout=subprocess.PIPE, stderr=err)
+        out = set()
+        try:
+            for tok in nul_tokens(proc.stdout):
+                p = tok.decode("utf-8", "surrogateescape")
+                if p and (wanted is None or p in wanted):
+                    out.add(p)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdout.close()
+            proc.wait()
+        return out if proc.returncode == 0 else None
 
 
 def git_can_open(repo_path):
@@ -333,34 +373,107 @@ def utc(iso):
         return 0.0
 
 
-def commit_dates(repo_path, shas, chunk=4000):
-    """{sha: {"committer_date": ...}} - just the dates, without reading full
-    commit messages (all that the default output needs)."""
-    out = {}
-    for i in range(0, len(shas), chunk):
-        proc = run_tracked(
-            GIT + ["-C", repo_path, "log", "--no-walk", "--stdin",
-                   "--format=%H%x1f%cI"],
-            input="\n".join(shas[i:i + chunk]).encode())
-        if proc.returncode != 0:
-            raise RuntimeError("git log failed: "
-                               + proc.stderr.decode("utf-8", "replace")[:300])
-        for line in proc.stdout.decode("utf-8", "replace").splitlines():
-            sha, _, date = line.partition("\x1f")
-            if sha:
-                out[sha] = {"committer_date": date}
+FOREVER = 1 << 62          # "every row this record ever wrote" (see lineage)
+
+
+def new_rec(hid=0):
+    """One tracked path's running totals.
+
+    Deliberately holds no list. The earlier version kept every change to the
+    path - a tuple per change - and a repo where the input lists 200k files
+    that each changed 30 times then spent 2.5 GB here before any output was
+    written, in one worker. Everything the output needs is a running total, a
+    bitmask, and the earliest/latest commit seen so far, so nothing grows with
+    the number of changes.
+
+    first/last are (sha, date, author, subject) tuples, shared with every
+    other path whose first or last change is that same commit.
+    """
+    return {"n": 0, "added": 0, "modified": 0, "deleted": 0, "renamed": 0,
+            "first_ts": None, "first": None, "last_ts": None, "last": None,
+            "last_type": "", "mask": 0, "hid": hid}
+
+
+def merge_rec(dst, src):
+    """Fold `src`'s totals into `dst` (a rename bringing the old name's
+    history onto the new one)."""
+    for k in ("n", "added", "modified", "deleted", "renamed"):
+        dst[k] += src[k]
+    dst["mask"] |= src["mask"]
+    if src["first_ts"] is not None and (dst["first_ts"] is None
+                                        or src["first_ts"] < dst["first_ts"]):
+        dst["first_ts"], dst["first"] = src["first_ts"], src["first"]
+    if src["last_ts"] is not None and (dst["last_ts"] is None
+                                       or src["last_ts"] >= dst["last_ts"]):
+        dst["last_ts"], dst["last"] = src["last_ts"], src["last"]
+        dst["last_type"] = src["last_type"]
+
+
+def lineage(hid, absorbed_by, cloned_from):
+    """[(hid, max_seq)] - which spilled history rows belong to one record.
+
+    A record normally owns exactly the rows it wrote. Two things complicate
+    that, both only with --follow-renames: a rename landing on a path that
+    already had history absorbs that record's rows as well, and a rename away
+    from a path that is itself in the input clones the old record - the clone
+    owns the source's rows up to the moment of the split and none after it.
+    """
+    out, stack, seen = [], [(hid, FOREVER)], set()
+    while stack:
+        h, cap = stack.pop()
+        if (h, cap) in seen:
+            continue
+        seen.add((h, cap))
+        out.append((h, cap))
+        for a in absorbed_by.get(h, ()):
+            stack.append((a, cap))
+        src = cloned_from.get(h)
+        if src:
+            stack.append((src[0], min(cap, src[1])))
     return out
 
 
-def new_rec():
-    return {"n": 0, "added": 0, "modified": 0, "deleted": 0, "renamed": 0,
-            "first_sha": "", "last_sha": "", "last_type": "", "hist": []}
+class HistoryPart:
+    """One repo's history rows, spilled to a temp file as the repo was read
+    and replayed when they are written out.
+
+    A list would cost a few hundred bytes per change to every listed file in
+    the repo - held in the worker until it finished, then held again in the
+    main thread until it was written. The file is deleted once replayed.
+    """
+
+    def __init__(self, path, owners, org, repo):
+        self.path, self.owners, self.org, self.repo = path, owners, org, repo
+
+    def __iter__(self):
+        try:
+            with open(self.path, newline="", encoding="utf-8",
+                      errors="surrogateescape") as fh:
+                for row in csv.reader(fh):
+                    for path, cap in self.owners.get(int(row[0]), ()):
+                        if int(row[1]) <= cap:
+                            yield [self.org, self.repo, path] + row[2:]
+        finally:
+            self.close()
+
+    def close(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+def _drop(history):
+    """Throw away a history part nobody is going to write out."""
+    if hasattr(history, "close"):
+        history.close()
 
 
 def process_repo(root, org, repo, rows, want_history=False, details=False,
-                 job=None, follow_renames=False):
-    """-> (summary_rows, history_rows) for one repo. `rows` is a list of
-    (rowno, relpath, filename, sha256)."""
+                 job=None, follow_renames=False, branch_count=True):
+    """-> (summary_rows, history) for one repo. `rows` is a list of
+    (rowno, relpath, filename, sha256). `history` is an empty list, or a
+    HistoryPart to be iterated once by whoever writes file_history.csv."""
     rp = os.path.join(root, org, repo)
     job = job or RepoJob(org, repo, len(rows))
     job.start = time.time()
@@ -385,6 +498,7 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
         return blank_rows("repo_missing")
     job.phase = "opening repo"
     recovery = None if git_can_open(rp) else RecoveredRepo(rp)
+    spill = spill_path = None
     try:
         if recovery:
             job.phase = "recovering repo (listing objects)"
@@ -393,7 +507,17 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
         else:
             gp, feed = rp, None
         wanted = {c for *_x, cands in prepared for c in cands}
-        recs, needed = {}, set()
+        recs = {}
+
+        # Branch membership comes first so that a path's branch_count can be
+        # accumulated as a bitmask while its changes stream past. Working it
+        # out afterwards would mean remembering which commits touched which
+        # path - the list this pass exists to avoid keeping.
+        if branch_count:
+            job.phase = "counting branches"
+            bidx = branch_membership(gp, live_refs(gp), None)
+        else:
+            bidx = BranchIndex()
 
         if follow_renames:
             job.phase = "reading renames (pass 1/2)"
@@ -419,51 +543,94 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
             track = wanted
             job.phase = "reading history"
 
+        # The commit's own date (and, when they are wanted, its author and
+        # subject) ride along in the same `git log`, so first_seen /
+        # last_changed / the --details columns need no second pass over every
+        # sha and no dict of every commit's metadata.
+        if want_history:
+            spill = tempfile.NamedTemporaryFile(
+                mode="w", newline="", encoding="utf-8",
+                errors="surrogateescape", delete=False,
+                prefix="fhl_hist_", suffix=".csv")
+            spill_path = spill.name
+            spill_w = csv.writer(spill)
+        seq = hid_seq = 0
+        absorbed_by = defaultdict(list)   # hid -> hids folded into it
+        cloned_from = {}                  # hid -> (source hid, seq at the split)
+
+        def next_hid():
+            nonlocal hid_seq
+            hid_seq += 1
+            return hid_seq
+
         # keep only tracked paths; a rename (when --follow-renames is on)
         # moves the old name's record onto the new name. Only changes to
         # tracked paths are ever built - the rest are dropped while git's
         # output is being read, so an untracked file costs nothing however
         # many changes its commit contains.
-        for sha, changes in changes_from_git(
+        for sha, info, changes in changes_from_git(
                 gp, [], None, None, None, feed, renames=follow_renames,
-                keep=lambda status, path, old: path in track or old in track):
+                keep=lambda status, path, old: path in track or old in track,
+                meta="full" if (details or want_history) else "date"):
+            if not changes:
+                continue
+            date, author, subject = info
+            ts = utc(date)                      # once per commit, not per change
+            cmask = bidx.mask_of(sha)
+            cinfo = (sha, date, author, subject)
             for c in changes:
                 st, p, old = c["status"][:1], c["path"], c["old_path"]
                 if st == "R" and old in recs:
                     if old in wanted:
                         # the old path may still exist elsewhere (renamed on
                         # another branch only): keep its own history too
-                        moved = dict(recs[old], hist=list(recs[old]["hist"]))
+                        src = recs[old]
+                        moved = dict(src, hid=next_hid() if want_history else 0)
+                        if want_history:
+                            cloned_from[moved["hid"]] = (src["hid"], seq)
                     else:
                         moved = recs.pop(old)
                     cur = recs.get(p)
                     if cur is not None:
-                        for k in ("n", "added", "modified", "deleted", "renamed"):
-                            moved[k] += cur[k]
-                        moved["hist"] += cur["hist"]
+                        merge_rec(moved, cur)
+                        if want_history:
+                            absorbed_by[moved["hid"]].append(cur["hid"])
                     recs[p] = moved
-                rec = recs.setdefault(p, new_rec())
+                rec = recs.get(p)
+                if rec is None:
+                    rec = recs[p] = new_rec(next_hid() if want_history else 0)
                 rec["n"] += 1
                 rec["renamed" if st == "R" else "added" if st == "A"
                     else "deleted" if st == "D" else "modified"] += 1
-                rec["hist"].append(
-                    (sha, c["status"], old, c["old_blob"], c["new_blob"], rec["n"])
-                    if want_history else (sha, c["status"]))
-                needed.add(sha)
+                rec["mask"] |= cmask
+                # first / last change by commit time (UTC); ties fall back to
+                # git's order, so the earliest write wins for first and the
+                # latest for last
+                if rec["first_ts"] is None or ts < rec["first_ts"]:
+                    rec["first_ts"], rec["first"] = ts, cinfo
+                if rec["last_ts"] is None or ts >= rec["last_ts"]:
+                    rec["last_ts"], rec["last"] = ts, cinfo
+                    rec["last_type"] = c["status"]
+                if want_history:
+                    seq += 1
+                    spill_w.writerow([rec["hid"], seq, sha, date, author,
+                                      subject.replace("\n", " "), c["status"],
+                                      rec["n"], old, c["old_blob"],
+                                      c["new_blob"]])
+        if spill is not None:
+            spill.close()
+            spill = None
 
-        job.phase = "reading commit dates"
-        if not needed:
-            meta = {}
-        elif details or want_history:
-            meta = commit_metadata(gp, sorted(needed))
-        else:
-            meta = commit_dates(gp, sorted(needed))
-        job.phase = "counting branches"
-        member = (branch_membership(gp, live_refs(gp), needed)
-                  if needed else {})
         job.phase = "listing current files"
-        head = head_paths(gp)
+        head = head_paths(gp, wanted)
     except Exception as exc:                       # noqa: BLE001 - per-repo isolation
+        if spill is not None:
+            spill.close()
+        if spill_path:
+            try:
+                os.unlink(spill_path)
+            except OSError:
+                pass
         if job.expired:
             return blank_rows("timeout", "gave up after %s during: %s"
                               % (fmt_dur(job.elapsed()), job.phase))
@@ -473,16 +640,8 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
         if recovery:
             recovery.__exit__()
 
-    def m(sha, key):
-        return meta.get(sha, {}).get(key, "")
-
-    # first / last change by commit time (UTC); ties fall back to git's order
-    for rec in recs.values():
-        keyed = [(utc(m(h[0], "committer_date")), i, h)
-                 for i, h in enumerate(rec["hist"])]
-        rec["first_sha"] = min(keyed)[2][0]
-        last = max(keyed)[2]
-        rec["last_sha"], rec["last_type"] = last[0], last[1]
+    def fld(info, i):
+        return info[i] if info else ""
 
     summary, history, emitted = [], [], set()
     for rowno, rel, fname, sha256, p, cands in prepared:
@@ -503,34 +662,35 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
                 "present_at_head": ("yes" if in_head else "no")
                 if head is not None else ""}
         if rec:
+            first, last = rec["first"], rec["last"]
             vals.update(status="found", last_change_type=rec["last_type"],
                         commits_touched=rec["n"], added=rec["added"],
                         modified=rec["modified"], deleted=rec["deleted"],
                         renamed=rec["renamed"],
-                        first_seen=m(rec["first_sha"], "committer_date"),
-                        last_changed=m(rec["last_sha"], "committer_date"),
-                        branch_count=len(set().union(
-                            *(member.get(h[0], ()) for h in rec["hist"]))),
-                        first_commit=rec["first_sha"],
-                        first_author=m(rec["first_sha"], "author_name"),
-                        first_subject=(m(rec["first_sha"], "subject") or "")
-                        .replace("\n", " "),
-                        last_commit=rec["last_sha"],
-                        last_author=m(rec["last_sha"], "author_name"),
-                        last_subject=(m(rec["last_sha"], "subject") or "")
-                        .replace("\n", " "))
-            if want_history and (org, repo, matched) not in emitted:
-                emitted.add((org, repo, matched))
-                for sha, status, old, ob, nb, nth in rec["hist"]:
-                    history.append([org, repo, matched, sha,
-                                    m(sha, "committer_date"), m(sha, "author_name"),
-                                    (m(sha, "subject") or "").replace("\n", " "),
-                                    status, nth, old, ob, nb])
+                        first_seen=fld(first, 1),
+                        last_changed=fld(last, 1),
+                        branch_count=rec["mask"].bit_count(),
+                        first_commit=fld(first, 0),
+                        first_author=fld(first, 2),
+                        first_subject=fld(first, 3).replace("\n", " "),
+                        last_commit=fld(last, 0),
+                        last_author=fld(last, 2),
+                        last_subject=fld(last, 3).replace("\n", " "))
+            emitted.add(matched)
         else:
             vals["status"] = "in_head_no_history" if in_head else "not_found"
         for k, v in vals.items():
             r[SUMMARY_HEADER.index(k)] = v
         summary.append(r)
+
+    if spill_path:
+        # one entry per matched path, so a path listed by several input rows
+        # still has its history written exactly once
+        owners = defaultdict(list)
+        for path in emitted:
+            for hid, cap in lineage(recs[path]["hid"], absorbed_by, cloned_from):
+                owners[hid].append((path, cap))
+        history = HistoryPart(spill_path, owners, org, repo)
     return summary, history
 
 
@@ -586,9 +746,19 @@ def main():
                          "a rename then shows as a plain delete+add and costs "
                          "one extra git log pass per repo, which can be slow "
                          "or memory-heavy on repos with very large commits")
+    ap.add_argument("--no-branch-count", action="store_true",
+                    help="leave branch_count blank. Counting it walks every "
+                         "branch of the repo and keeps a bitmask for every "
+                         "commit, which is the most expensive phase on a repo "
+                         "with a long history and many branches")
     ap.add_argument("--big-repo-gb", type=float, default=1.0, metavar="GB",
                     help="a repo whose pack files total at least this much counts "
                          "as big (default 1)")
+    ap.add_argument("--big-repo-rows", type=int, default=100_000, metavar="N",
+                    help="a repo with at least this many input rows also counts "
+                         "as big (default 100,000). Pack size alone misses the "
+                         "repos that are heavy because the LIST is long, which "
+                         "is what the per-file bookkeeping scales with")
     ap.add_argument("--max-big-repos", type=int, default=0, metavar="N",
                     help="run at most N big repos at the same time, so that "
                          "several huge repos cannot exhaust memory (default 0 = "
@@ -637,9 +807,14 @@ def main():
     out_cols = CORE_COLUMNS + (DETAIL_COLUMNS if args.details else [])
     pick = [SUMMARY_HEADER.index(c) for c in out_cols]
 
+    total_repos = len(groups)
     todo = sorted((k for k in groups if k not in done),
                   key=lambda k: -len(groups[k]))
     rows_done = sum(len(groups[k]) for k in done if k in groups)
+    row_count = {k: len(groups[k]) for k in todo}
+    for k in list(groups):              # a finished repo keeps nothing in RAM
+        if k in done:
+            del groups[k]
     counts, hist_rows = Counter(), 0
     bar = Progress("files", total, not args.quiet)
 
@@ -673,13 +848,21 @@ def main():
         big_bytes = args.big_repo_gb * 1024 ** 3
         deferred = []                   # big repos waiting for a free big slot
 
+        def is_big(key):
+            # Pack size is how heavy the repo's history is; the row count is
+            # how heavy OUR bookkeeping is, and one tracked path costs the
+            # same whether the pack is 50 MB or 5 GB. A repo that trips either
+            # test needs a big slot.
+            return (row_count.get(key, 0) >= args.big_repo_rows
+                    or pack_bytes(os.path.join(args.repos_root, *key)) >= big_bytes)
+
         def next_repo():
             big_running = sum(1 for j in jobs.values() if j.big)
             while True:
                 key = next(todo_iter, None)
                 if key is None:
                     break
-                if pack_bytes(os.path.join(args.repos_root, *key)) >= big_bytes:
+                if is_big(key):
                     if big_running < max_big:
                         return key, True
                     deferred.append(key)
@@ -689,8 +872,12 @@ def main():
                 return deferred.pop(0), True
             return None, False
 
-        def submit_next():              # keep the queue short: 2 repos per worker
-            while len(jobs) < args.workers * 2:
+        def submit_next():
+            # Only one repo per worker is ever queued. Queueing two meant the
+            # 16 biggest repos (todo is sorted biggest first) were handed to
+            # the pool before a single one had finished, so the memory guard
+            # below had nothing left to hold back.
+            while len(jobs) < args.workers:
                 avail = mem_available_gb()
                 if (args.min_free_gb and jobs and avail is not None
                         and avail < args.min_free_gb):
@@ -698,15 +885,17 @@ def main():
                 key, big = next_repo()
                 if key is None:
                     return
-                job = RepoJob(key[0], key[1], len(groups[key]))
+                rows = groups.pop(key)  # the future owns them from here
+                job = RepoJob(key[0], key[1], len(rows))
                 job.big = big
                 jobs[pool.submit(process_repo, args.repos_root, key[0], key[1],
-                                 groups[key], args.history, args.details,
-                                 job, args.follow_renames)] = job
+                                 rows, args.history, args.details,
+                                 job, args.follow_renames,
+                                 not args.no_branch_count)] = job
 
         def status_text():
             run = [j for j in jobs.values() if j.start]
-            text = "%s/%s repos" % (f"{repos_done:,}", f"{len(groups):,}")
+            text = "%s/%s repos" % (f"{repos_done:,}", f"{total_repos:,}")
             avail = mem_available_gb()
             if avail is not None:
                 text += " | %.0fG free" % avail
@@ -729,19 +918,26 @@ def main():
                     summary, history = fut.result()
                     sw.writerows([[r[i] for i in pick] for r in summary])
                     if hw:
-                        hw.writerows(history)
+                        # streamed straight off the worker's spill file, so
+                        # neither side ever holds the repo's history rows
+                        for hrow in history:
+                            hw.writerow(hrow)
+                            hist_rows += 1
+                    else:
+                        _drop(history)
                     for r in summary:
                         counts[r[status_ix]] += 1
                     if summary and summary[0][status_ix] == "timeout":
                         timed_out.append((job, summary[0][SUMMARY_HEADER.index("error")]))
-                    hist_rows += len(history)
+                    n_rows = len(summary)
+                    del summary                 # before the next repo lands
                     sf.flush()
                     if hw:
                         hf.flush()
                     df.write("%s\t%s\n" % (job.org, job.repo))
                     df.flush()
                     repos_done += 1
-                    rows_done += len(summary)
+                    rows_done += n_rows
                 submit_next()
                 for job in jobs.values():            # watchdog + slow warnings
                     if not job.start or job.expired:
@@ -757,7 +953,7 @@ def main():
                                                   f"{job.rows:,}", job.phase),
                               file=sys.stderr, flush=True)
                 bar.update(rows_done, status_text())
-            bar.close("%s/%s repos" % (f"{repos_done:,}", f"{len(groups):,}"))
+            bar.close("%s/%s repos" % (f"{repos_done:,}", f"{total_repos:,}"))
         except KeyboardInterrupt:
             interrupted = True
             for job in list(jobs.values()):     # stop every running git process
@@ -765,6 +961,9 @@ def main():
             pool.shutdown(wait=False, cancel_futures=True)
         finally:
             pool.shutdown(wait=True)
+            for fut in list(jobs):      # spill files of repos nobody read
+                if fut.done() and not fut.cancelled() and fut.exception() is None:
+                    _drop(fut.result()[1])
             sf.flush()
             if hw:
                 hf.flush()
@@ -783,7 +982,7 @@ def main():
     if interrupted:
         print("\ninterrupted: %s of %s repo(s) finished and are saved in %s.\n"
               "Run the same command with --resume to carry on."
-              % (f"{repos_done:,}", f"{len(groups):,}", args.out), file=sys.stderr)
+              % (f"{repos_done:,}", f"{total_repos:,}", args.out), file=sys.stderr)
         return 130
 
     print("\ndone      %s row(s)%s -> %s"

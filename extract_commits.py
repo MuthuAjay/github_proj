@@ -63,6 +63,10 @@ RS = "\x1e"   # record separator between commits
 
 LOG_FMT = FS.join(["%H", "%P", "%an", "%ae", "%aI", "%cn", "%ce", "%cI",
                    "%T", "%s", "%B"]) + RS
+# the same without %B: the full message is the heaviest field by far and only
+# metadata.json prints it (see commit_metadata(with_message=False))
+LOG_FMT_NO_BODY = FS.join(["%H", "%P", "%an", "%ae", "%aI", "%cn", "%ce",
+                           "%cI", "%T", "%s"]) + RS
 
 # reflog line: <old> <new> <who> <ts> <tz>\t<action>: <message>
 REFLOG_RE = re.compile(r"^([0-9a-f]{40}) ([0-9a-f]{40}) (.*?)\t(.*)$")
@@ -262,26 +266,78 @@ def branch_refs(live):
     return out
 
 
+class BranchIndex:
+    """Which branches contain each commit, as ONE INTEGER per commit.
+
+    The obvious shape - {sha: {branch names}} - costs a Python set per commit
+    (216 bytes empty, far more once filled) plus a reference per membership. A
+    repo with a million commits on two hundred branches spends gigabytes on
+    that before a single statistic is computed. Here the branch names are
+    stored once and each commit carries a bitmask, so membership costs one int
+    per commit and the names are rebuilt only for the rows that print them.
+    """
+
+    __slots__ = ("names", "bit", "mask")
+
+    def __init__(self, names=()):
+        self.names = list(names)
+        self.bit = {n: 1 << i for i, n in enumerate(self.names)}
+        self.mask = {}
+
+    def mask_of(self, sha):
+        return self.mask.get(sha, 0)
+
+    def names_for_mask(self, mask):
+        return [n for i, n in enumerate(self.names) if mask >> i & 1]
+
+    def get(self, sha, default=()):
+        """The branch names containing `sha`, built on demand."""
+        mask = self.mask.get(sha, 0)
+        return self.names_for_mask(mask) if mask else default
+
+    def count(self, sha):
+        return self.mask.get(sha, 0).bit_count()
+
+    def __bool__(self):
+        return bool(self.mask)
+
+    def __len__(self):
+        return len(self.mask)
+
+
 def branch_membership(repo, live, wanted, progress=None):
-    """{commit sha: {branch names that contain it}}. A commit belongs to a
-    branch if it is reachable from that branch's tip, so history shared with
+    """-> BranchIndex: which branches contain each commit. A commit belongs to
+    a branch if it is reachable from that branch's tip, so history shared with
     main shows up under every branch that descends from it. Only commits in
-    `wanted` are kept."""
-    member = {}
+    `wanted` are kept; wanted=None keeps every commit a branch reaches.
+
+    rev-list output is read a line at a time: a branch tip with a million
+    commits behind it would otherwise materialise a 40 MB string and a
+    million-element list of Python strings just to be thrown away again.
+    """
     branches = branch_refs(live)
+    idx = BranchIndex(branches)
+    mask = idx.mask
     for i, (name, (ref, _tip)) in enumerate(branches.items(), 1):
         if progress:
             progress.update(i - 1)
-        try:
-            shas = git_out(repo, ["rev-list", ref]).split()
-        except RuntimeError:
-            continue
-        for sha in shas:
-            if sha in wanted:
-                member.setdefault(sha, set()).add(name)
+        bit = idx.bit[name]
+        with tempfile.TemporaryFile() as err:
+            proc = _spawn(GIT + ["-C", repo, "rev-list", ref],
+                          stdout=subprocess.PIPE, stderr=err)
+            try:
+                for raw in proc.stdout:
+                    sha = raw.strip().decode("ascii", "replace")
+                    if wanted is None or sha in wanted:
+                        mask[sha] = mask.get(sha, 0) | bit
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.stdout.close()
+                proc.wait()
     if progress:
         progress.close()
-    return member
+    return idx
 
 
 def reachable_commits(repo, revs, since, until, limit, oldest_first=False):
@@ -315,14 +371,22 @@ def pack_commits(repo):
     return out
 
 
-def commit_metadata(repo, shas, chunk=4000):
-    """Batch-read commit headers. One git process per chunk, not per commit."""
+def commit_metadata(repo, shas, chunk=4000, with_message=True):
+    """Batch-read commit headers. One git process per chunk, not per commit.
+
+    with_message=False drops %B, the full commit message. Only metadata.json
+    ever prints it, and it is by far the biggest field: keeping it for a
+    million commits costs gigabytes to answer questions that need nothing
+    beyond the author, the date and the subject.
+    """
+    fmt = LOG_FMT if with_message else LOG_FMT_NO_BODY
+    need = 11 if with_message else 10
     meta = {}
     for i in range(0, len(shas), chunk):
         batch = shas[i:i + chunk]
         proc = run_tracked(
             GIT + ["-C", repo, "log", "--no-walk", "--stdin",
-                   "--format=" + LOG_FMT],
+                   "--format=" + fmt],
             input="\n".join(batch).encode())
         if proc.returncode != 0:
             raise RuntimeError("git log failed: %s"
@@ -333,7 +397,7 @@ def commit_metadata(repo, shas, chunk=4000):
             if not record.strip():
                 continue
             f = record.split(FS)
-            if len(f) < 11:
+            if len(f) < need:
                 continue
             meta[f[0]] = {
                 "sha": f[0],
@@ -341,8 +405,10 @@ def commit_metadata(repo, shas, chunk=4000):
                 "author_name": f[2], "author_email": f[3], "author_date": f[4],
                 "committer_name": f[5], "committer_email": f[6],
                 "committer_date": f[7],
-                "tree": f[8], "subject": f[9], "message": f[10],
+                "tree": f[8], "subject": f[9],
+                "message": f[10] if with_message else "",
             }
+        del text
     return meta
 
 
@@ -576,23 +642,39 @@ def _nul_tokens(stream, size=1 << 20):
         yield buf
 
 
-def parse_log_stream(stream, keep=None):
+def parse_log_stream(stream, keep=None, meta=False):
     """(sha, changes) per commit, read from the output of
     `git log --raw -z --format=%x1e%H` as a stream.
 
     keep(status, path, old_path) -> bool, if given, is asked about each change
     BEFORE anything is built for it, so files the caller does not care about
     cost no memory: a commit that touches two million files but only two
-    wanted ones yields a list of two."""
-    sha, changes = None, []
+    wanted ones yields a list of two.
+
+    meta=True is for a log whose format also carries the commit's own fields
+    (see changes_from_git): each item is then (sha, info, changes), with info
+    the (committer_date, author_name, subject) tuple. Getting them from the
+    same process is what lets a caller avoid a second `git log` over every sha
+    it saw - the pass that used to build a dict of every commit's metadata."""
+    sha, info, changes = None, None, []
     tokens = _nul_tokens(stream)
     for tok in tokens:
         if tok.startswith(b"\n"):
             tok = tok[1:]
         if tok.startswith(b"\x1e"):
             if sha is not None:
-                yield sha, changes
-            sha, changes = tok[1:].decode("ascii", "replace").strip(), []
+                yield (sha, info, changes) if meta else (sha, changes)
+            head = tok[1:].decode("utf-8", "surrogateescape").strip("\n")
+            if meta:
+                # subject last, so a stray separator in it stays in the subject
+                f = head.split(FS, 3)
+                sha = f[0].strip()
+                info = (f[1] if len(f) > 1 else "",
+                        f[2] if len(f) > 2 else "",
+                        f[3] if len(f) > 3 else "")
+            else:
+                sha = head.strip()
+            changes = []
         elif tok.startswith(b":") and sha is not None:
             fields = tok[1:].decode("ascii", "replace").split()
             if len(fields) < 5:
@@ -610,23 +692,37 @@ def parse_log_stream(stream, keep=None):
                                 "new_mode": new_mode, "old_blob": old_blob,
                                 "new_blob": new_blob})
     if sha is not None:
-        yield sha, changes
+        yield (sha, info, changes) if meta else (sha, changes)
 
 
 def changes_from_git(repo, revs, since, until, limit, stdin_file=None,
-                     oldest_first=True, renames=True, keep=None):
+                     oldest_first=True, renames=True, keep=None, meta=False):
     """(sha, changes) per commit, oldest first (parents before children),
     streamed from ONE `git log` over the object store - no commit folders, no
     file content. Merges are diffed against their first parent and renames are
     detected (-M), exactly as diff_tree() does per commit. `keep` filters
-    changes while they are read (see parse_log_stream)."""
+    changes while they are read (see parse_log_stream).
+
+    meta asks git for the commit's own fields in the same output, and each
+    item becomes (sha, info, changes):
+      "date"  ->  (committer_date, "", "")
+      "full"  ->  (committer_date, author_name, subject)
+    A caller that takes them from here needs no second pass over the shas it
+    saw, which is the difference between holding one commit's fields and
+    holding a dict of every commit in the repo.
+    """
     # stdin_file: a file of commit shas to start from (used for repos that have
     # no usable refs, where --all would find nothing)
     cmd = GIT + ["-C", repo, "log"] + (["--stdin"] if stdin_file else
                                        revs if revs else ["--all", "--reflog"])
     cmd += ["--topo-order"] + (["--reverse"] if oldest_first else [])
+    fmt = "%x1e%H"
+    if meta:
+        fmt += FS + "%cI"
+        if meta == "full":
+            fmt += FS + "%an" + FS + "%s"
     cmd += ["--raw", "-z", "-M" if renames else "--no-renames", "--no-abbrev",
-            "--diff-merges=first-parent", "--format=%x1e%H"]
+            "--diff-merges=first-parent", "--format=" + fmt]
     if since:
         cmd.append("--since=" + since)
     if until:
@@ -636,9 +732,22 @@ def changes_from_git(repo, revs, since, until, limit, stdin_file=None,
     with tempfile.TemporaryFile() as err, \
             (open(stdin_file, "rb") if stdin_file else nullcontext()) as feed:
         proc = _spawn(cmd, stdin=feed, stdout=subprocess.PIPE, stderr=err)
-        yield from parse_log_stream(proc.stdout, keep)
-        proc.wait()
-        if proc.returncode != 0:
+        drained = False
+        try:
+            yield from parse_log_stream(proc.stdout, keep, meta=bool(meta))
+            drained = True
+        finally:
+            # A caller that stops early (or dies) would otherwise leave git
+            # running against a pipe nobody reads, holding its own memory for
+            # the rest of the run.
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+            proc.wait()
+        if drained and proc.returncode != 0:
             err.seek(0)
             raise RuntimeError("git log failed: "
                                + err.read().decode("utf-8", "replace")[:400])
@@ -672,8 +781,17 @@ def write_file_churn(out, changes_iter, meta, repo_name="",
     one commit that changed the file (see branch_membership). With branch_list
     it gets an extra `branches` column naming them, joined with "|".
     Returns (files, trees, history_rows).
+
+    Memory: a path's branches are an integer bitmask, not a set of names, so
+    branch membership costs one int per path instead of a set. What is left
+    scales with the repo's PATHS (one record each, plus a name per directory
+    it sits in for distinct_files), never with its changes - the stream is
+    consumed a commit at a time.
     """
-    commit_branches = commit_branches or {}
+    mask_of = (commit_branches.mask_of if commit_branches is not None
+               else lambda _sha: 0)
+    names_for = (commit_branches.names_for_mask if commit_branches is not None
+                 else lambda _mask: [])
     stats = {}
     trees = {}
     hist_rows = 0
@@ -697,7 +815,7 @@ def write_file_churn(out, changes_iter, meta, repo_name="",
         return stats.setdefault(path, {
             "commits": 0, "added": 0, "modified": 0, "deleted": 0,
             "renamed": 0, "first": "", "last": "",
-            "branches": set()})
+            "branches": 0})
 
     for sha, changes in changes_iter:
         date = meta.get(sha, {}).get("committer_date", "")
@@ -705,6 +823,7 @@ def write_file_churn(out, changes_iter, meta, repo_name="",
             changed_counts[sha] = len(changes)
         touched = set()
         m = meta.get(sha, {})
+        bmask = mask_of(sha)              # the same for every change of a commit
         for c in changes:
             status, p, old = c["status"][:1], c["path"], c["old_path"]
             if status == "R" and old and old in stats:
@@ -721,7 +840,7 @@ def write_file_churn(out, changes_iter, meta, repo_name="",
             r[key] += 1
             r["first"] = r["first"] or date
             r["last"] = date
-            r["branches"] |= commit_branches.get(sha, frozenset())
+            r["branches"] |= bmask
 
             for d in dict.fromkeys(dirs_of(p) + (dirs_of(old) if old else [])):
                 t = tree_rec(d)
@@ -748,6 +867,8 @@ def write_file_churn(out, changes_iter, meta, repo_name="",
         for d, t in sorted(trees.items(), key=lambda kv: (-kv[1]["commits"], kv[0])):
             w.writerow([repo_name, d, t["commits"], t["changes"],
                         len(t["files"]), t["first"], t["last"]])
+    n_trees = len(trees)
+    trees.clear()          # the path sets are the heaviest thing still held
 
     with open(os.path.join(out, "file_churn.csv"), "w", newline="",
               encoding="utf-8", errors="surrogateescape") as fh:
@@ -756,11 +877,12 @@ def write_file_churn(out, changes_iter, meta, repo_name="",
                     "renamed", "first_seen", "last_changed",
                     "branch_count"] + (["branches"] if branch_list else []))
         for p, r in sorted(stats.items(), key=lambda kv: (-kv[1]["commits"], kv[0])):
+            bits = r["branches"]
             w.writerow([p, r["commits"], r["added"], r["modified"], r["deleted"],
                         r["renamed"], r["first"], r["last"],
-                        len(r["branches"])] +
-                       (["|".join(sorted(r["branches"]))] if branch_list else []))
-    return len(stats), len(trees), hist_rows
+                        bits.bit_count()] +
+                       (["|".join(sorted(names_for(bits)))] if branch_list else []))
+    return len(stats), n_trees, hist_rows
 
 
 # --------------------------------------------------------------------------
@@ -855,6 +977,7 @@ def write_commits_csv(out, commits, meta, refs_at, membership, reachable_set,
         for i, sha in enumerate(commits):
             m = meta.get(sha, {})
             files, nbytes, changed, folder, error = extras(sha)
+            names = sorted(membership.get(sha, ()))
             w.writerow([
                 i, sha, " ".join(m.get("parents", [])),
                 int(len(m.get("parents", [])) > 1),
@@ -864,8 +987,7 @@ def write_commits_csv(out, commits, meta, refs_at, membership, reachable_set,
                 m.get("tree", ""), (m.get("subject", "") or "").replace("\n", " "),
                 files, nbytes, changed,
                 " ".join(refs_at.get(sha, [])),
-                len(membership.get(sha, ())),
-                "|".join(sorted(membership.get(sha, ()))),
+                len(names), "|".join(names),
                 int(sha in reachable_set), folder, error,
             ])
 
@@ -1028,7 +1150,9 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     # ---- metadata ---------------------------------------------------------
-    meta = commit_metadata(repo, commits)
+    # --churn-only never prints a commit message, so do not carry one: %B for
+    # a million commits is gigabytes of text nothing reads.
+    meta = commit_metadata(repo, commits, with_message=not args.churn_only)
 
     # Which branches contain each commit (a commit records no branch of its
     # own; membership is reachability from a branch tip). Reflog-only and
