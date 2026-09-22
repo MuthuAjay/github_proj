@@ -7,10 +7,21 @@ through to the output and never used for matching). Each row is looked up in
 the repo at <repos-root>/<org>/<repo>.
 
 The work is done once per repo, not once per file: the rows are grouped by
-(org, repo), and each repo's history is read with two `git log` passes over
-the object store (no checkout, no file content), then joined to the list.
-Merges are diffed against their first parent and renames are followed (-M), so
-a file that was renamed keeps the commits from before the rename.
+(org, repo), and each repo's history is read with ONE `git log` pass over the
+object store (no checkout, no file content), then joined to the list. Merges
+are diffed against their first parent.
+
+Rename detection (git's -M) is OFF by default: a renamed file shows as a plain
+delete of the old name and add of the new name, and the two names are NOT
+linked - a file's history only covers commits under the exact path you gave
+it, `renamed` is always 0, and first_seen/first_commit is the commit that
+created that name, not the file's true origin under an earlier name. This is
+deliberately cheap: git's rename detection does its own (potentially large)
+similarity-scoring work inside the git process for any commit with a lot of
+adds+deletes, before we ever see the output, and that cost cannot be filtered
+away on the Python side. Pass --follow-renames to turn it back on (two git log
+passes per repo instead of one; slower and heavier on repos with huge commits,
+but a renamed file then keeps its pre-rename history under the new name).
 
 Output (in --out): file_summary.csv, one row per input row - the same statistics
 as file_churn.csv, looked up for each listed file:
@@ -30,9 +41,9 @@ Optional extras:
 status is one of:
   found               the path has history in the repo
   in_head_no_history  in the current tree but no commit reached it (shallow?)
-  not_found           no history under that path. An old name that was renamed
-                      away is still "found" (its history up to the rename, with
-                      present_at_head = no); the new name's history includes it
+  not_found           no history under that exact path (a since-renamed-away
+                      old name is its own "found" row, with present_at_head =
+                      no, unless --follow-renames links it to the new name)
   repo_missing        <repos-root>/<org>/<repo> is not a git repo
   repo_error          git failed on that repo (message in `error`)
   timeout             the repo ran past --repo-timeout and was abandoned; the
@@ -347,7 +358,7 @@ def new_rec():
 
 
 def process_repo(root, org, repo, rows, want_history=False, details=False,
-                 job=None):
+                 job=None, follow_renames=False):
     """-> (summary_rows, history_rows) for one repo. `rows` is a list of
     (rowno, relpath, filename, sha256)."""
     rp = os.path.join(root, org, repo)
@@ -382,30 +393,39 @@ def process_repo(root, org, repo, rows, want_history=False, details=False,
         else:
             gp, feed = rp, None
         wanted = {c for *_x, cands in prepared for c in cands}
-
-        job.phase = "reading renames (pass 1/2)"
-        # pass 1: walk newest first (children before parents); whenever a
-        # tracked path was created by a rename, its old name is tracked too.
-        # Nothing but the tracked set is kept, so memory stays small even for
-        # repos with millions of renames.
-        track = set(wanted)
-
-        def renamed_from_tracked(status, path, old_path):
-            return status[:1] == "R" and bool(old_path) and path in track
-
-        for _sha, changes in changes_from_git(gp, [], None, None, None, feed,
-                                              oldest_first=False,
-                                              keep=renamed_from_tracked):
-            for c in changes:
-                track.add(c["old_path"])
-
-        # pass 2: oldest first, keep only tracked paths; a rename moves the
-        # old name's record onto the new name
         recs, needed = {}, set()
-        # only changes to tracked paths are ever built; the rest are dropped
-        # while git's output is being read
+
+        if follow_renames:
+            job.phase = "reading renames (pass 1/2)"
+            # pass 1: walk newest first (children before parents); whenever a
+            # tracked path was created by a rename, its old name is tracked
+            # too. Nothing but the tracked set is kept, so memory stays small
+            # even for repos with millions of renames.
+            track = set(wanted)
+
+            def renamed_from_tracked(status, path, old_path):
+                return status[:1] == "R" and bool(old_path) and path in track
+
+            for _sha, changes in changes_from_git(gp, [], None, None, None, feed,
+                                                  oldest_first=False,
+                                                  keep=renamed_from_tracked):
+                for c in changes:
+                    track.add(c["old_path"])
+            job.phase = "reading history (pass 2/2)"
+        else:
+            # renames off: git reports a plain delete + add instead of a
+            # rename, so only the paths actually asked for need tracking -
+            # no separate pass to discover old names.
+            track = wanted
+            job.phase = "reading history"
+
+        # keep only tracked paths; a rename (when --follow-renames is on)
+        # moves the old name's record onto the new name. Only changes to
+        # tracked paths are ever built - the rest are dropped while git's
+        # output is being read, so an untracked file costs nothing however
+        # many changes its commit contains.
         for sha, changes in changes_from_git(
-                gp, [], None, None, None, feed,
+                gp, [], None, None, None, feed, renames=follow_renames,
                 keep=lambda status, path, old: path in track or old in track):
             for c in changes:
                 st, p, old = c["status"][:1], c["path"], c["old_path"]
@@ -560,6 +580,12 @@ def main():
     ap.add_argument("--history", action="store_true",
                     help="also write file_history.csv (one row per change to "
                          "each matched file)")
+    ap.add_argument("--follow-renames", action="store_true",
+                    help="detect renames (git -M) and link a renamed file's "
+                         "pre-rename history to its new name. Off by default: "
+                         "a rename then shows as a plain delete+add and costs "
+                         "one extra git log pass per repo, which can be slow "
+                         "or memory-heavy on repos with very large commits")
     ap.add_argument("--big-repo-gb", type=float, default=1.0, metavar="GB",
                     help="a repo whose pack files total at least this much counts "
                          "as big (default 1)")
@@ -676,7 +702,7 @@ def main():
                 job.big = big
                 jobs[pool.submit(process_repo, args.repos_root, key[0], key[1],
                                  groups[key], args.history, args.details,
-                                 job)] = job
+                                 job, args.follow_renames)] = job
 
         def status_text():
             run = [j for j in jobs.values() if j.start]
