@@ -97,6 +97,21 @@ def show_top(title, counter, n, indent="  "):
         print("%s%12s  (%s more)" % (indent, "...", f"{len(counter) - n:,}"))
 
 
+def is_git_internal(path, relpath):
+    """A row pointing inside a repo's own .git directory.
+
+    A file inventory that walked the archive picks these up - hooks/*.sample,
+    description, HEAD, config, the object files - and none of them were ever
+    committed, so `not_found` is the right answer rather than a miss. They
+    would otherwise swamp the numbers that matter: a repo contributes roughly
+    a dozen .sample hooks on its own.
+    """
+    p = (path or "").replace("\\", "/")
+    r = (relpath or "").replace("\\", "/")
+    return (p == ".git" or p.startswith(".git/") or "/.git/" in p
+            or r == ".git" or r.startswith(".git/") or "/.git/" in r)
+
+
 def ext_of(name):
     """'.java', '(dotfile)' or '(no extension)' for a file name."""
     leaf = (name or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
@@ -166,6 +181,7 @@ def main():
         print("missing column(s) %s; found %s" % (missing, header), file=sys.stderr)
         return 2
     ix = {c: header.index(c) for c in NEEDED}
+    err_ix = header.index("error") if "error" in header else None
     width = len(header)
 
     rows = 0
@@ -177,8 +193,14 @@ def main():
     last_year = Counter()
     stale = Counter()
     ext_rows, ext_commits, ext_nf = Counter(), Counter(), Counter()
-    org_stat = defaultdict(lambda: [0, 0, 0, 0])   # rows, found, not_found, commits
-    repo_stat = defaultdict(lambda: [0, 0, 0, 0])
+    # rows, found, not_found, commits, not_found that are NOT .git internals
+    org_stat = defaultdict(lambda: [0, 0, 0, 0, 0])
+    repo_stat = defaultdict(lambda: [0, 0, 0, 0, 0])
+    nf_kind = Counter()
+    notes = Counter()                     # the `error` column, grouped
+    recovered_repos = set()
+    seen_paths = set()                    # hash of (org, repo, matched_path)
+    dup_rows = 0
     hot = []                              # bounded heap of (commits, org, repo, path)
     hot_cap = max(args.top, args.churn_rows)
     nf_seen = Counter()                   # not_found examples kept per repo
@@ -197,12 +219,24 @@ def main():
         o, r = org_stat[org], repo_stat[(org, repo)]
         o[0] += 1
         r[0] += 1
+        if err_ix is not None:
+            note = row[err_ix]
+            if note:
+                notes[note[:90]] += 1
+                if note.startswith("recovered:"):
+                    recovered_repos.add((org, repo))
 
         if st == "repo_missing":
             missing_repos.add((org, repo))
         if st == "not_found":
             o[2] += 1
             r[2] += 1
+            if is_git_internal(row[ix["matched_path"]], row[ix["relpath"]]):
+                nf_kind["git internals (never committed)"] += 1
+            else:
+                nf_kind["real miss"] += 1
+                o[4] += 1
+                r[4] += 1
             ext_nf[ext_of(row[ix["filename"]] or row[ix["relpath"]])] += 1
             # at most two per repo, so the examples show different problems
             # rather than the first repo's first twenty rows
@@ -240,6 +274,11 @@ def main():
                 ever_renamed += 1
 
         path = row[ix["matched_path"]]
+        key = hash((org, repo, path))     # a hash, not the tuple: 5M tuples is GBs
+        if key in seen_paths:
+            dup_rows += 1
+        else:
+            seen_paths.add(key)
         e = ext_of(path or row[ix["filename"]])
         ext_rows[e] += 1
         ext_commits[e] += n
@@ -271,6 +310,18 @@ def main():
     for st, cnt in status.most_common():
         print("  %-20s %12s  %5.1f%%" % (st, f"{cnt:,}", 100.0 * cnt / rows))
 
+    if notes:
+        print("\nNOTES  (the `error` column - read this before anything else)")
+        for note, cnt in notes.most_common(10):
+            print("  %12s  %s" % (f"{cnt:,}", note))
+        if recovered_repos:
+            print("  -> %s repo(s) were RECOVERED: the archive holds their objects "
+                  "but no\n     usable HEAD or refs, so history was rebuilt from "
+                  "every commit object in\n     the pack. Churn figures are "
+                  "complete; present_at_head and branch_count\n     cannot be "
+                  "answered for them and are blank / 0 by definition."
+                  % f"{len(recovered_repos):,}")
+
     if not found:
         print("\nnothing matched - no statistics to report")
         return 0
@@ -290,9 +341,33 @@ def main():
     for k in ("added", "modified", "deleted", "renamed"):
         print("    %-10s %14s  %5.1f%%" % (k, f"{kind[k]:,}", 100.0 * kind[k] / kt))
 
+    if dup_rows:
+        print("\n  DUPLICATE input rows  %s  (%.1f%%): %s rows resolve to only %s "
+              "distinct\n  <org>/<repo>/<path>, so every total above counts those "
+              "files more than once."
+              % (f"{dup_rows:,}", 100.0 * dup_rows / found, f"{found:,}",
+                 f"{len(seen_paths):,}"))
+
     print("\n  still present at HEAD")
     for k, c in head.most_common():
         print("    %-10s %14s  %5.1f%%" % (k, f"{c:,}", 100.0 * c / found))
+    blank_head = head.get("(blank)", 0)
+    if blank_head > found * 0.5:
+        if recovered_repos:
+            print("""
+  ^ expected: these repos have no usable HEAD (see NOTES above), so there is
+    no "current tree" to ask about. Nothing else in this report is affected -
+    history is read from the commit objects, not from HEAD.""")
+        else:
+            print("""
+  ^ present_at_head is blank for most rows, so `git ls-tree HEAD` failed on
+    those repos while their history still read fine. Either the archive kept
+    only .git/objects (no HEAD or refs), or HEAD names a branch the clone does
+    not have. Check one with:
+      ls    <repos-root>/<org>/<repo>/.git
+      cat   <repos-root>/<org>/<repo>/.git/HEAD
+      git -C <repos-root>/<org>/<repo> ls-tree -r --name-only HEAD   # exit 128
+    The churn figures are unaffected - they come from --all --reflog.""")
 
     print("\nAGE")
     print("  first seen by year")
@@ -327,26 +402,41 @@ def main():
         nf_by_repo = Counter()
         dead_repos = 0
         for key, v in repo_stat.items():
-            if not v[2]:
+            if not v[4]:                  # real misses only, .git rows excluded
                 continue
-            nf_by_repo["%s/%s" % key] = v[2]
+            nf_by_repo["%s/%s" % key] = v[4]
             if v[1] == 0:                 # the repo matched nothing at all
-                repo_level += v[2]
+                repo_level += v[4]
                 dead_repos += 1
             else:
-                path_level += v[2]
+                path_level += v[4]
         print("\n" + "=" * 78)
         print("NOT_FOUND  %s rows (%.1f%% of all rows)" % (f"{nf:,}", 100.0 * nf / rows))
+        print("\n  what they are")
+        for k, c in nf_kind.most_common():
+            print("    %-34s %12s  %5.1f%%" % (k, f"{c:,}", 100.0 * c / nf))
+        real = nf_kind["real miss"]
+        if nf_kind["git internals (never committed)"]:
+            print("    -> .git internals are an artefact of the INPUT list, not a "
+                  "matching failure.\n       Excluding them, the real miss rate is "
+                  "%s of %s rows (%.2f%%)."
+                  % (f"{real:,}", f"{rows:,}", 100.0 * real / rows))
+        if not real:
+            print("\n  no real misses to break down")
+            nf = 0
+        denom = real or 1
+        print("\n  real misses, split by where the fault is")
         print("  repo-level  %12s  %5.1f%%  in %s repo(s) where NOTHING matched"
-              % (f"{repo_level:,}", 100.0 * repo_level / nf, f"{dead_repos:,}"))
+              % (f"{repo_level:,}", 100.0 * repo_level / denom, f"{dead_repos:,}"))
         print("              -> suspect the clone: wrong repo, shallow/partial "
               "clone, or all\n                 history under a different path root")
         print("  path-level  %12s  %5.1f%%  in repos that matched other rows"
-              % (f"{path_level:,}", 100.0 * path_level / nf))
+              % (f"{path_level:,}", 100.0 * path_level / denom))
         print("              -> suspect the path: never committed (build output, "
               "vendored\n                 deps), or a rename the default run does "
               "not follow")
-        show_top("  repos with the most not_found rows", nf_by_repo, args.top, "    ")
+        show_top("  repos with the most REAL not_found rows", nf_by_repo,
+                 args.top, "    ")
         show_top("  not_found by extension", ext_nf, args.top, "    ")
         if nf_samples:
             print("\n  examples (relpath -> matched_path tried)")
@@ -368,14 +458,15 @@ def main():
         os.makedirs(args.out_dir, exist_ok=True)
         d = args.out_dir
         write_csv(os.path.join(d, "by_org.csv"),
-                  ["org", "rows", "found", "not_found", "total_commits",
-                   "mean_commits_per_found"],
-                  [[k, v[0], v[1], v[2], v[3], round(v[3] / v[1], 2) if v[1] else ""]
+                  ["org", "rows", "found", "not_found", "not_found_real",
+                   "total_commits", "mean_commits_per_found"],
+                  [[k, v[0], v[1], v[2], v[4], v[3],
+                    round(v[3] / v[1], 2) if v[1] else ""]
                    for k, v in sorted(org_stat.items(), key=lambda kv: -kv[1][0])])
         write_csv(os.path.join(d, "by_repo.csv"),
-                  ["org", "repo", "rows", "found", "not_found", "total_commits",
-                   "mean_commits_per_found"],
-                  [[k[0], k[1], v[0], v[1], v[2], v[3],
+                  ["org", "repo", "rows", "found", "not_found",
+                   "not_found_real", "total_commits", "mean_commits_per_found"],
+                  [[k[0], k[1], v[0], v[1], v[2], v[4], v[3],
                     round(v[3] / v[1], 2) if v[1] else ""]
                    for k, v in sorted(repo_stat.items(), key=lambda kv: -kv[1][0])])
         write_csv(os.path.join(d, "top_churn.csv"),
@@ -390,10 +481,11 @@ def main():
                    for e in sorted(set(ext_rows) | set(ext_nf),
                                    key=lambda x: -ext_rows[x])])
         write_csv(os.path.join(d, "not_found_repos.csv"),
-                  ["org", "repo", "not_found", "found", "kind"],
-                  [[k[0], k[1], v[2], v[1], "repo-level" if v[1] == 0 else "path-level"]
-                   for k, v in sorted(repo_stat.items(), key=lambda kv: -kv[1][2])
-                   if v[2]])
+                  ["org", "repo", "not_found", "not_found_real", "found", "kind"],
+                  [[k[0], k[1], v[2], v[4], v[1],
+                    "repo-level" if v[1] == 0 else "path-level"]
+                   for k, v in sorted(repo_stat.items(), key=lambda kv: -kv[1][4])
+                   if v[4]])
         write_csv(os.path.join(d, "repo_missing.csv"), ["org", "repo"],
                   sorted(missing_repos))
         write_csv(os.path.join(d, "not_found_samples.csv"),
