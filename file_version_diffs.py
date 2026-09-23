@@ -47,7 +47,7 @@ import subprocess
 import sys
 import tempfile
 
-from extract_commits import (GIT, commit_metadata, git_dir, git_out,
+from extract_commits import (GIT, commit_metadata, git_dir,
                              parse_log_stream, run_tracked, spawn)
 
 ZERO = "0" * 40
@@ -68,18 +68,27 @@ def normalise_path(repo, path):
     return path.replace(os.sep, "/").lstrip("/")
 
 
+def is_bare_repo(d):
+    return (os.path.isfile(os.path.join(d, "HEAD"))
+            and os.path.isdir(os.path.join(d, "objects"))
+            and os.path.isdir(os.path.join(d, "refs")))
+
+
 def find_repo(file_path):
-    """The work tree holding `file_path`, found by walking up from it. The
-    file itself need not exist (it may have been deleted); the nearest
-    existing directory above it is asked instead."""
+    """The repo holding `file_path`, found by walking up from it: the first
+    directory that has a .git, or is itself a bare repo (HEAD, objects/,
+    refs/ directly inside). The file need not exist on disk - in a bare
+    clone or a deleted file it never does - so missing directories are
+    walked past, not treated as the end."""
     d = os.path.dirname(os.path.abspath(file_path))
-    while d and not os.path.isdir(d):
-        d = os.path.dirname(d)
-    try:
-        top = git_out(d, ["rev-parse", "--show-toplevel"]).strip()
-    except RuntimeError:
-        return None
-    return top or None
+    while True:
+        if os.path.isdir(d) and (os.path.exists(os.path.join(d, ".git"))
+                                 or is_bare_repo(d)):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
 
 
 def file_changes(repo, path, revs, follow):
