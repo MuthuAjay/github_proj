@@ -38,6 +38,7 @@ carry the history across renames.
 
 Usage:
     python3 file_version_diffs.py <repo> <path/in/repo> [--out diffs.txt]
+    python3 file_version_diffs.py /full/path/to/file   [--out diffs.txt]
 """
 
 import argparse
@@ -46,8 +47,8 @@ import subprocess
 import sys
 import tempfile
 
-from extract_commits import (GIT, commit_metadata, git_dir, parse_log_stream,
-                             run_tracked, spawn)
+from extract_commits import (GIT, commit_metadata, git_dir, git_out,
+                             parse_log_stream, run_tracked, spawn)
 
 ZERO = "0" * 40
 BAR = "#" * 78
@@ -65,6 +66,20 @@ def normalise_path(repo, path):
         if full == repo or full.startswith(repo + os.sep):
             path = os.path.relpath(full, repo)
     return path.replace(os.sep, "/").lstrip("/")
+
+
+def find_repo(file_path):
+    """The work tree holding `file_path`, found by walking up from it. The
+    file itself need not exist (it may have been deleted); the nearest
+    existing directory above it is asked instead."""
+    d = os.path.dirname(os.path.abspath(file_path))
+    while d and not os.path.isdir(d):
+        d = os.path.dirname(d)
+    try:
+        top = git_out(d, ["rev-parse", "--show-toplevel"]).strip()
+    except RuntimeError:
+        return None
+    return top or None
 
 
 def file_changes(repo, path, revs, follow):
@@ -170,8 +185,10 @@ def banner(n, total, sha, meta, change):
 def main():
     ap = argparse.ArgumentParser(
         description="Save every version of one file as a chain of diffs.")
-    ap.add_argument("repo", help="path to the repository (work tree or .git)")
-    ap.add_argument("path", help="file path inside the repo")
+    ap.add_argument("repo", help="path to the repository (work tree or .git); "
+                                 "or, on its own, the full path of the file - "
+                                 "the repo is then found by walking up from it")
+    ap.add_argument("path", nargs="?", help="file path inside the repo")
     ap.add_argument("--out", help="output .txt (default: "
                                   "<file name>.versions.txt in the cwd)")
     ap.add_argument("--rev", action="append", default=[],
@@ -181,6 +198,12 @@ def main():
     ap.add_argument("--context", type=int, default=3,
                     help="lines of context around each change (default 3)")
     args = ap.parse_args()
+    if args.path is None:
+        args.path = os.path.abspath(args.repo)
+        found = find_repo(args.path)
+        if not found:
+            sys.exit("no git repository found above " + args.path)
+        args.repo = found
 
     repo = os.path.abspath(args.repo)
     if not os.path.isdir(repo):
