@@ -49,6 +49,7 @@ import tempfile
 
 from extract_commits import (GIT, commit_metadata, git_dir,
                              parse_log_stream, run_tracked, spawn)
+from file_history_for_list import RecoveredRepo, git_can_open
 
 ZERO = "0" * 40
 BAR = "#" * 78
@@ -217,37 +218,55 @@ def main():
     repo = os.path.abspath(args.repo)
     if not os.path.isdir(repo):
         sys.exit("not a directory: " + repo)
-    try:
-        gdir = git_dir(repo)
-    except RuntimeError as exc:
-        sys.exit("not a git repository: %s\n  %s" % (repo, exc))
     path = normalise_path(repo, args.path)
     out = args.out or os.path.basename(path) + ".versions.txt"
 
-    changes = file_changes(repo, path, args.rev, args.follow_renames)
+    if git_can_open(repo):
+        write_versions(repo, repo, git_dir(repo), path, out, args.rev,
+                       " ".join(args.rev or ["--all"]), args)
+        return
+    # A .git holding objects/ but no usable HEAD or refs: git will not open it,
+    # so read it through a stand-in repo that borrows the object store and
+    # gives every commit in it a ref (see file_history_for_list.py).
+    if args.rev:
+        print("note: --rev is ignored - this repo has no usable refs")
+    try:
+        with RecoveredRepo(repo) as rec:
+            rec.add_all_commits_as_refs()
+            write_versions(rec.tmp, repo,
+                           "recovered - git cannot open it (no HEAD/refs); "
+                           "read from its objects/ directly", path, out, [],
+                           "every commit object in the store", args)
+    except RuntimeError as exc:
+        sys.exit("not a git repository: %s\n  %s" % (repo, exc))
+
+
+def write_versions(gp, repo, gdir_note, path, out, revs, revs_note, args):
+    """Write the versions file. `gp` is the repo git is actually run against
+    (the stand-in for a recovered one), `repo` the one the user named."""
+    changes = file_changes(gp, path, revs, args.follow_renames)
     if not changes:
         sys.exit("no history for %s in %s" % (path, repo))
-    meta = commit_metadata(repo, [sha for sha, _c in changes],
+    meta = commit_metadata(gp, [sha for sha, _c in changes],
                            with_message=False)
 
     total = len(changes)
     with open(out, "w", encoding="utf-8", errors="replace") as fh:
         fh.write("file      %s\nrepo      %s\ngit dir   %s\nrevs      %s\n"
                  "renames   %s\nversions  %d (oldest first)\n\n"
-                 % (path, repo, gdir, " ".join(args.rev or ["--all"]),
+                 % (path, repo, gdir_note, revs_note,
                     "followed" if args.follow_renames else "not followed",
                     total))
         for n, (sha, change) in enumerate(changes, 1):
             fh.write(banner(n, total, sha, meta.get(sha, {}), change) + "\n")
             try:
-                fh.write(section_body(repo, change, args.context))
+                fh.write(section_body(gp, change, args.context))
             except RuntimeError as exc:
                 fh.write("(error: %s)" % exc)
             fh.write("\n\n")
         fh.write("### END (%d version(s))\n" % total)
 
     print("%s: %d version(s) -> %s" % (path, total, out))
-
 
 if __name__ == "__main__":
     main()
