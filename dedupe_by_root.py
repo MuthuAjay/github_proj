@@ -28,6 +28,10 @@ Works on any CSV/TSV with org, repo and relpath columns (filename optional):
 the input list for file_history_for_list.py, or its file_summary.csv. Every
 column of a kept row is written back unchanged.
 
+--only-root github replaces that rule: the github copy IS the population,
+every other root's rows are dropped, and repos with nothing under github drop
+out entirely (their rows count as dropped_loser_only in the report).
+
 Writes:
   <out>                  the kept rows
   <out>_roots.csv        per repo: files per root, the winner, rows kept,
@@ -127,6 +131,11 @@ def main():
                          "population)")
     ap.add_argument("--prefer", default="github,AllRepos",
                     help="tie-break order of roots (default github,AllRepos)")
+    ap.add_argument("--only-root", metavar="ROOT",
+                    help="keep ONLY this root's rows (e.g. github): it is the "
+                         "population, every other root is dropped, and a repo "
+                         "with no rows under it drops out entirely. Replaces "
+                         "the most-files rule; --keep-unique does not apply")
     ap.add_argument("--quiet", action="store_true", help="no progress lines")
     args = ap.parse_args()
 
@@ -146,7 +155,15 @@ def main():
     for _row, org, repo, root, _p in src.rows("pass 1/3 count", args.quiet):
         total += 1
         per_repo[(org, repo)][root] += 1
-    winner = {k: pick_winner(v, prefer) for k, v in per_repo.items()}
+    if args.only_root:
+        want = args.only_root.strip("/").lower()
+        args.keep_unique = False
+        # a repo without that root gets a winner no row has, so all its
+        # rows fall out as "loser-only"
+        winner = {k: next((r for r in v if r.lower() == want), "\0none")
+                  for k, v in per_repo.items()}
+    else:
+        winner = {k: pick_winner(v, prefer) for k, v in per_repo.items()}
 
     # ---- pass 2: the winning roots' paths ----------------------------------
     # a hash per file, not the tuple: millions of tuples cost gigabytes
@@ -193,10 +210,16 @@ def main():
             roots = per_repo[k]
             w.writerow([k[0], k[1],
                         "|".join("%s:%d" % rc for rc in roots.most_common()),
-                        winner[k], sum(roots.values())] + stat[k])
+                        "" if winner[k] == "\0none" else winner[k],
+                        sum(roots.values())] + stat[k])
 
     tot = [sum(s[i] for s in stat.values()) for i in range(5)]
     two_roots = sum(1 for v in per_repo.values() if len(v) > 1)
+    if args.only_root:
+        kept_repos = sum(1 for k in per_repo if winner[k] != "\0none")
+        print("only root            %s: %s repo(s) kept, %s repo(s) without "
+              "it dropped" % (args.only_root, f"{kept_repos:,}",
+                              f"{len(per_repo) - kept_repos:,}"))
     root_wins = Counter(winner[k] for k, v in per_repo.items() if len(v) > 1)
     print("rows in              %s  (%s repo(s), %s listed under 2+ roots)"
           % (f"{total:,}", f"{len(per_repo):,}", f"{two_roots:,}"))
@@ -205,7 +228,10 @@ def main():
     print("kept                 %s" % f"{tot[0]:,}")
     print("dropped duplicate    %s  (the winning root lists the same file)"
           % f"{tot[1]:,}")
-    if args.keep_unique:
+    if args.only_root:
+        print("dropped other roots  %s  (files not listed under %s)"
+              % (f"{tot[2]:,}", args.only_root))
+    elif args.keep_unique:
         print("kept loser-only      %s  (only the losing root lists them)"
               % f"{tot[3]:,}")
     else:
