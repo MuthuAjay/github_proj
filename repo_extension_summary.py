@@ -12,8 +12,16 @@ Output columns:
                           that changed three files counts three times
     not_found             listed paths with no history, excluding .git
                           internals (hooks, HEAD, config - never committed)
-    repo_status           ok / repo_missing / repo_error / timeout / bad_row
-                          when EVERY row of the repo had that status
+    repo_status           ok, or why the repo has nothing to count:
+                            only_git_listed  every listed path was inside
+                                             .git (config, hooks, packs) -
+                                             the input has no work-tree file
+                                             for the repo, typically a clone
+                                             that was never checked out
+                            not_found        every listed path is missing
+                                             from history
+                            repo_missing / repo_error / timeout / bad_row
+                                             every row had that status
     listed_files          files whose extension IS in the list
     listed_commits        commits_touched of those files
     files_bucket          which --file-buckets range listed_files falls in
@@ -35,13 +43,16 @@ Also written next to --out:
                            self-contained - open it in any browser
 
 Buckets are on the LISTED extensions by default (the files you are looking
-for); --bucket-on all buckets on every file instead. Repos that failed as a
-whole (repo_missing, repo_error, timeout, bad_row) are left out of the
-buckets and counted separately.
+for); --bucket-on all buckets on every file instead. Repos whose
+repo_status is not ok are left out of the buckets and counted separately,
+per status.
 
 Extensions are matched on the file name, case-insensitively. A dotfile such as
 .gitignore counts as the extension "gitignore". Rows repeating the same
-(org, repo, matched_path) - duplicate input rows - are counted once.
+(org, repo, matched_path) are counted once - found and not_found alike. That
+covers duplicate input rows and the same file inventoried under two roots
+(AllRepos\\<org>\\<repo>\\... and github\\<org>\\<repo>\\...), since
+matched_path is the path inside the repo with the root already stripped.
 
 Usage:
     python3 repo_extension_summary.py file_summary.csv --out repo_summary.csv
@@ -108,8 +119,6 @@ class Repo:
         self.ext_files = Counter()
         self.ext_commits = Counter()
         self.other_exts = Counter()
-
-
 
 
 def parse_edges(spec, default):
@@ -274,14 +283,23 @@ def write_html(path, src, basis, dists, ext_rows, totals, skipped):
     tiles = [("Repos bucketed", totals["repos"]),
              ("Files (%s)" % what, totals["files"]),
              ("Commits touched (%s)" % what, totals["commits"]),
-             ("Repos not bucketed", skipped)]
+             ("Repos not bucketed", sum(skipped.values()))]
     parts.append("<div class='tiles'>" + "".join(
         "<div class='tile'><div class='k'>%s</div><div class='v'>%s</div></div>"
         % (html.escape(k), fmt(v)) for k, v in tiles) + "</div>")
     if skipped:
-        parts.append("<p class='note'>Repos not bucketed failed as a whole "
-                     "(repo_missing, repo_error, timeout, bad_row) - see "
-                     "repo_status in the CSV.</p>")
+        why = {"only_git_listed": "every listed path was inside .git - the "
+                                  "input has no work-tree file for the repo",
+               "not_found": "no listed path has history",
+               "repo_missing": "repo folder not found",
+               "repo_error": "git failed on the repo",
+               "timeout": "repo timed out", "bad_row": "unusable input rows"}
+        parts.append("<p class='note'>Not bucketed (repo_status in the "
+                     "CSV):</p><ul class='note'>" + "".join(
+                         "<li><b>%s</b> %s &mdash; %s</li>"
+                         % (fmt(n), html.escape(st),
+                            html.escape(why.get(st, st)))
+                         for st, n in skipped.most_common()) + "</ul>")
 
     def tip(label, repos, files, commits, by):
         return ("%s %s\nrepos    %s  (%.1f%%)\nfiles    %s  (%.1f%%)\n"
@@ -387,18 +405,19 @@ def main():
             r = repos[(org, repo)]
             r.statuses[st] += 1
             path = row[ix["matched_path"]]
-            if st == "not_found":
-                if not is_git_internal(path, row[ix["relpath"]]):
-                    r.not_found += 1
+            if st not in ("found", "not_found"):
                 continue
-            if st != "found":
-                continue
-
+            # matched_path is repo-relative, so the same file inventoried
+            # under two roots (AllRepos\... and github\...) has one key
             key = hash((org, repo, path))
             if key in seen:
                 dups += 1
                 continue
             seen.add(key)
+            if st == "not_found":
+                if not is_git_internal(path, row[ix["relpath"]]):
+                    r.not_found += 1
+                continue
             try:
                 n = int(row[ix["commits_touched"]] or 0)
             except ValueError:
@@ -422,8 +441,14 @@ def main():
         return listed(r) if args.bucket_on == "listed" else (r.files, r.commits)
 
     def status_of(r):
+        if r.files:
+            return "ok"
         only = list(r.statuses)
-        return "ok" if r.files or r.not_found or len(only) != 1 else only[0]
+        if only == ["not_found"]:
+            # r.not_found leaves out .git internals, so 0 means that is all
+            # the input listed for this repo
+            return "not_found" if r.not_found else "only_git_listed"
+        return only[0] if len(only) == 1 else "ok"
 
     header = ["org", "repo", "files", "commits_touched", "not_found",
               "repo_status", "listed_files", "listed_commits",
@@ -445,7 +470,7 @@ def main():
     by_commits = [[0, 0, 0] for _ in c_labels]
     total = Repo()
     ext_repos = Counter()
-    skipped = 0
+    skipped = Counter()
     with open(args.out, "w", newline="", encoding="utf-8",
               errors="surrogateescape") as fh:
         w = csv.writer(fh)
@@ -462,7 +487,7 @@ def main():
                     dist[i][1] += nf
                     dist[i][2] += nc
             else:
-                skipped += 1
+                skipped[status] += 1
             w.writerow(line(org, repo, r, status, fb, cb))
             total.files += r.files
             total.commits += r.commits
@@ -505,6 +530,9 @@ def main():
              (", %s duplicate row(s) skipped" % fmt(dups)) if dups else ""))
     print("listed extensions: %s file(s), %s commit(s) touched"
           % (fmt(lf), fmt(lc)))
+    if skipped:
+        print("not bucketed: %s" % ", ".join(
+            "%s %s" % (fmt(n), st) for st, n in skipped.most_common()))
     print("-> %s\n-> %s\n-> %s" % (args.out, dist_path, html_path))
 
 
