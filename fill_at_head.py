@@ -21,7 +21,8 @@ Two sources for the checked-out file list (use one):
                     slow on a network mount
 
 Manifests are rewritten atomically, one repo at a time, and only the at_head
-column changes. Repos with no checked-out copy at all (not in the inventory,
+column changes. --workers lists that many repos at once: listing a network
+mount is waiting, not work, so parallel listings overlap the waits. Repos with no checked-out copy at all (not in the inventory,
 or no folder under --disk-root) are left as "" and counted, so "no" always
 means "the repo is there but this file is not".
 
@@ -39,6 +40,7 @@ import os
 import sys
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from explore_input_csv import detect_delimiter
 from file_history_for_list import full_path
@@ -88,6 +90,32 @@ def disk_paths(root, org, repo):
     return out
 
 
+def update_repo(mp, present, dry_run):
+    """Set at_head in one manifest. -> Counter of at_head over written
+    files. present=None: the repo has no checked-out copy."""
+    counts = Counter()
+    with open(mp, newline="", encoding="utf-8",
+              errors="surrogateescape") as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        return counts
+    hi = rows[0].index("at_head")
+    oi = rows[0].index("output")
+    for r in rows[1:]:
+        r[hi] = "" if present is None else ("yes" if r[2] in present else "no")
+        if r[oi]:
+            counts[r[hi] or "no checked-out copy"] += 1
+    if not dry_run:
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerows(rows)
+        tmp = mp + ".tmp"
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape",
+                  newline="") as fh:
+            fh.write(buf.getvalue())
+        os.replace(tmp, mp)
+    return counts
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -95,6 +123,10 @@ def main():
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--inventory", help="inventory CSV of the checked-out copy")
     src.add_argument("--disk-root", help="mounted folder holding <org>/<repo>")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="repos handled at once (default 16); with "
+                         "--disk-root the listings of a network mount "
+                         "overlap, which is where the speed comes from")
     ap.add_argument("--dry-run", action="store_true",
                     help="count only, do not rewrite manifests")
     args = ap.parse_args()
@@ -108,59 +140,61 @@ def main():
         inv = inventory_paths(args.inventory)
         print("inventory %s repo(s), %s path(s), read in %.0fs"
               % (f"{len(inv):,}", f"{sum(map(len, inv.values())):,}",
-                 time.time() - t0))
+                 time.time() - t0), flush=True)
 
-    counts = Counter()
-    repos = no_copy = 0
+    todo = []
     for org in sorted(os.listdir(state)):
         od = os.path.join(state, org)
         if not os.path.isdir(od):
             continue
         for repo in sorted(os.listdir(od)):
             mp = os.path.join(od, repo, "manifest.csv")
-            if not os.path.isfile(mp):
+            if os.path.isfile(mp):
+                todo.append((org, repo, mp))
+    print("repos     %s to update, %d worker(s)%s"
+          % (f"{len(todo):,}", args.workers,
+             " - dry run" if args.dry_run else ""), flush=True)
+
+    def one(item):
+        org, repo, mp = item
+        present = (inv.get((org, repo)) if inv is not None
+                   else disk_paths(args.disk_root, org, repo))
+        return present is None, update_repo(mp, present, args.dry_run)
+
+    counts = Counter()
+    done = no_copy = errors = 0
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futs = {pool.submit(one, it): it for it in todo}
+        for fut in as_completed(futs):
+            org, repo, _mp = futs[fut]
+            try:
+                missing, c = fut.result()
+            except Exception as exc:              # noqa: BLE001 - one repo
+                errors += 1
+                print("ERROR %s/%s: %s: %s" % (org, repo, type(exc).__name__,
+                                               exc), file=sys.stderr, flush=True)
                 continue
-            repos += 1
-            present = (inv.get((org, repo)) if inv is not None
-                       else disk_paths(args.disk_root, org, repo))
-            if present is None:
-                no_copy += 1
-            with open(mp, newline="", encoding="utf-8",
-                      errors="surrogateescape") as fh:
-                rows = list(csv.reader(fh))
-            if not rows:
-                continue
-            hi = rows[0].index("at_head")
-            oi = rows[0].index("output")
-            for r in rows[1:]:
-                if present is None:
-                    r[hi] = ""
-                else:
-                    r[hi] = "yes" if r[2] in present else "no"
-                if r[oi]:
-                    counts[r[hi] or "no checked-out copy"] += 1
-            if not args.dry_run:
-                buf = io.StringIO()
-                csv.writer(buf, lineterminator="\n").writerows(rows)
-                tmp = mp + ".tmp"
-                with open(tmp, "w", encoding="utf-8", errors="surrogateescape",
-                          newline="") as fh:
-                    fh.write(buf.getvalue())
-                os.replace(tmp, mp)
-            if repos % 1000 == 0:
-                print("  %s repos ..." % f"{repos:,}", file=sys.stderr,
-                      flush=True)
+            no_copy += missing
+            counts.update(c)
+            done += 1
+            if done % 500 == 0:
+                el = time.time() - t0
+                print("  %s / %s repos  %.0fs  (~%.0f min left)"
+                      % (f"{done:,}", f"{len(todo):,}", el,
+                         el / done * (len(todo) - done) / 60),
+                      file=sys.stderr, flush=True)
 
     written = sum(counts.values())
-    print("repos %s (%s with no checked-out copy)%s"
-          % (f"{repos:,}", f"{no_copy:,}",
+    print("repos %s (%s with no checked-out copy, %d error(s))%s"
+          % (f"{done:,}", f"{no_copy:,}", errors,
              " - dry run, nothing rewritten" if args.dry_run else ""))
     print("written files by at_head:")
     for k, v in counts.most_common():
         print("  %-22s %12s  %5.1f%%" % (k, f"{v:,}",
                                         100.0 * v / written if written else 0))
     print("%.0fs" % (time.time() - t0))
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
