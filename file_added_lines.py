@@ -522,6 +522,10 @@ def run_repo(cfg, org, repo, paths, job):
     bind_job(job)
     clear_repo(cfg.out, org, repo)
     status, rows, error = process_repo(cfg, org, repo, paths, job)
+    if status != "ok":
+        # a repo that timed out or failed part-way may already have flushed
+        # some files; they have no manifest rows, so they must not stay
+        clear_repo(cfg.out, org, repo)
     sd = state_dir(cfg.out, org, repo)
     os.makedirs(sd, exist_ok=True)
     buf = _csv_text([MANIFEST_HEADER] + rows)
