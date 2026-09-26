@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import csv
+import errno
 import io
 import os
 import sys
@@ -73,6 +74,10 @@ def inventory_paths(path):
             if org and repo and p:
                 out[(org, repo)].add(p)
     return out
+
+
+MOUNT_ERRNOS = {errno.ENOTCONN, errno.EIO, errno.ETIMEDOUT, errno.ESTALE,
+                errno.EHOSTDOWN, errno.ECONNABORTED, errno.ENODEV}
 
 
 def disk_paths(root, org, repo):
@@ -172,12 +177,31 @@ def main():
 
     counts = Counter()
     done = no_copy = errors = 0
+    stopped = ""
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futs = {pool.submit(one, it): it for it in todo}
         for fut in as_completed(futs):
             org, repo, _mp = futs[fut]
+            if fut.cancelled():
+                continue
             try:
                 missing, c = fut.result()
+            except OSError as exc:
+                if exc.errno in MOUNT_ERRNOS and not stopped:
+                    # the mount is gone: every other repo would fail the same
+                    # way, so stop instead of reporting thousands of errors
+                    stopped = "%s/%s: %s" % (org, repo, exc)
+                    for g in futs:
+                        g.cancel()
+                    print("STOP  the checked-out copy stopped answering (%s) "
+                          "- no new repos are started" % exc,
+                          file=sys.stderr, flush=True)
+                errors += 1
+                if exc.errno not in MOUNT_ERRNOS:
+                    print("ERROR %s/%s: %s: %s" % (org, repo,
+                                                   type(exc).__name__, exc),
+                          file=sys.stderr, flush=True)
+                continue
             except Exception as exc:              # noqa: BLE001 - one repo
                 errors += 1
                 print("ERROR %s/%s: %s: %s" % (org, repo, type(exc).__name__,
@@ -202,6 +226,12 @@ def main():
         print("  %-22s %12s  %5.1f%%" % (k, f"{v:,}",
                                         100.0 * v / written if written else 0))
     print("%.0fs" % (time.time() - t0))
+    if stopped:
+        print("STOPPED: the checked-out copy stopped answering (%s). Remount "
+              "it and run the same command again - every repo is simply "
+              "redone, the manifests already updated are rewritten with the "
+              "same values." % stopped)
+        return 3
     return 1 if errors else 0
 
 

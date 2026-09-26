@@ -25,8 +25,11 @@ A current file that cannot be read (permission, binary where history is text)
 keeps the whole history, flagged in the manifest: nothing unprocessed is ever
 dropped. A failing MOUNT is different: if the active copy stops answering
 (blobfuse "Transport endpoint is not connected", I/O errors, timeouts) the
-repo is not recorded at all - no done.json - so it cannot be mistaken for a
-repo without an active copy, and the next run retries it.
+repo is not recorded at all - no done.json - and the run STOPS starting new
+repos and exits with code 3. Remount, run the same command again, and it
+carries on with the repos not done yet. --redo-suspect reruns only done repos
+a broken mount may have spoiled (recorded with no active copy, or with a
+mount error on a current file) - for runs made before this check existed.
 
 Nothing is written to the source folder or the active copy. The output is
 self-contained, so the source can be deleted afterwards: hard-linked files
@@ -64,7 +67,7 @@ import shutil
 import sys
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 from file_added_lines import decode, utf16_text
 
@@ -126,6 +129,26 @@ def repo_exists(root, org, repo):
         if exc.errno in MOUNT_ERRNOS:
             raise MountDown("%s/%s: %s" % (org, repo, exc))
         raise
+
+
+MOUNT_ERROR_TEXT = ("Errno 107", "Transport endpoint is not connected",
+                    "Errno 5]", "Input/output error", "Errno 110",
+                    "timed out", "Errno 116", "Stale file handle")
+
+
+def suspect(out, org, repo):
+    """A done repo whose result a broken mount may have spoiled."""
+    sd = os.path.join(out, STATE, org, repo)
+    try:
+        with open(os.path.join(sd, "done.json"), encoding="utf-8") as fh:
+            if not json.load(fh).get("active_copy", True):
+                return True
+        with open(os.path.join(sd, "manifest.csv"), encoding="utf-8",
+                  errors="replace") as fh:
+            return any(t in line for line in fh for t in MOUNT_ERROR_TEXT
+                       if "unreadable_current" in line)
+    except (OSError, ValueError):
+        return True
 
 
 def link_or_copy(src, dst):
@@ -239,6 +262,7 @@ def one_file(cfg, org, repo, row, active_repo_exists):
 
 def run_repo(cfg, org, repo):
     t0 = time.time()
+    check_mount(cfg.active_root)          # before clearing anything
     if not cfg.dry_run:
         clear_repo(cfg.out, org, repo)
     mp = os.path.join(cfg.src, STATE, org, repo, "manifest.csv")
@@ -301,6 +325,12 @@ def main():
                     help="only this repo (repeatable)")
     ap.add_argument("--redo", action="store_true",
                     help="reprocess repos already done in --out")
+    ap.add_argument("--redo-suspect", action="store_true",
+                    help="reprocess only repos a broken mount may have spoiled: "
+                         "recorded as having no active copy, or with a file "
+                         "whose current version failed with a mount error "
+                         "(Transport endpoint is not connected, I/O error, "
+                         "timeout). Other done repos are skipped")
     ap.add_argument("--dry-run", action="store_true",
                     help="work everything out and print the totals, write nothing")
     ap.add_argument("--name", default="delta", help="log file name (default delta)")
@@ -345,10 +375,11 @@ def main():
                 continue
             if not os.path.isfile(os.path.join(od, repo, "manifest.csv")):
                 continue
-            if not args.redo and not args.dry_run and os.path.isfile(
-                    os.path.join(args.out, STATE, org, repo, "done.json")):
-                skipped += 1
-                continue
+            done_path = os.path.join(args.out, STATE, org, repo, "done.json")
+            if not args.redo and not args.dry_run and os.path.isfile(done_path):
+                if not (args.redo_suspect and suspect(args.out, org, repo)):
+                    skipped += 1
+                    continue
             todo.append((org, repo))
     print("repos     %s to process, %s already done%s"
           % (f"{len(todo):,}", f"{skipped:,}",
@@ -372,16 +403,31 @@ def main():
                          "seconds", "files", "files_written", "lines_history",
                          "lines_removed", "lines_kept", "error"])
     try:
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            futs = {pool.submit(run_repo, cfg, o, r): (o, r) for o, r in todo}
-            for fut in as_completed(futs):
-                o, r = futs[fut]
+        pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+        queue, running, stopped = list(todo), {}, ""
+
+        def fill():
+            while queue and not stopped and len(running) < args.workers:
+                o, r = queue.pop(0)
+                running[pool.submit(run_repo, cfg, o, r)] = (o, r)
+
+        fill()
+        while running:
+            finished_now, _ = wait(running, return_when=FIRST_COMPLETED)
+            for fut in finished_now:
+                o, r = running.pop(fut)
                 try:
                     rec = fut.result()
                 except MountDown as exc:
                     log.error("MOUNT  %s/%s not done, retried next run: %s",
                               o, r, exc)
                     statuses["mount_down"] += 1
+                    if not stopped:
+                        stopped = str(exc)
+                        log.error("STOP   the active copy is not reachable - "
+                                  "no new repos are started; the %d running "
+                                  "finish or fail, the rest stay to do",
+                                  len(running))
                     continue
                 except Exception as exc:          # noqa: BLE001 - one repo
                     log.error("FAIL   %s/%s %s: %s", o, r, type(exc).__name__, exc)
@@ -413,6 +459,8 @@ def main():
                           % (f"{done:,}", f"{len(todo):,}", el,
                              el / done * (len(todo) - done) / 60),
                           file=sys.stderr, flush=True)
+            fill()
+        pool.shutdown()
     finally:
         if repos_csv:
             repos_csv.close()
@@ -435,14 +483,15 @@ def main():
     for ln in lines:
         log.info(ln)
         print(ln)
-    if statuses["mount_down"]:
-        msg = ("%d repo(s) hit an unreachable active copy and were NOT recorded "
-               "- check the mount, then run the same command again"
-               % statuses["mount_down"])
-        log.warning(msg)
-        print(msg)
-    return 1 if (statuses["failed"] or statuses["error"]
-                 or statuses["mount_down"]) else 0
+    left = len(todo) - done - statuses["failed"]
+    if stopped:
+        msg = ("STOPPED: the active copy stopped answering (%s). %d repo(s) are "
+               "not done yet. Remount it, then run the SAME command again "
+               "(without --redo) - finished repos are skipped."
+               % (stopped, left))
+        log.error(msg)                    # shown on stderr and in the log
+        return 3
+    return 1 if statuses["failed"] or statuses["error"] else 0
 
 
 if __name__ == "__main__":
