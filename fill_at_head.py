@@ -77,12 +77,21 @@ def inventory_paths(path):
 
 def disk_paths(root, org, repo):
     """Set of repo-relative paths under <root>/<org>/<repo>, or None if the
-    folder does not exist."""
+    folder does not exist. A failing mount raises OSError instead of looking
+    like a missing repo, so that repo is reported as an error, not "no
+    checked-out copy"."""
     base = os.path.join(root, org, repo)
-    if not os.path.isdir(base):
+    try:
+        os.stat(base)
+    except FileNotFoundError:
+        with os.scandir(root) as it:   # raises if the mount itself is gone
+            next(it, None)
         return None
+
+    def onerror(exc):
+        raise exc
     out = set()
-    for dirpath, dirnames, filenames in os.walk(base):
+    for dirpath, dirnames, filenames in os.walk(base, onerror=onerror):
         dirnames[:] = [d for d in dirnames if d != ".git"]
         rel = os.path.relpath(dirpath, base)
         rel = "" if rel == "." else rel.replace(os.sep, "/") + "/"

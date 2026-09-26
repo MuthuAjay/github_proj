@@ -21,9 +21,12 @@ at_head comes from the source manifests (filled by fill_at_head.py). Where it
 is blank but the repo DOES have a folder in the active copy - fill_at_head.py
 had not reached it - the file is looked up in the active copy directly.
 
-A current file that cannot be read (mount error, binary where history is
-text) keeps the whole history, flagged in the manifest: nothing unprocessed
-is ever dropped.
+A current file that cannot be read (permission, binary where history is text)
+keeps the whole history, flagged in the manifest: nothing unprocessed is ever
+dropped. A failing MOUNT is different: if the active copy stops answering
+(blobfuse "Transport endpoint is not connected", I/O errors, timeouts) the
+repo is not recorded at all - no done.json - so it cannot be mistaken for a
+repo without an active copy, and the next run retries it.
 
 Nothing is written to the source folder or the active copy. The output is
 self-contained, so the source can be deleted afterwards: hard-linked files
@@ -52,6 +55,7 @@ Usage:
 import argparse
 import csv
 import datetime
+import errno
 import io
 import json
 import logging
@@ -87,6 +91,41 @@ def current_lines(path):
             raise ValueError("current file is binary")
         text = "\n".join(decode(ln) for ln in data.split(b"\n"))
     return {s for s in (ln.strip() for ln in text.splitlines()) if s}
+
+
+# errors that mean the MOUNT is failing, not that a file is missing or bad:
+# a repo that hits one is failed (no done.json) so the next run retries it,
+# instead of recording "no active copy" / "unreadable" for good
+MOUNT_ERRNOS = {errno.ENOTCONN, errno.EIO, errno.ETIMEDOUT, errno.ESTALE,
+                errno.EHOSTDOWN, errno.ECONNABORTED, errno.ENODEV}
+
+
+class MountDown(RuntimeError):
+    pass
+
+
+def check_mount(path):
+    """Raise MountDown unless `path` (the active root) can be listed."""
+    try:
+        with os.scandir(path) as it:
+            next(it, None)
+    except OSError as exc:
+        raise MountDown("active copy not reachable at %s: %s" % (path, exc))
+
+
+def repo_exists(root, org, repo):
+    """Does <root>/<org>/<repo> exist? A missing folder on a WORKING mount
+    is False; a failing mount raises MountDown."""
+    try:
+        os.stat(os.path.join(root, org, repo))
+        return True
+    except FileNotFoundError:
+        check_mount(root)              # missing, or is the mount gone?
+        return False
+    except OSError as exc:
+        if exc.errno in MOUNT_ERRNOS:
+            raise MountDown("%s/%s: %s" % (org, repo, exc))
+        raise
 
 
 def link_or_copy(src, dst):
@@ -140,7 +179,15 @@ def one_file(cfg, org, repo, row, active_repo_exists):
     if not active_repo_exists:
         at_head, how = "", "no_active_copy"
     elif at_head not in ("yes", "no"):
-        at_head = "yes" if os.path.isfile(active) else "no"   # not filled yet
+        try:                                   # not filled yet: look it up
+            at_head = "yes" if os.stat(active) else "no"
+        except FileNotFoundError:
+            check_mount(cfg.active_root)
+            at_head = "no"
+        except OSError as exc:
+            if exc.errno in MOUNT_ERRNOS:
+                raise MountDown("%s: %s" % (active, exc))
+            at_head = "no"
         how = "checked"
     else:
         how = ""
@@ -161,7 +208,13 @@ def one_file(cfg, org, repo, row, active_repo_exists):
 
     try:
         cur = current_lines(active)
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        if exc.errno in MOUNT_ERRNOS:
+            raise MountDown("%s: %s" % (active, exc))
+        if isinstance(exc, FileNotFoundError):
+            check_mount(cfg.active_root)
+        return whole("unreadable_current", "%s: %s" % (type(exc).__name__, exc))
+    except ValueError as exc:
         return whole("unreadable_current", "%s: %s" % (type(exc).__name__, exc))
 
     kept, n_hist = [], 0
@@ -191,7 +244,7 @@ def run_repo(cfg, org, repo):
     mp = os.path.join(cfg.src, STATE, org, repo, "manifest.csv")
     with open(mp, newline="", encoding="utf-8", errors="surrogateescape") as fh:
         src_rows = list(csv.DictReader(fh))
-    active_repo_exists = os.path.isdir(os.path.join(cfg.active_root, org, repo))
+    active_repo_exists = repo_exists(cfg.active_root, org, repo)
     rows, error = [], ""
     with ThreadPoolExecutor(max_workers=cfg.file_workers) as pool:
         futs = [pool.submit(one_file, cfg, org, repo, r, active_repo_exists)
@@ -199,6 +252,10 @@ def run_repo(cfg, org, repo):
         for f, r in zip(futs, src_rows):
             try:
                 rows.append(f.result())
+            except MountDown:
+                for g in futs:
+                    g.cancel()
+                raise                         # the whole repo is retried
             except Exception as exc:          # noqa: BLE001 - one file
                 error = "%s: %s" % (type(exc).__name__, exc)
                 rows.append([org, repo, r["path"], "", "error",
@@ -252,8 +309,10 @@ def main():
     src_state = os.path.join(args.src, STATE)
     if not os.path.isdir(src_state):
         sys.exit("no _state folder under " + args.src)
-    if not os.path.isdir(args.active_root):
-        sys.exit("not a directory: " + args.active_root)
+    try:
+        check_mount(args.active_root)
+    except MountDown as exc:
+        sys.exit(str(exc))
     if os.path.realpath(args.out) == os.path.realpath(args.src):
         sys.exit("--out must be a different folder from the source")
 
@@ -319,6 +378,11 @@ def main():
                 o, r = futs[fut]
                 try:
                     rec = fut.result()
+                except MountDown as exc:
+                    log.error("MOUNT  %s/%s not done, retried next run: %s",
+                              o, r, exc)
+                    statuses["mount_down"] += 1
+                    continue
                 except Exception as exc:          # noqa: BLE001 - one repo
                     log.error("FAIL   %s/%s %s: %s", o, r, type(exc).__name__, exc)
                     statuses["failed"] += 1
@@ -371,7 +435,14 @@ def main():
     for ln in lines:
         log.info(ln)
         print(ln)
-    return 1 if statuses["failed"] or statuses["error"] else 0
+    if statuses["mount_down"]:
+        msg = ("%d repo(s) hit an unreachable active copy and were NOT recorded "
+               "- check the mount, then run the same command again"
+               % statuses["mount_down"])
+        log.warning(msg)
+        print(msg)
+    return 1 if (statuses["failed"] or statuses["error"]
+                 or statuses["mount_down"]) else 0
 
 
 if __name__ == "__main__":
