@@ -7,8 +7,9 @@ whether it was deleted or renamed.
 
 ## Summary
 
-- **6,059,816 files** exist only in history, across all **13,631**
-  repositories.
+- **6,059,816 files** exist only in history. Of the **13,631** repositories
+  analysed, **8,420** have such files; the other 5,211 still contain every
+  file they ever had.
 - **30% (1.83M)** are third-party code, mostly JavaScript packages
   (`node_modules`), saved into repositories and later cleaned out.
 - **70% (4.23M)** are the teams' own files:
@@ -32,7 +33,14 @@ whether it was deleted or renamed.
 | **History-only files** | **6,059,816** | 100% |
 | Teams' own files | 4,225,510 | 69.7% |
 | Third-party code (not traced further) | 1,834,306 | 30.3% |
-| Repositories | 13,631 | |
+
+| Repositories | Count |
+|---|---:|
+| Analysed | 13,631 |
+| **With history-only files** | **8,420** |
+| of which with the teams' own files | 8,406 |
+| of which with third-party code only | 14 |
+| With no history-only files (every file still exists) | 5,211 |
 
 ## Why the teams' own files are gone
 
