@@ -249,6 +249,12 @@ def load_manifest(src, org, repo):
     return hist, at_head
 
 
+def one_line(text):
+    """Commit subjects can carry \r (commits made on Windows); a bare \r is
+    not quoted by the csv writer and splits the row when read back."""
+    return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+
+
 def csv_text(rows):
     buf = io.StringIO()
     csv.writer(buf, lineterminator="\n").writerows(rows)
@@ -313,7 +319,7 @@ def process_repo(cfg, org, repo, job):
         to = r["renamed_to"] if reason == "renamed" else ""
         rows.append([org, repo, p, "own_code", "", reason,
                      first[0], first[1], last[0], last[1],
-                     rem[0], rem[1], rem[2].replace("\n", " ")[:300],
+                     rem[0], rem[1], one_line(rem[2])[:300],
                      to, at_head.get(to, "") if to else "",
                      "|".join(br), versions,
                      "yes" if cfg.renames else "no"])
@@ -356,6 +362,8 @@ def combine(out, top_n=30):
     removal_meta = {}
     by_repo = defaultdict(Counter)
     total = repos = 0
+    broken = Counter()                             # (org, repo) -> bad rows
+    width = len(ROW_HEADER)
     comb = os.path.join(out, "history_only_files.csv")
     with open(comb + ".tmp", "w", newline="", encoding="utf-8",
               errors="surrogateescape") as cf:
@@ -373,6 +381,11 @@ def combine(out, top_n=30):
                     rd = csv.reader(fh)
                     next(rd, None)
                     for r in rd:
+                        if len(r) != width:
+                            # a row split by a bare \r (written before that
+                            # was cleaned); --redo-broken rebuilds the repo
+                            broken[(org, repo)] += 1
+                            continue
                         w.writerow(r)
                         total += 1
                         reason, cat = r[5], r[3]
@@ -454,6 +467,12 @@ def combine(out, top_n=30):
             " | ".join(f"{c[x]:,}" for x in reason_cols)))
     with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(md) + "\n")
+    write("broken_rows.csv", ["org", "repo", "broken_rows"],
+          [[o, r, n] for (o, r), n in sorted(broken.items())])
+    if broken:
+        print("WARNING %s broken row(s) in %d repo(s) skipped - listed in "
+              "broken_rows.csv; rerun those repos with --redo-broken"
+              % (f"{sum(broken.values()):,}", len(broken)), file=sys.stderr)
     return total, repos
 
 
@@ -492,6 +511,9 @@ def main():
                     help="only repos whose last attempt failed or timed out")
     ap.add_argument("--redo", action="store_true",
                     help="reprocess repos already done")
+    ap.add_argument("--redo-broken", action="store_true",
+                    help="reprocess only the repos listed in broken_rows.csv "
+                         "(rows split by a \\r in a commit message)")
     ap.add_argument("--combine-only", action="store_true",
                     help="only rebuild the combined CSV and summaries")
     ap.add_argument("--name", help="log name (default: batch name or 'run')")
@@ -539,7 +561,12 @@ def main():
             return None
 
     prior = {k: state_of(k) for k in chosen}
-    if args.redo:
+    if args.redo_broken:
+        bp = os.path.join(args.out, "broken_rows.csv")
+        with open(bp, newline="", encoding="utf-8") as f:
+            bad = {(r["org"], r["repo"]) for r in csv.DictReader(f)}
+        todo = [k for k in chosen if k in bad]
+    elif args.redo:
         todo = chosen
     elif args.retry_failed:
         todo = [k for k in chosen if prior[k] not in (None, "ok")]
