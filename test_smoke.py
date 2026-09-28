@@ -723,5 +723,43 @@ class FileHistoryForList(Base):
         self.assertIn("100.0%", self.run1.stderr)
 
 
+class FileDelta(unittest.TestCase):
+    """file_delta.py on a hand-made extraction: the history lines minus the
+    current file's, with a "\\r" inside a line on both sides."""
+
+    def test_subtracts_lines_with_inner_cr(self):
+        tmp = tempfile.mkdtemp(prefix="delta_")
+        try:
+            src, act, out = (os.path.join(tmp, d) for d in ("src", "act", "out"))
+            sd = os.path.join(src, "_state", "o", "r")
+            os.makedirs(sd)
+            os.makedirs(os.path.join(src, "o", "r"))
+            with open(os.path.join(src, "o", "r", "f.sql.txt"), "wb") as fh:
+                fh.write(b"keep me\nsame\ra\nold\n")        # as extracted
+            with open(os.path.join(src, "o", "r", "gone.sql.txt"), "wb") as fh:
+                fh.write(b"x\ny\n")
+            with open(os.path.join(sd, "manifest.csv"), "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["org", "repo", "path", "output", "status", "at_head"])
+                w.writerow(["o", "r", "f.sql", "o/r/f.sql.txt", "ok", "yes"])
+                w.writerow(["o", "r", "gone.sql", "o/r/gone.sql.txt", "ok", "no"])
+            os.makedirs(os.path.join(act, "o", "r"))
+            with open(os.path.join(act, "o", "r", "f.sql"), "wb") as fh:
+                fh.write(b"  same\ra  \r\nold\r\n")          # CRLF, indented
+            run("file_delta.py", src, "--active-root", act, "--out", out)
+            with open(os.path.join(out, "o", "r", "f.sql.txt"), "rb") as fh:
+                self.assertEqual(fh.read(), b"keep me\n")
+            with open(os.path.join(out, "o", "r", "gone.sql.txt"), "rb") as fh:
+                self.assertEqual(fh.read(), b"x\ny\n")        # whole history
+            rows = {r["path"]: r for r in read_csv(
+                os.path.join(out, "_state", "o", "r", "manifest.csv"))}
+            self.assertEqual((rows["f.sql"]["action"],
+                              rows["f.sql"]["lines_history"],
+                              rows["f.sql"]["lines_removed"]),
+                             ("subtracted", "3", "2"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

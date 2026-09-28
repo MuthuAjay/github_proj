@@ -153,7 +153,6 @@ class ExtensionVersions(unittest.TestCase):
         self.assertEqual(self.e("xlsx", "versions_per_file"), "4")
         self.assertEqual(self.e("xlsx", "versions_beyond_head"), "3")
         self.assertEqual(self.e("xlsx", "same_as_latest"), "1")
-        self.assertEqual(self.e("xlsx", "versions_to_send"), "5")  # 4 + active-only
         self.assertEqual(self.e("xlsx", "files_active_only"), "1")
         self.assertEqual(self.files[("repoA", "docs/report.xlsx")]["latest_blob"],
                          git(os.path.join(self.arch, "org1", "repoA"),
@@ -188,19 +187,50 @@ class ExtensionVersions(unittest.TestCase):
         self.assertEqual(ident["logo.png"]["hashed"], "yes")    # size matched
         self.assertEqual(ident["notes.msg"]["hashed"], "no")    # size did not
 
-    def test_to_send(self):
-        self.assertEqual(self.e("png", "versions_to_send"), "4")   # 3 + active logo
-        self.assertEqual(self.e("jpg", "versions_to_send"), "2")
+    def test_to_send_head_processed(self):
+        # a version identical to an active file is skipped in every repo
+        want = {"xlsx": 3,      # 4 minus the active one; active-only adds 0
+                "png": 1,       # PNG is in repoA's active copy (the copy):
+                                # repoA's logo and copy skip it; repoB has no
+                                # active copy, so its logo is sent
+                "jpg": 1,       # a.jpg is b.jpg's content: JB skipped, JA sent
+                "pptx": 1,      # DECK1 is active (same_as_older), DECK2 sent
+                "msg": 1,       # no_match: the one archived version
+                "woff": 0, "mpg": 0,          # mpg: only an LFS stub
+                "xls": 1, "docx": 1}          # no active repo / deleted
+        got = {e: int(self.e(e, "versions_to_send")) for e in want}
+        self.assertEqual(got, want)
+        self.assertEqual(self.e("xlsx", "versions_to_send_all_repos"), "3")
+        self.assertEqual(self.e("png", "versions_to_send_all_repos"), "1")
+        self.assertEqual(self.e("lock", "versions_to_send"), "")   # text: n/a
+
+    def test_to_send_incl_head(self):
+        want = {"xlsx": 5,      # 4 + the active-only new.xlsx
+                "png": 4,       # 3 + the active logo (no_match)
+                "jpg": 2, "pptx": 2,
+                "mpg": 1,       # stub 0 + the real file in the active copy
+                "woff": 1, "xls": 1,
+                "msg": 2,       # 1 + the active file (no_match)
+                "docx": 1}
+        got = {e: int(self.e(e, "versions_to_send_incl_head")) for e in want}
+        self.assertEqual(got, want)
         self.assertEqual(self.e("jpg", "files_history_only"), "1")
-        self.assertEqual(self.e("pptx", "versions_to_send"), "2")
-        self.assertEqual(self.e("mpg", "versions_to_send"), "1")   # stub 0 + real 1
         self.assertEqual(self.e("mpg", "lfs_stub_versions"), "1")
         self.assertEqual(self.e("woff", "files_vendored"), "1")
-        self.assertEqual(self.e("woff", "versions_to_send"), "1")
-        self.assertEqual(self.e("xls", "versions_to_send"), "1")
-        self.assertEqual(self.e("msg", "versions_to_send"), "2")  # + no_match
-        self.assertEqual(self.e("docx", "versions_to_send"), "1")
         self.assertEqual(self.e("msg", "at_head_unchecked"), "0")
+
+    def test_commit_per_version(self):
+        a = os.path.join(self.arch, "org1", "repoA")
+        vers = {r["blob"]: r for r in read_csv(os.path.join(
+            self.out, "_state", "org1", "repoA", "versions.csv"))
+            if r["path"] == "docs/report.xlsx"}
+        first = git(a, "rev-parse", "HEAD~5:docs/report.xlsx").strip()   # c1
+        last = git(a, "rev-parse", "HEAD:docs/report.xlsx").strip()      # c5
+        self.assertEqual(vers[first]["first_commit"],
+                         git(a, "rev-parse", "HEAD~5").strip())
+        self.assertEqual(vers[last]["last_commit"],
+                         git(a, "rev-parse", "HEAD").strip())
+        self.assertTrue(vers[last]["first_date"].startswith("20"))
 
     def test_case_delete_and_text(self):
         f = self.files[("repoA", "Old.DOCX")]
@@ -222,6 +252,27 @@ class ExtensionVersions(unittest.TestCase):
         md = load(self.out, "summary.md")
         self.assertIn("| xlsx |", md)
         self.assertIn("Binary extensions", md)
+
+
+class PassOneOnly(unittest.TestCase):
+    def test_latest_assumed_processed(self):
+        tmp = tempfile.mkdtemp(prefix="extv_p1_")
+        try:
+            arch, act, batch = build(tmp)
+            out = os.path.join(tmp, "out")
+            run("extension_versions.py", "--batch", batch, "--repos-root", arch,
+                "--active-root", act, "--out", out)
+            ext = {r["ext"]: r for r in
+                   read_csv(os.path.join(out, "by_extension.csv"))}
+            # no pass 2: each binary file's latest version counts as the
+            # active one - pptx then sends DECK1, not DECK2 (pass 2 corrects)
+            self.assertEqual(ext["xlsx"]["versions_to_send"], "3")
+            self.assertEqual(ext["png"]["versions_to_send"], "1")   # repoB
+            self.assertEqual(ext["pptx"]["versions_to_send"], "1")
+            self.assertEqual(ext["xlsx"]["at_head_unchecked"], "1")
+            self.assertEqual(ext["xlsx"]["at_head_checked"], "0")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class MountDrop(unittest.TestCase):

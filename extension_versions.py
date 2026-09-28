@@ -47,7 +47,9 @@ run the same command again, and it carries on.
 
 Output, under --out:
   _state/<org>/<repo>/files.csv     pass 1: one row per path
-  _state/<org>/<repo>/versions.csv  pass 1: one row per (path, distinct blob)
+  _state/<org>/<repo>/versions.csv  pass 1: one row per (path, distinct blob),
+                                    with the first and last commit (and
+                                    date) that gave the path that content
   _state/<org>/<repo>/done.json     pass 1 outcome, written last (resume)
   _state/<org>/<repo>/identical.csv, identical.json      pass 2
   _logs/<name>.log, <name>_repos.csv
@@ -81,15 +83,23 @@ by_extension.csv columns:
   at_head_checked, same_as_latest, same_as_older, same_as_other_path,
   no_match, lfs_active_real, gone, unreadable, at_head_unchecked (pass 2
   not run for those yet)
-  versions_to_send       the head is NOT processed for these extensions, so
-                         everything goes: every archived version of every
-                         path (LFS stubs excluded - nothing to send), plus
-                         the active file where the archive does not have
-                         its content (no_match, lfs_active_real), plus each
-                         active_only file. A file identical to a version
-                         (same_as_*) adds nothing - that version is sent.
-                         at_head_unchecked files count their archived
-                         versions only until pass 2 has run for them
+  versions_to_send       the head IS processed: every version except those
+                         whose content is a file in the SAME repo's active
+                         copy (pass 2's same_as_* - that path or another path
+                         of the repo) and LFS stubs (nothing to send). A repo
+                         with no active copy sends every version, even if
+                         another repo's active copy has the same content.
+                         Where pass 2 has not run, each binary file's latest
+                         version is assumed to be the active one. This is
+                         what an extraction of the previous versions writes
+  versions_to_send_all_repos, gb_to_send_all_repos
+                         the same, each content written once however many
+                         repos need it
+  versions_to_send_incl_head
+                         if the head were NOT processed: every archived
+                         version (LFS stubs excluded), plus the active file
+                         where the archive lacks its content (no_match,
+                         lfs_active_real), plus each active_only file
 
 Usage:
     python3 extension_versions.py --batch batches/S01.csv \\
@@ -123,7 +133,8 @@ from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 from explain_file_counts import vendor_of
 from explore_input_csv import is_repo_dir
-from extract_commits import GIT, bind_job, parse_log_stream, run_tracked, spawn
+from extract_commits import (FS, GIT, bind_job, parse_log_stream, run_tracked,
+                             spawn)
 from file_added_lines import _feed, read_blobs
 from file_delta import (MOUNT_ERRNOS, MountDown, check_mount, csv_text,
                         repo_exists, write_atomic)
@@ -144,7 +155,8 @@ FILE_HEADER = ["org", "repo", "path", "ext", "group", "vendored", "in_history",
                "bytes_versions", "max_bytes", "lfs_versions",
                "missing_objects", "last_event"]
 VERSION_HEADER = ["path", "blob", "bytes", "commits", "latest", "lfs_oid",
-                  "lfs_bytes"]
+                  "lfs_bytes", "first_commit", "first_date", "last_commit",
+                  "last_date"]
 ID_HEADER = ["path", "active_bytes", "result", "matched_blob", "matched_path",
              "lfs_match", "hashed", "error"]
 RESULTS = ["same_as_latest", "same_as_older", "same_as_other_path", "no_match",
@@ -165,8 +177,10 @@ def read_history(gp, exts, job):
     """{path: rec} for every path with one of `exts` that any commit on any
     branch touched. Newest first (no --reverse: git streams it), so the
     first change seen for a path is its last event and the first blob seen
-    its latest version. rec = {"commits": n, "blobs": {blob: commits},
-    "latest": blob, "last_event": A/M/D/T}"""
+    its latest version. rec = {"commits": n, "blobs": {blob: [commits,
+    first sha, first date, last sha, last date]}, "latest": blob,
+    "last_event": A/M/D/T} - first / last: the oldest and newest commit (in
+    topo order) that gave the path that content."""
     files = {}
 
     def keep(status, path, old_path):
@@ -175,7 +189,7 @@ def read_history(gp, exts, job):
     cmd = GIT + ["-c", "core.quotePath=false", "-C", gp, "log", "--all",
                  "--stdin", "--full-history", "--topo-order", "--raw", "-z",
                  "--no-abbrev", "--no-renames", "--diff-merges=first-parent",
-                 "--format=%x1e%H"]
+                 "--format=%x1e%H" + FS + "%cI"]
     specs = [":(glob,icase)**/*." + e for e in sorted(exts)]
     job.phase = "reading history"
     with tempfile.TemporaryFile() as err:
@@ -185,7 +199,9 @@ def read_history(gp, exts, job):
                                   daemon=True)
         feeder.start()
         try:
-            for _sha, changes in parse_log_stream(proc.stdout, keep):
+            for sha, info, changes in parse_log_stream(proc.stdout, keep,
+                                                       meta=True):
+                date = info[0]
                 for c in changes:
                     r = files.get(c["path"])
                     if r is None:
@@ -197,7 +213,11 @@ def read_history(gp, exts, job):
                     if c["status"][:1] == "D" or not blob \
                             or set(blob) == {"0"} or c["new_mode"] in SKIP_MODES:
                         continue
-                    r["blobs"][blob] = r["blobs"].get(blob, 0) + 1
+                    v = r["blobs"].get(blob)
+                    if v is None:              # newest first: this is the last
+                        v = r["blobs"][blob] = [0, sha, date, sha, date]
+                    v[0] += 1
+                    v[1], v[2] = sha, date     # ... and this, so far, the first
                     if r["latest"] is None:
                         r["latest"] = blob
         finally:
@@ -319,11 +339,11 @@ def process_repo(cfg, org, repo, job):
                       sum(1 for b in r["blobs"] if b in lfs),
                       sum(1 for b in r["blobs"] if b not in sizes),
                       r["last_event"]])
-        for b, n in r["blobs"].items():
+        for b, (n, fsha, fdate, lsha, ldate) in r["blobs"].items():
             oid, osz = lfs.get(b, ("", ""))
             vrows.append([p, b, sizes.get(b, ""), n,
                           "yes" if b == latest else "", oid,
-                          "" if osz is None else osz])
+                          "" if osz is None else osz, fsha, fdate, lsha, ldate])
     for p in sorted((active or set()) - set(hist)):
         e = ext_key(p)
         frows.append([org, repo, p, e, group_of(e), vendor_of(p), "no", "yes",
@@ -483,21 +503,62 @@ EXT_COLS = ["repos", "files_in_history", "files_at_head", "files_history_only",
             "versions_per_repo", "versions_all_repos", "gb_per_file",
             "gb_per_repo", "gb_all_repos", "median_bytes", "max_bytes",
             "lfs_stub_versions", "missing_objects", "at_head_checked"] \
-    + RESULTS + ["at_head_unchecked", "versions_to_send"]
+    + RESULTS + ["at_head_unchecked", "versions_to_send",
+                 "versions_to_send_all_repos", "gb_to_send_all_repos",
+                 "versions_to_send_incl_head"]
+BINARY_ONLY = RESULTS + ["at_head_checked", "at_head_unchecked",
+                         "versions_to_send", "versions_to_send_all_repos",
+                         "gb_to_send_all_repos", "versions_to_send_incl_head"]
 REPO_COLS = ["files_in_history", "files_at_head", "files_history_only",
              "files_active_only", "commits", "versions_per_file",
              "versions_per_repo", "bytes_per_repo", "lfs_stub_versions"] \
-    + RESULTS + ["versions_to_send"]
+    + RESULTS + ["versions_to_send", "versions_to_send_incl_head"]
 GB = 1e9
+PROCESSED = ("same_as_latest", "same_as_older", "same_as_other_path")
+
+
+def done_repos(out):
+    """(org, repo, state dir) of every repo whose pass 1 finished ok."""
+    state = os.path.join(out, STATE)
+    for org in sorted(os.listdir(state)) if os.path.isdir(state) else []:
+        od = os.path.join(state, org)
+        if not os.path.isdir(od):
+            continue
+        for repo in sorted(os.listdir(od)):
+            sd = os.path.join(od, repo)
+            done = read_json(os.path.join(sd, "done.json"))
+            if done and done.get("status") == "ok":
+                yield org, repo, sd
+
+
+def processed_in_repo(sd):
+    """Blob ids (20 bytes) of one repo whose content is a file in THAT
+    repo's active copy - already processed, so not sent for this repo: the
+    versions pass 2 found an active file identical to (same path, or another
+    path of the same repo). Another repo's active copy never counts. Where
+    pass 2 has not run, the latest version of each binary file at head is
+    assumed to be the active one."""
+    done = set()
+    ij = read_json(os.path.join(sd, "identical.json"))
+    if ij and ij.get("status") == "ok":
+        for r in read_rows(os.path.join(sd, "identical.csv")):
+            if r["result"] in PROCESSED and r["matched_blob"]:
+                done.add(bytes.fromhex(r["matched_blob"]))
+    else:
+        for f in read_rows(os.path.join(sd, "files.csv")):
+            if f["group"] == "binary" and f["at_head"] == "yes" \
+                    and f["latest_blob"]:
+                done.add(bytes.fromhex(f["latest_blob"]))
+    return done
 
 
 def combine(out):
     """Rebuild by_extension.csv, by_repo.csv, all_files.csv and summary.md
     from every repo whose pass 1 finished ok."""
-    state = os.path.join(out, STATE)
     acc = defaultdict(Counter)                   # ext -> column -> n
     repos_of = defaultdict(set)
     everywhere = defaultdict(dict)               # ext -> {blob: bytes}
+    to_send = defaultdict(dict)                  # ext -> {blob: bytes}
     per_repo = []
     repos = 0
     comb = os.path.join(out, "all_files.csv")
@@ -505,83 +566,86 @@ def combine(out):
               errors="surrogateescape") as cf:
         w = csv.writer(cf)
         w.writerow(FILE_HEADER + ["result", "matched_path", "lfs_match"])
-        for org in sorted(os.listdir(state)) if os.path.isdir(state) else []:
-            od = os.path.join(state, org)
-            if not os.path.isdir(od):
-                continue
-            for repo in sorted(os.listdir(od)):
-                sd = os.path.join(od, repo)
-                done = read_json(os.path.join(sd, "done.json"))
-                if not done or done.get("status") != "ok":
+        for org, repo, sd in done_repos(out):
+            repos += 1
+            ij = read_json(os.path.join(sd, "identical.json"))
+            ident = {}
+            if ij and ij.get("status") == "ok":
+                ident = {r["path"]: r for r in
+                         read_rows(os.path.join(sd, "identical.csv"))}
+            rc = defaultdict(Counter)
+            processed = processed_in_repo(sd)
+            seen = defaultdict(dict)          # ext -> {blob: bytes} here
+            send_of = Counter()               # path -> versions to send
+            for v in read_rows(os.path.join(sd, "versions.csv")):
+                e = ext_key(v["path"])
+                n = int(v["bytes"]) if v["bytes"].isdigit() else 0
+                seen[e][v["blob"]] = n
+                d = bytes.fromhex(v["blob"])
+                everywhere[e].setdefault(d, n)
+                if not v["lfs_oid"] and d not in processed:
+                    send_of[v["path"]] += 1
+                    if group_of(e) == "binary":
+                        to_send[e].setdefault(d, n)
+            for e, bl in seen.items():
+                acc[e]["versions_per_repo"] += len(bl)
+                acc[e]["bytes_per_repo"] += sum(bl.values())
+                rc[e]["versions_per_repo"] += len(bl)
+                rc[e]["bytes_per_repo"] += sum(bl.values())
+            for f in read_rows(os.path.join(sd, "files.csv")):
+                e = f["ext"]
+                a, r = acc[e], rc[e]
+                repos_of[e].add((org, repo))
+                i = ident.get(f["path"])
+                w.writerow([f[k] for k in FILE_HEADER]
+                           + ([i["result"], i["matched_path"],
+                               i["lfs_match"]] if i else ["", "", ""]))
+                if f["in_history"] != "yes":
+                    a["files_active_only"] += 1
+                    r["files_active_only"] += 1
+                    if f["group"] == "binary":        # only copy there is
+                        a["versions_to_send_incl_head"] += 1
+                        r["versions_to_send_incl_head"] += 1
                     continue
-                repos += 1
-                ij = read_json(os.path.join(sd, "identical.json"))
-                ident = {}
-                if ij and ij.get("status") == "ok":
-                    ident = {r["path"]: r for r in
-                             read_rows(os.path.join(sd, "identical.csv"))}
-                rc = defaultdict(Counter)
-                seen = defaultdict(dict)          # ext -> {blob: bytes} here
-                for v in read_rows(os.path.join(sd, "versions.csv")):
-                    e = ext_key(v["path"])
-                    n = int(v["bytes"]) if v["bytes"].isdigit() else 0
-                    seen[e][v["blob"]] = n
-                    everywhere[e].setdefault(bytes.fromhex(v["blob"]), n)
-                for e, bl in seen.items():
-                    acc[e]["versions_per_repo"] += len(bl)
-                    acc[e]["bytes_per_repo"] += sum(bl.values())
-                    rc[e]["versions_per_repo"] += len(bl)
-                    rc[e]["bytes_per_repo"] += sum(bl.values())
-                for f in read_rows(os.path.join(sd, "files.csv")):
-                    e = f["ext"]
-                    a, r = acc[e], rc[e]
-                    repos_of[e].add((org, repo))
-                    i = ident.get(f["path"])
-                    w.writerow([f[k] for k in FILE_HEADER]
-                               + ([i["result"], i["matched_path"],
-                                   i["lfs_match"]] if i else ["", "", ""]))
-                    if f["in_history"] != "yes":
-                        a["files_active_only"] += 1
-                        r["files_active_only"] += 1
-                        if f["group"] == "binary":        # only copy there is
-                            a["versions_to_send"] += 1
-                            r["versions_to_send"] += 1
-                        continue
-                    nv = int(f["versions"])
-                    for c in (a, r):
-                        c["files_in_history"] += 1
-                        c["commits"] += int(f["commits"])
-                        c["versions_per_file"] += nv
-                        c["lfs_stub_versions"] += int(f["lfs_versions"])
-                    a["files_vendored"] += bool(f["vendored"])
-                    a["bytes_per_file"] += int(f["bytes_versions"])
-                    a["missing_objects"] += int(f["missing_objects"])
-                    at = f["at_head"]
-                    col = {"yes": "files_at_head", "no": "files_history_only",
-                           "": "files_no_active_repo"}[at]
-                    a[col] += 1
-                    r[col] += 1
-                    a["versions_beyond_head"] += max(nv - (at == "yes"), 0)
-                    if f["group"] != "binary":
-                        continue
-                    # the head is not processed either: every archived
-                    # version goes (an LFS stub has nothing to send), plus
-                    # the active file when the archive lacks its content
-                    send = nv - int(f["lfs_versions"])
-                    if at == "yes":
-                        if i:
-                            a["at_head_checked"] += 1
-                            a[i["result"]] += 1
-                            r[i["result"]] += 1
-                            if i["result"] in ("no_match", "lfs_active_real"):
-                                send += 1
-                        else:
-                            a["at_head_unchecked"] += 1
-                    a["versions_to_send"] += send
-                    r["versions_to_send"] += send
-                for e in sorted(rc):
-                    per_repo.append([org, repo, e, group_of(e)]
-                                    + [rc[e][c] for c in REPO_COLS])
+                nv = int(f["versions"])
+                for c in (a, r):
+                    c["files_in_history"] += 1
+                    c["commits"] += int(f["commits"])
+                    c["versions_per_file"] += nv
+                    c["lfs_stub_versions"] += int(f["lfs_versions"])
+                a["files_vendored"] += bool(f["vendored"])
+                a["bytes_per_file"] += int(f["bytes_versions"])
+                a["missing_objects"] += int(f["missing_objects"])
+                at = f["at_head"]
+                col = {"yes": "files_at_head", "no": "files_history_only",
+                       "": "files_no_active_repo"}[at]
+                a[col] += 1
+                r[col] += 1
+                a["versions_beyond_head"] += max(nv - (at == "yes"), 0)
+                if f["group"] != "binary":
+                    continue
+                # head processed: the versions whose content is in no
+                # active file (LFS stubs have nothing to send)
+                send = send_of[f["path"]]
+                a["versions_to_send"] += send
+                r["versions_to_send"] += send
+                # head NOT processed: every archived version, plus the
+                # active file when the archive lacks its content
+                incl = nv - int(f["lfs_versions"])
+                if at == "yes":
+                    if i:
+                        a["at_head_checked"] += 1
+                        a[i["result"]] += 1
+                        r[i["result"]] += 1
+                        if i["result"] in ("no_match", "lfs_active_real"):
+                            incl += 1
+                    else:
+                        a["at_head_unchecked"] += 1
+                a["versions_to_send_incl_head"] += incl
+                r["versions_to_send_incl_head"] += incl
+            for e in sorted(rc):
+                per_repo.append([org, repo, e, group_of(e)]
+                                + [rc[e][c] for c in REPO_COLS])
     os.replace(comb + ".tmp", comb)
 
     order = [e for e in TEXT_EXTS + BINARY_EXTS if e in acc] \
@@ -597,12 +661,11 @@ def combine(out):
         a["gb_all_repos"] = round(sum(sizes) / GB, 3)
         a["median_bytes"] = int(statistics.median(sizes)) if sizes else 0
         a["max_bytes"] = sizes[-1] if sizes else 0
+        a["versions_to_send_all_repos"] = len(to_send[e])
+        a["gb_to_send_all_repos"] = round(sum(to_send[e].values()) / GB, 3)
         binary = group_of(e) == "binary"
         table.append([e, group_of(e)] + [
-            a[c] if binary or c not in RESULTS + ["at_head_checked",
-                                                  "at_head_unchecked",
-                                                  "versions_to_send"] else ""
-            for c in EXT_COLS])
+            a[c] if binary or c not in BINARY_ONLY else "" for c in EXT_COLS])
     with open(os.path.join(out, "by_extension.csv"), "w", newline="",
               encoding="utf-8") as fh:
         w = csv.writer(fh)
@@ -638,7 +701,10 @@ def write_summary(out, table, repos):
                 "versions_all_repos", "gb_per_file", "gb_all_repos",
                 "lfs_stub_versions"]
         if grp == "binary":
-            cols += RESULTS + ["at_head_unchecked", "versions_to_send"]
+            cols += RESULTS + ["at_head_unchecked", "versions_to_send",
+                               "versions_to_send_all_repos",
+                               "gb_to_send_all_repos",
+                               "versions_to_send_incl_head"]
         md += ["## " + title, "",
                "| ext | " + " | ".join(cols) + " |",
                "|---|" + "---:|" * len(cols)]

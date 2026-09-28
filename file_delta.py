@@ -89,11 +89,15 @@ def current_lines(path):
     with open(path, "rb") as fh:
         data = fh.read()
     text = utf16_text(data)
-    if text is None:
+    if text is not None:
+        lines = text.splitlines()          # UTF-16: as the extraction splits it
+    else:
         if b"\0" in data[:8000]:
             raise ValueError("current file is binary")
-        text = "\n".join(decode(ln) for ln in data.split(b"\n"))
-    return {s for s in (ln.strip() for ln in text.splitlines()) if s}
+        # one line per "\n", as in git's diff - not splitlines(), which would
+        # also split at a "\r", form feed etc. inside a line
+        lines = (decode(ln) for ln in data.split(b"\n"))
+    return {s for s in (ln.strip() for ln in lines) if s}
 
 
 # errors that mean the MOUNT is failing, not that a file is missing or bad:
@@ -216,7 +220,9 @@ def one_file(cfg, org, repo, row, active_repo_exists):
         how = ""
 
     def whole(action, note):
-        n = sum(1 for _ in open(src, encoding="utf-8", errors="surrogateescape"))
+        with open(src, encoding="utf-8", errors="surrogateescape",
+                  newline="\n") as fh:
+            n = sum(1 for _ in fh)
         if not cfg.dry_run:
             kind = link_or_copy(src, dst)
             action = action.replace("linked", kind) if action.startswith(
@@ -241,7 +247,11 @@ def one_file(cfg, org, repo, row, active_repo_exists):
         return whole("unreadable_current", "%s: %s" % (type(exc).__name__, exc))
 
     kept, n_hist = [], 0
-    with open(src, encoding="utf-8", errors="surrogateescape") as fh:
+    # newline="\n": file_added_lines.py wrote one line per "\n"; the default
+    # would also split at a lone "\r" inside a line, and the halves would not
+    # match the current file's (stripped) lines
+    with open(src, encoding="utf-8", errors="surrogateescape",
+              newline="\n") as fh:
         for ln in fh:
             s = ln.rstrip("\n")
             if not s:
