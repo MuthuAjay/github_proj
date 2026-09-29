@@ -510,6 +510,62 @@ class PerRepo(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class DeltaSummary(unittest.TestCase):
+    """extension_delta_summary.py from the counts, the text delta and the
+    extraction of the same archive."""
+
+    def test_summary(self):
+        tmp = tempfile.mkdtemp(prefix="extv_sum_")
+        try:
+            arch, act, batch = build(tmp)
+            counts = os.path.join(tmp, "counts")
+            base = ["--batch", batch, "--repos-root", arch, "--active-root",
+                    act, "--out", counts]
+            run("extension_versions.py", *base)
+            run("extension_versions.py", *base, "--identical")
+            text = os.path.join(tmp, "text")
+            run("file_added_lines.py", "--batch", batch, "--repos-root", arch,
+                "--out", text, "--extensions", "lock,rst,tfvars,groovy",
+                "--quiet", "--min-free-disk-gb", "0")
+            run("fill_at_head.py", text, "--disk-root", act)
+            run("file_delta.py", text, "--active-root", act, "--out",
+                text + "_delta")
+            binary = os.path.join(tmp, "binary")
+            run("extract_versions.py", "--state", counts, "--repos-root", arch,
+                "--out", binary, "--batch", batch, "--min-free-disk-gb", "0")
+
+            # counts only
+            out1 = os.path.join(tmp, "s1.csv")
+            run("extension_delta_summary.py", counts, "--out", out1)
+            s1 = {r["ext"]: r for r in read_csv(out1)}
+            self.assertEqual(s1["xlsx"]["versions"], "4")
+            self.assertEqual(s1["xlsx"]["versions_processed(in_active)"], "1")
+            self.assertEqual(s1["xlsx"]["versions_to_send"], "3")
+            self.assertEqual(s1["xlsx"]["delta_dedup"], "3")
+            self.assertEqual(s1["mpg"]["lfs_stubs(not_in_archive)"], "1")
+            self.assertEqual(s1["rst"]["delta_dedup"], "")
+            self.assertIn("--text-delta", s1["rst"]["note"])
+
+            # with the text delta and the extraction
+            out2 = os.path.join(tmp, "s2.csv")
+            run("extension_delta_summary.py", counts, "--out", out2,
+                "--text-delta", text + "_delta", "--extraction", binary)
+            s2 = {r["ext"]: r for r in read_csv(out2)}
+            self.assertEqual((s2["rst"]["delta_dedup"],
+                              s2["rst"]["delta_lines"]), ("1", "1"))
+            self.assertEqual(s2["lock"]["delta_lines"], "0")
+            self.assertEqual(s2["xlsx"]["extracted_files"], "3")
+            self.assertEqual(s2["pptx"]["delta_dedup"], "2")     # 1 + empty
+            self.assertEqual(s2["pptx"]["extracted_files"], "1") # empty not
+            bin_rows = [r for e, r in s2.items()
+                        if r["group"] == "binary"]
+            self.assertEqual(s2["total"]["delta_dedup"],
+                             str(sum(int(r["delta_dedup"]) for r in bin_rows)))
+            self.assertEqual(s2["total"]["delta_lines"], "1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class PassOneOnly(unittest.TestCase):
     def test_latest_assumed_processed(self):
         tmp = tempfile.mkdtemp(prefix="extv_p1_")
