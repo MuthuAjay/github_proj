@@ -40,10 +40,18 @@ Detail CSVs next to the report:
   certificates.csv          every pfx / p7s file (for the security team)
   lock_files.csv            lock files by file name
   to_send_by_ext_reason.csv versions / GB to send per extension and reason
+  repo_delta.csv            per repo and extension: files, versions, versions
+                            to send, delta_dedup (unique within the repo), GB,
+                            delta_only_in_this_repo, and with --text-delta the
+                            text files and lines left to send
+  repo_delta_totals.csv     the same, one row per repo
 
 Usage:
     python3 ext_versions_analysis.py /data/workarea/ext_versions \\
         --out /data/workarea/ext_versions/analysis
+    # after the text track, with its delta per repo
+    python3 ext_versions_analysis.py /data/workarea/ext_versions \\
+        --text-delta /data/workarea/text9_extract_delta
 """
 
 import argparse
@@ -58,6 +66,7 @@ from collections import Counter, defaultdict
 from extension_versions import (BINARY_EXTS, PROCESSED, STATE, TEXT_EXTS,
                                 group_of, processed_in_repo, read_json,
                                 read_rows)
+from repo_extension_summary import ext_key
 
 MB, GB = 1e6, 1e9
 SIZE_BUCKETS = [(100e3, "< 100 KB"), (1 * MB, "100 KB - 1 MB"),
@@ -141,6 +150,8 @@ class Stats:
         self.certs = []
         self.locks = defaultdict(Counter)   # file name -> files/versions/bytes
         self.missing = Counter()
+        self.per_repo = defaultdict(Counter)       # (org, repo, ext) -> column
+        self.per_repo_blobs = defaultdict(dict)    # (org, repo, ext) -> {blob: n}
 
 
 def scan(root):
@@ -199,10 +210,16 @@ def scan_repo(st, org, repo, sd, pass2):
     for p, f in files.items():
         e = f["ext"]
         c = st.ext[e]
+        pr = st.per_repo[(org, repo, e)]
         st.ext_repos[e].add((org, repo))
         if f["in_history"] != "yes":
             c["files_active_only"] += 1
+            pr["files_active_only"] += 1
             continue
+        pr["files_in_history"] += 1
+        pr[{"yes": "files_at_head", "no": "files_history_only"}.get(
+            f["at_head"], "files_no_active_repo")] += 1
+        pr["versions"] += int(f["versions"])
         c["files"] += 1
         c["versions"] += int(f["versions"])
         c["bytes"] += int(f["bytes_versions"])
@@ -232,6 +249,7 @@ def scan_repo(st, org, repo, sd, pass2):
         e = f["ext"]
         n = int(v["bytes"]) if v["bytes"].isdigit() else 0
         if v["lfs_oid"]:
+            st.per_repo[(org, repo, e)]["lfs_stub_versions"] += 1
             st.lfs[e]["stub_versions"] += 1
             st.lfs_repos.add((org, repo))
             lfs_here.add(e)
@@ -256,6 +274,8 @@ def scan_repo(st, org, repo, sd, pass2):
                 why = "active_differs"
             else:
                 why = "active_unreadable"
+        st.per_repo[(org, repo, e)]["versions_to_send"] += 1
+        st.per_repo_blobs[(org, repo, e)][d] = n
         rc = st.reason[(e, why)]
         rc["versions"] += 1
         rc["bytes"] += n
@@ -277,10 +297,93 @@ def scan_repo(st, org, repo, sd, pass2):
 
 
 # --------------------------------------------------------------------------
+# per repository
+# --------------------------------------------------------------------------
+
+REPO_COLS = ["files_in_history", "files_at_head", "files_history_only",
+             "files_no_active_repo", "files_active_only", "versions",
+             "lfs_stub_versions", "versions_to_send", "delta_dedup",
+             "delta_gb", "delta_only_in_this_repo", "text_files_with_delta",
+             "text_lines_kept"]
+
+
+def read_text_delta(root):
+    """{(org, repo, ext): Counter} from file_delta.py's per-repo manifests:
+    text files that still have lines to send, and those lines."""
+    out = defaultdict(Counter)
+    state = os.path.join(root, STATE)
+    for org in sorted(os.listdir(state)) if os.path.isdir(state) else []:
+        od = os.path.join(state, org)
+        if not os.path.isdir(od):
+            continue
+        for repo in sorted(os.listdir(od)):
+            mp = os.path.join(od, repo, "manifest.csv")
+            if not os.path.isfile(mp):
+                continue
+            for r in read_rows(mp):
+                c = out[(org, repo, ext_key(r["path"]))]
+                c["text_files_with_delta"] += bool(r["output"])
+                c["text_lines_kept"] += int(r["lines_kept"] or 0)
+    return out
+
+
+def write_per_repo(st, out, text_delta):
+    """repo_delta.csv (per repo and extension) and repo_delta_totals.csv
+    (per repo). delta_dedup = contents to send, each once within the repo;
+    delta_only_in_this_repo = of those, the ones no other repo has."""
+    keys = set(st.per_repo) | set(text_delta)
+    rows, tot = [], defaultdict(Counter)
+    for org, repo, e in sorted(keys):
+        c = Counter(st.per_repo.get((org, repo, e), {}))
+        c.update(text_delta.get((org, repo, e), {}))
+        bl = st.per_repo_blobs.get((org, repo, e), {})
+        c["delta_dedup"] = len(bl)
+        c["delta_bytes"] = sum(bl.values())
+        c["delta_only_in_this_repo"] = sum(
+            1 for d in bl if st.distinct[(e, d)][2] == 1)
+        binary = group_of(e) == "binary"
+        rows.append([org, repo, e, group_of(e)] + [
+            round(c["delta_bytes"] / GB, 4) if col == "delta_gb" and binary
+            else ("" if (binary and col.startswith("text_")) or
+             (not binary and col in ("versions_to_send", "delta_dedup",
+                                     "delta_gb", "delta_only_in_this_repo",
+                                     "lfs_stub_versions"))
+             or (col.startswith("text_") and not text_delta) else c[col])
+            for col in REPO_COLS])
+        t = tot[(org, repo)]
+        for col in ("files_in_history", "files_at_head", "files_history_only",
+                    "files_active_only"):
+            t[col] += c[col]
+        if binary:
+            t["binary_versions_to_send"] += c["versions_to_send"]
+            t["binary_delta_dedup"] += c["delta_dedup"]
+            t["binary_delta_bytes"] += c["delta_bytes"]
+        else:
+            t["text_files_with_delta"] += c["text_files_with_delta"]
+            t["text_lines_kept"] += c["text_lines_kept"]
+    write_csv(os.path.join(out, "repo_delta.csv"),
+              ["org", "repo", "ext", "group"] + REPO_COLS, rows)
+    tcols = ["files_in_history", "files_at_head", "files_history_only",
+             "files_active_only", "binary_versions_to_send",
+             "binary_delta_dedup", "binary_delta_gb", "text_files_with_delta",
+             "text_lines_kept"]
+    trows = []
+    for (org, repo), t in sorted(tot.items(),
+                                 key=lambda kv: -kv[1]["binary_delta_bytes"]):
+        trows.append([org, repo] + [
+            round(t["binary_delta_bytes"] / GB, 4) if col == "binary_delta_gb"
+            else ("" if col.startswith("text_") and not text_delta else t[col])
+            for col in tcols])
+    write_csv(os.path.join(out, "repo_delta_totals.csv"), ["org", "repo"] + tcols,
+              trows)
+    return trows
+
+
+# --------------------------------------------------------------------------
 # report
 # --------------------------------------------------------------------------
 
-def report(st, root, out):
+def report(st, root, out, text_delta=None):
     md = ["# Extension versions - analysis", "",
           "Source: `%s`. Generated %s by ext_versions_analysis.py." % (
               root, datetime.date.today().isoformat()), "",
@@ -504,6 +607,26 @@ def report(st, root, out):
             "the archive - they cannot be extracted.",
             table(["ext", "versions"], miss))
 
+    # per repository
+    trows = write_per_repo(st, out, text_delta or {})
+    with_bin = sum(1 for r in trows if r[6])
+    sec("Per repository", "Every repo and extension in repo_delta.csv, one "
+        "row per repo in repo_delta_totals.csv. delta_dedup counts each "
+        "content once within the repo, so repos sharing a file both count it; "
+        "delta_only_in_this_repo is what no other repo has. Text columns are "
+        "filled when --text-delta points at file_delta.py's output.",
+        table(["", "repos"], [
+            ["with anything in history", len(trows)],
+            ["with binary versions to send", with_bin]]
+            + ([["with text lines to send", sum(1 for r in trows if r[9])]]
+               if text_delta else []))
+        + "\n\n" + table(["org", "repo", "binary to send", "unique in repo",
+                           "GB"] + (["text files", "text lines"]
+                                    if text_delta else []),
+                          [[r[0], r[1], r[6], r[7], r[8]]
+                           + ([r[9], r[10]] if text_delta else [])
+                           for r in trows[:20]]))
+
     # cross-check
     rows = []
     be = os.path.join(root, "by_extension.csv")
@@ -538,14 +661,22 @@ def main():
     ap.add_argument("root", help="extension_versions.py --out folder")
     ap.add_argument("--out", help="folder for the report and CSVs "
                                   "(default: <root>/analysis)")
+    ap.add_argument("--text-delta", metavar="DIR",
+                    help="file_delta.py output of the text track (e.g. "
+                         "/data/workarea/text9_extract_delta): adds the text "
+                         "files and lines left to send per repo")
     args = ap.parse_args()
+    if args.text_delta and not os.path.isdir(os.path.join(args.text_delta,
+                                                          STATE)):
+        sys.exit("no _state folder under " + args.text_delta)
     if not os.path.isdir(os.path.join(args.root, STATE)):
         sys.exit("no _state folder under " + args.root)
     out = args.out or os.path.join(args.root, "analysis")
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
     st = scan(args.root)
-    path = report(st, args.root, out)
+    text_delta = read_text_delta(args.text_delta) if args.text_delta else None
+    path = report(st, args.root, out, text_delta)
     print("report -> %s  (%.0fs)" % (path, time.time() - t0))
     return 0
 

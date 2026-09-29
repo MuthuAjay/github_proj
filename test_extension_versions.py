@@ -75,11 +75,12 @@ def build(tmp):
     commit(a, "c1", [("docs/report.xlsx", X[0]), ("logo.png", PNG),
                      ("Gemfile.lock", "a\n"), ("infra/main.tfvars", "x=1\n"),
                      ("README.md", "hi\n"), ("a.jpg", JA), ("b.jpg", JB),
+                     ("docs/old.rst", "Contact: jane@example.com\n"),
                      ("notes.msg", b"msg1\x00")])
     commit(a, "c2", [("docs/report.xlsx", X[1]), ("Gemfile.lock", "a\nb\n")])
     commit(a, "c3", [("node_modules/pkg/font.woff", b"\x00woff"),
                      ("Old.DOCX", b"\x00docx"), ("big.mpg", POINTER)])
-    commit(a, "c4", rm=["Old.DOCX"])
+    commit(a, "c4", rm=["Old.DOCX", "docs/old.rst"])
     git(a, "checkout", "-qb", "side")
     commit(a, "s1", [("docs/report.xlsx", X[2]), ("deck.pptx", DECK1)])
     git(a, "checkout", "-q", "master")
@@ -432,6 +433,58 @@ class Extract(unittest.TestCase):
                                                          "done.json")))
             self.assertTrue(os.path.exists(os.path.join(st, "repoB",
                                                         "done.json")))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class PerRepo(unittest.TestCase):
+    """ext_versions_analysis.py's repo_delta.csv, with the text track's
+    delta joined in."""
+
+    def test_repo_delta(self):
+        tmp = tempfile.mkdtemp(prefix="extv_repo_")
+        try:
+            arch, act, batch = build(tmp)
+            out = os.path.join(tmp, "counts")
+            base = ["--batch", batch, "--repos-root", arch, "--active-root",
+                    act, "--out", out]
+            run("extension_versions.py", *base)
+            run("extension_versions.py", *base, "--identical")
+            text = os.path.join(tmp, "text")
+            run("file_added_lines.py", "--batch", batch, "--repos-root", arch,
+                "--out", text, "--extensions", "lock,rst,tfvars,groovy",
+                "--quiet", "--min-free-disk-gb", "0")
+            run("fill_at_head.py", text, "--disk-root", act)
+            run("file_delta.py", text, "--active-root", act, "--out",
+                text + "_delta")
+            run("ext_versions_analysis.py", out, "--text-delta", text + "_delta")
+            an = os.path.join(out, "analysis")
+            rd = {(r["repo"], r["ext"]): r for r in
+                  read_csv(os.path.join(an, "repo_delta.csv"))}
+            self.assertEqual(rd[("repoA", "xlsx")]["versions_to_send"], "3")
+            self.assertEqual(rd[("repoA", "xlsx")]["delta_dedup"], "3")
+            # the docx content is in repoA and repoB: unique within each,
+            # but in neither only
+            self.assertEqual(rd[("repoB", "docx")]["delta_dedup"], "1")
+            self.assertEqual(rd[("repoB", "docx")]["delta_only_in_this_repo"],
+                             "0")
+            self.assertEqual(rd[("repoB", "png")]["delta_only_in_this_repo"],
+                             "1")
+            # text: the deleted old.rst keeps its line, lock loses nothing
+            self.assertEqual(rd[("repoA", "rst")]["text_files_with_delta"], "1")
+            self.assertEqual(rd[("repoA", "rst")]["text_lines_kept"], "1")
+            self.assertEqual(rd[("repoA", "lock")]["text_lines_kept"], "0")
+            self.assertEqual(rd[("repoA", "rst")]["versions_to_send"], "")
+            self.assertEqual(rd[("repoA", "xlsx")]["text_lines_kept"], "")
+            tot = {r["repo"]: r for r in
+                   read_csv(os.path.join(an, "repo_delta_totals.csv"))}
+            self.assertEqual(tot["repoA"]["text_lines_kept"], "1")
+            self.assertEqual(
+                sum(int(r["binary_delta_dedup"]) for r in tot.values()),
+                sum(int(r["delta_dedup"]) for r in rd.values()
+                    if r["group"] == "binary"))
+            self.assertIn("## Per repository",
+                          load(an, "ext_versions_analysis.md"))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
