@@ -760,6 +760,18 @@ class FileDelta(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_mount_down_at_start_exits_3(self):
+        tmp = tempfile.mkdtemp(prefix="delta_")
+        try:
+            os.makedirs(os.path.join(tmp, "src", "_state"))
+            p = run("file_delta.py", os.path.join(tmp, "src"), "--active-root",
+                    os.path.join(tmp, "no_such_mount"), "--out",
+                    os.path.join(tmp, "out"), check=False)
+            self.assertEqual(p.returncode, 3, p.stderr)
+            self.assertIn("STOPPED", p.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -352,7 +352,11 @@ def main():
     try:
         check_mount(args.active_root)
     except MountDown as exc:
-        sys.exit(str(exc))
+        # 3, like a mount lost mid-run: a runner then stops instead of
+        # marking this run finished
+        print("STOPPED: %s - remount it and run the same command again" % exc,
+              file=sys.stderr)
+        return 3
     if os.path.realpath(args.out) == os.path.realpath(args.src):
         sys.exit("--out must be a different folder from the source")
 
