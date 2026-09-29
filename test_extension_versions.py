@@ -20,6 +20,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +60,13 @@ def commit(repo, msg, files=(), rm=()):
     git(repo, "commit", "-qm", msg)
 
 
+def unlink_refs(repo):
+    """Leave only the object store, as in the archive: no HEAD, no refs."""
+    os.remove(os.path.join(repo, ".git", "HEAD"))
+    shutil.rmtree(os.path.join(repo, ".git", "refs"))
+    os.makedirs(os.path.join(repo, ".git", "refs"))
+
+
 def build(tmp):
     arch, act = os.path.join(tmp, "archive"), os.path.join(tmp, "active")
     a = os.path.join(arch, "org1", "repoA")
@@ -83,7 +91,10 @@ def build(tmp):
     b = os.path.join(arch, "org1", "repoB")          # no active copy
     os.makedirs(b)
     git(b, "init", "-q", "-b", "master")
-    commit(b, "b1", [("logo.png", PNG), ("c.xls", b"\x00xls")])
+    commit(b, "b1", [("logo.png", PNG), ("c.xls", b"\x00xls"),
+                     ("old.docx", b"\x00docx"),       # = repoA's Old.DOCX
+                     ("empty.pptx", b"")])
+    unlink_refs(b)                                   # like the archive
 
     c = os.path.join(arch, "org1", "repoC")          # git cannot open it
     os.makedirs(c)
@@ -194,10 +205,12 @@ class ExtensionVersions(unittest.TestCase):
                                 # repoA's logo and copy skip it; repoB has no
                                 # active copy, so its logo is sent
                 "jpg": 1,       # a.jpg is b.jpg's content: JB skipped, JA sent
-                "pptx": 1,      # DECK1 is active (same_as_older), DECK2 sent
+                "pptx": 2,      # DECK1 is active (same_as_older), DECK2
+                                # sent; + repoB's empty.pptx
                 "msg": 1,       # no_match: the one archived version
                 "woff": 0, "mpg": 0,          # mpg: only an LFS stub
-                "xls": 1, "docx": 1}          # no active repo / deleted
+                "xls": 1,
+                "docx": 2}      # repoA deleted Old.DOCX + repoB's copy
         got = {e: int(self.e(e, "versions_to_send")) for e in want}
         self.assertEqual(got, want)
         self.assertEqual(self.e("xlsx", "versions_to_send_all_repos"), "3")
@@ -207,11 +220,11 @@ class ExtensionVersions(unittest.TestCase):
     def test_to_send_incl_head(self):
         want = {"xlsx": 5,      # 4 + the active-only new.xlsx
                 "png": 4,       # 3 + the active logo (no_match)
-                "jpg": 2, "pptx": 2,
+                "jpg": 2, "pptx": 3,
                 "mpg": 1,       # stub 0 + the real file in the active copy
                 "woff": 1, "xls": 1,
                 "msg": 2,       # 1 + the active file (no_match)
-                "docx": 1}
+                "docx": 2}
         got = {e: int(self.e(e, "versions_to_send_incl_head")) for e in want}
         self.assertEqual(got, want)
         self.assertEqual(self.e("jpg", "files_history_only"), "1")
@@ -268,6 +281,7 @@ class Analysis(unittest.TestCase):
             an = os.path.join(out, "analysis")
             md = load(an, "ext_versions_analysis.md")
             self.assertIn("All match.", md)
+            self.assertIn("Empty (0-byte) contents among them: pptx 1", md)
             self.assertIn("| pass 2 ok | 3 |", md)
             reasons = {(r["ext"], r["reason"]): int(r["versions"]) for r in
                        read_csv(os.path.join(an, "to_send_by_ext_reason.csv"))}
@@ -277,6 +291,147 @@ class Analysis(unittest.TestCase):
             self.assertEqual(reasons[("docx", "history_only")], 1)
             locks = read_csv(os.path.join(an, "lock_files.csv"))
             self.assertEqual(locks[0]["file_name"], "gemfile.lock")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def blob_id(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+class Extract(unittest.TestCase):
+    """extract_versions.py on the counts of the same archive."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="xv_")
+        cls.arch, cls.act, cls.batch = build(cls.tmp)
+        cls.state = os.path.join(cls.tmp, "counts")
+        base = ["--batch", cls.batch, "--repos-root", cls.arch,
+                "--active-root", cls.act, "--out", cls.state]
+        run("extension_versions.py", *base)
+        run("extension_versions.py", *base, "--identical")
+        cls.out = os.path.join(cls.tmp, "binary")
+        cls.args = ["--state", cls.state, "--repos-root", cls.arch,
+                    "--out", cls.out, "--batch", cls.batch, "--workers", "1",
+                    "--min-free-disk-gb", "0"]
+        cls.p = run("extract_versions.py", *cls.args)
+        cls.rows = read_csv(os.path.join(cls.out, "manifest.csv"))
+        cls.by = {(r["repo"], r["path"], r["blob"]): r for r in cls.rows}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def row(self, repo, path, data):
+        return self.by[(repo, path, blob_id(data))]
+
+    def test_only_unprocessed_versions(self):
+        got = sorted((r["repo"], r["path"], r["action"]) for r in self.rows)
+        self.assertEqual(got, [
+            ("repoA", "Old.DOCX", "written"),
+            ("repoA", "a.jpg", "written"),              # JA; JB is a.jpg now
+            ("repoA", "big.mpg", "lfs_stub"),
+            ("repoA", "deck.pptx", "written"),          # DECK2; DECK1 active
+            ("repoA", "docs/report.xlsx", "written"),   # X1, X2, X3; X4 active
+            ("repoA", "docs/report.xlsx", "written"),
+            ("repoA", "docs/report.xlsx", "written"),
+            ("repoA", "notes.msg", "written"),
+            ("repoB", "c.xls", "written"),
+            ("repoB", "empty.pptx", "empty"),
+            ("repoB", "logo.png", "written"),           # repoB has no active copy
+            ("repoB", "old.docx", "deduped")])          # same bytes as Old.DOCX
+        self.assertNotIn(blob_id(X[3]), {r["blob"] for r in self.rows})
+
+    def test_files_are_the_versions(self):
+        for repo, path, data in (("repoA", "docs/report.xlsx", X[0]),
+                                 ("repoA", "deck.pptx", DECK2),
+                                 ("repoB", "logo.png", PNG)):
+            r = self.row(repo, path, data)
+            with open(os.path.join(self.out, r["stored_as"]), "rb") as fh:
+                self.assertEqual(fh.read(), data)
+        a = self.row("repoA", "Old.DOCX", b"\x00docx")
+        b = self.row("repoB", "old.docx", b"\x00docx")
+        self.assertEqual(a["stored_as"], b["stored_as"])      # stored once
+        self.assertTrue(a["stored_as"].endswith(".docx"))
+
+    def test_reasons_and_commits(self):
+        why = {(r["repo"], r["path"]): r["why"] for r in self.rows}
+        self.assertEqual(why[("repoA", "Old.DOCX")], "history_only")
+        self.assertEqual(why[("repoA", "docs/report.xlsx")], "older_version")
+        self.assertEqual(why[("repoA", "notes.msg")], "active_differs")
+        self.assertEqual(why[("repoB", "logo.png")], "no_active_repo")
+        r = self.row("repoA", "docs/report.xlsx", X[0])
+        self.assertEqual(len(r["first_commit"]), 40)
+        self.assertTrue(r["first_date"].startswith("20"))
+
+    def test_summary_matches_disk_and_counts(self):
+        ext = {r["ext"]: r for r in read_csv(os.path.join(self.out,
+                                                          "by_extension.csv"))}
+        self.assertEqual(ext["xlsx"]["files_stored"], "3")
+        self.assertEqual(ext["docx"]["files_stored"], "1")
+        self.assertEqual(ext["docx"]["deduped"], "1")
+        for e, r in ext.items():
+            self.assertEqual(r["files_stored"], r["files_on_disk"], e)
+        self.assertIn("They agree for every extension.",
+                      load(self.out, "summary.md"))
+        counts = {r["ext"]: r for r in read_csv(os.path.join(
+            self.state, "by_extension.csv"))}
+        for e in ("xlsx", "pptx", "docx", "png", "jpg", "msg", "xls"):
+            sent = sum(1 for r in self.rows if r["ext"] == e)
+            self.assertEqual(str(sent), counts[e]["versions_to_send"], e)
+
+    def test_resume(self):
+        again = run("extract_versions.py", *self.args)
+        self.assertIn("0 repo(s) to process (3 done", again.stdout)
+
+    def test_limits(self):
+        out = os.path.join(self.tmp, "limited")
+        run("extract_versions.py", "--state", self.state, "--repos-root",
+            self.arch, "--out", out, "--batch", self.batch,
+            "--min-free-disk-gb", "0", "--max-bytes", "10")
+        rows = read_csv(os.path.join(out, "manifest.csv"))
+        act = Counter((r["ext"], r["action"]) for r in rows)
+        self.assertEqual(act[("png", "too_large")], 1)         # 55 bytes
+        self.assertEqual(act[("xlsx", "written")], 3)          # 7 bytes each
+        self.assertFalse(any(r["stored_as"] for r in rows
+                             if r["action"] == "too_large"))
+
+    def test_disk_low_stops_and_resumes(self):
+        import extract_versions as xv
+        out = os.path.join(self.tmp, "disk")
+        argv = ["extract_versions.py", "--state", self.state, "--repos-root",
+                self.arch, "--out", out, "--batch", self.batch,
+                "--workers", "1", "--min-free-disk-gb", "5"]
+        free = iter([100.0] + [1.0] * 1000)           # fine at start, then low
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(xv, "free_gb", lambda p: next(free)):
+            self.assertEqual(xv.main(), 3)
+        self.assertFalse(os.path.exists(os.path.join(
+            out, "_state", "org1", "repoA", "done.json")))
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(xv, "free_gb", lambda p: 100.0):
+            self.assertEqual(xv.main(), 0)
+        self.assertEqual(len(read_csv(os.path.join(out, "manifest.csv"))),
+                         len(self.rows))
+
+    def test_needs_pass_two(self):
+        tmp = tempfile.mkdtemp(prefix="xv_p1_")
+        try:
+            arch, act, batch = build(tmp)
+            state = os.path.join(tmp, "counts")
+            run("extension_versions.py", "--batch", batch, "--repos-root",
+                arch, "--active-root", act, "--out", state)
+            out = os.path.join(tmp, "binary")
+            p = run("extract_versions.py", "--state", state, "--repos-root",
+                    arch, "--out", out, "--batch", batch,
+                    "--min-free-disk-gb", "0")
+            self.assertIn("no_pass2", p.stdout)
+            st = os.path.join(out, "_state", "org1")
+            self.assertFalse(os.path.exists(os.path.join(st, "repoA",
+                                                         "done.json")))
+            self.assertTrue(os.path.exists(os.path.join(st, "repoB",
+                                                        "done.json")))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -295,7 +450,7 @@ class PassOneOnly(unittest.TestCase):
             # active one - pptx then sends DECK1, not DECK2 (pass 2 corrects)
             self.assertEqual(ext["xlsx"]["versions_to_send"], "3")
             self.assertEqual(ext["png"]["versions_to_send"], "1")   # repoB
-            self.assertEqual(ext["pptx"]["versions_to_send"], "1")
+            self.assertEqual(ext["pptx"]["versions_to_send"], "2")
             self.assertEqual(ext["xlsx"]["at_head_unchecked"], "1")
             self.assertEqual(ext["xlsx"]["at_head_checked"], "0")
         finally:

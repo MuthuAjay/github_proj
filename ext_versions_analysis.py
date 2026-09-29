@@ -133,7 +133,9 @@ class Stats:
         self.results = defaultdict(Counter)  # ext -> pass 2 result -> files
         self.repo_send = Counter()          # (org, repo) -> bytes to send
         self.repo_send_n = Counter()
-        self.distinct = {}                  # blob -> [bytes, ext, repos, where]
+        # (ext, blob) -> [bytes, ext, repos, where]: per extension, as
+        # extension_versions.py counts it and the extraction stores it
+        self.distinct = {}
         self.lfs = defaultdict(Counter)     # ext -> stub versions / repos
         self.lfs_repos = set()
         self.certs = []
@@ -191,7 +193,7 @@ def scan_repo(st, org, repo, sd, pass2):
         ident = {r["path"]: r for r in
                  read_rows(os.path.join(sd, "identical.csv"))}
     processed = processed_in_repo(sd)
-    here = set()                                 # blobs counted for this repo
+    here = set()                           # (ext, blob) counted for this repo
     lfs_here = set()                             # exts with an LFS stub here
 
     for p, f in files.items():
@@ -263,12 +265,13 @@ def scan_repo(st, org, repo, sd, pass2):
         st.years[e][(v["first_date"] or "????")[:4]] += 1
         st.repo_send[(org, repo)] += n
         st.repo_send_n[(org, repo)] += 1
-        g = st.distinct.get(d)
+        k = (e, d)
+        g = st.distinct.get(k)
         if g is None:
-            st.distinct[d] = [n, e, 1, "%s/%s:%s" % (org, repo, p)]
-        elif d not in here:
+            st.distinct[k] = [n, e, 1, "%s/%s:%s" % (org, repo, p)]
+        elif k not in here:
             g[2] += 1
-        here.add(d)
+        here.add(k)
     for e in lfs_here:
         st.lfs[e]["repos"] += 1
 
@@ -405,13 +408,16 @@ def report(st, root, out):
         tb.update(byb[e])
     rows.append(["**total**"] + ["%s / %s GB" % (
         f"{sum(by[e][n] for e in binary):,}", gb(tb[n])) for n in names])
+    empty = Counter(e for size, e, _r, _w in st.distinct.values() if size == 0)
     sec("Sizes of the distinct contents to send",
         "Files / GB per size band - what a --max-bytes limit would cut.",
-        table(["ext"] + names, rows, max_rows=60))
+        table(["ext"] + names, rows, max_rows=60)
+        + "\n\nEmpty (0-byte) contents among them: %s - nothing to scan."
+        % (", ".join("%s %d" % kv for kv in sorted(empty.items())) or "none"))
     big = heapq.nlargest(200, st.distinct.items(), key=lambda kv: kv[1][0])
     write_csv(os.path.join(out, "largest_to_send.csv"),
               ["blob", "bytes", "ext", "repos", "example"],
-              [[d.hex(), g[0], g[1], g[2], g[3]] for d, g in big])
+              [[k[1].hex(), g[0], g[1], g[2], g[3]] for k, g in big])
     sec("Largest contents to send", "The 15 biggest; the top 200 are in "
         "largest_to_send.csv.",
         table(["bytes", "ext", "repos", "example"],
@@ -446,7 +452,7 @@ def report(st, root, out):
     dups = heapq.nlargest(200, st.distinct.items(), key=lambda kv: kv[1][2])
     write_csv(os.path.join(out, "duplicated_contents.csv"),
               ["blob", "bytes", "ext", "repos", "example"],
-              [[d.hex(), g[0], g[1], g[2], g[3]] for d, g in dups])
+              [[k[1].hex(), g[0], g[1], g[2], g[3]] for k, g in dups])
     sec("Duplication across repos", "The same content in several repos is "
         "written once (layout A); a readable per-repo tree (layout B) would "
         "show it once per repo.",
