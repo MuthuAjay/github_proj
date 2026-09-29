@@ -485,6 +485,27 @@ class PerRepo(unittest.TestCase):
                     if r["group"] == "binary"))
             self.assertIn("## Per repository",
                           load(an, "ext_versions_analysis.md"))
+            # every unique file once, with one original; the originals per
+            # repo add up to the same total as the counts
+            uniq = read_csv(os.path.join(an, "unique_files.csv"))
+            counts = read_csv(os.path.join(out, "by_extension.csv"))
+            total = sum(int(r["versions_to_send_all_repos"]) for r in counts
+                        if r["group"] == "binary")
+            self.assertEqual(len(uniq), total)
+            self.assertEqual(sum(int(r["binary_delta_original"])
+                                 for r in tot.values()), total)
+            docx = [r for r in uniq if r["ext"] == "docx"]
+            self.assertEqual(len(docx), 1)                  # in two repos
+            self.assertEqual((docx[0]["repos"], docx[0]["occurrences"]),
+                             ("2", "2"))
+            self.assertEqual((docx[0]["original_repo"],
+                              docx[0]["original_path"]), ("repoA", "Old.DOCX"))
+            self.assertEqual(docx[0]["stored_as"],
+                             "files/docx/%s/%s.docx" % (docx[0]["blob"][:2],
+                                                        docx[0]["blob"]))
+            self.assertEqual(rd[("repoA", "docx")]["delta_original"], "1")
+            self.assertEqual(rd[("repoB", "docx")]["delta_original"], "0")
+            self.assertEqual(rd[("repoB", "docx")]["delta_dedup"], "1")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

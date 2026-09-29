@@ -45,6 +45,14 @@ Detail CSVs next to the report:
                             delta_only_in_this_repo, and with --text-delta the
                             text files and lines left to send
   repo_delta_totals.csv     the same, one row per repo
+  unique_files.csv          one row per unique file to send: its stored name
+                            (as extract_versions.py writes it), how often and
+                            in how many repos it occurs, and its ORIGINAL -
+                            the earliest occurrence (first commit date; ties
+                            by org / repo / path): org, repo, path, commit,
+                            date. delta_original in repo_delta.csv counts
+                            unique files per original repo, so it adds up to
+                            the total
 
 Usage:
     python3 ext_versions_analysis.py /data/workarea/ext_versions \\
@@ -66,6 +74,7 @@ from collections import Counter, defaultdict
 from extension_versions import (BINARY_EXTS, PROCESSED, STATE, TEXT_EXTS,
                                 group_of, processed_in_repo, read_json,
                                 read_rows)
+from extract_versions import store_path
 from repo_extension_summary import ext_key
 
 MB, GB = 1e6, 1e9
@@ -286,11 +295,18 @@ def scan_repo(st, org, repo, sd, pass2):
         st.repo_send[(org, repo)] += n
         st.repo_send_n[(org, repo)] += 1
         k = (e, d)
+        # the ORIGINAL of a content: its earliest occurrence (first commit
+        # date), ties broken by org / repo / path - deterministic
+        orig = (v["first_date"] or "9999", org, repo, p, v["first_commit"])
         g = st.distinct.get(k)
         if g is None:
-            st.distinct[k] = [n, e, 1, "%s/%s:%s" % (org, repo, p)]
-        elif k not in here:
-            g[2] += 1
+            st.distinct[k] = [n, e, 1, "%s/%s:%s" % (org, repo, p), 1, orig]
+        else:
+            g[4] += 1
+            if orig < g[5]:
+                g[5] = orig
+            if k not in here:
+                g[2] += 1
         here.add(k)
     for e in lfs_here:
         st.lfs[e]["repos"] += 1
@@ -303,8 +319,11 @@ def scan_repo(st, org, repo, sd, pass2):
 REPO_COLS = ["files_in_history", "files_at_head", "files_history_only",
              "files_no_active_repo", "files_active_only", "versions",
              "lfs_stub_versions", "versions_to_send", "delta_dedup",
-             "delta_gb", "delta_only_in_this_repo", "text_files_with_delta",
-             "text_lines_kept"]
+             "delta_gb", "delta_only_in_this_repo", "delta_original",
+             "delta_original_gb", "text_files_with_delta", "text_lines_kept"]
+BINARY_COLS = ("versions_to_send", "delta_dedup", "delta_gb",
+               "delta_only_in_this_repo", "delta_original", "delta_original_gb",
+               "lfs_stub_versions")
 
 
 def read_text_delta(root):
@@ -330,7 +349,15 @@ def read_text_delta(root):
 def write_per_repo(st, out, text_delta):
     """repo_delta.csv (per repo and extension) and repo_delta_totals.csv
     (per repo). delta_dedup = contents to send, each once within the repo;
-    delta_only_in_this_repo = of those, the ones no other repo has."""
+    delta_only_in_this_repo = of those, the ones no other repo has;
+    delta_original = the unique files whose original (earliest occurrence)
+    is in this repo - each unique file counts in exactly one repo, so these
+    add up to the total across all repos."""
+    owned = defaultdict(Counter)
+    for g in st.distinct.values():
+        _d, org, repo, _p, _c = g[5]
+        owned[(org, repo, g[1])]["n"] += 1
+        owned[(org, repo, g[1])]["bytes"] += g[0]
     keys = set(st.per_repo) | set(text_delta)
     rows, tot = [], defaultdict(Counter)
     for org, repo, e in sorted(keys):
@@ -341,14 +368,16 @@ def write_per_repo(st, out, text_delta):
         c["delta_bytes"] = sum(bl.values())
         c["delta_only_in_this_repo"] = sum(
             1 for d in bl if st.distinct[(e, d)][2] == 1)
+        c["delta_original"] = owned[(org, repo, e)]["n"]
+        c["delta_original_bytes"] = owned[(org, repo, e)]["bytes"]
         binary = group_of(e) == "binary"
         rows.append([org, repo, e, group_of(e)] + [
-            round(c["delta_bytes"] / GB, 4) if col == "delta_gb" and binary
-            else ("" if (binary and col.startswith("text_")) or
-             (not binary and col in ("versions_to_send", "delta_dedup",
-                                     "delta_gb", "delta_only_in_this_repo",
-                                     "lfs_stub_versions"))
-             or (col.startswith("text_") and not text_delta) else c[col])
+            "" if (binary and col.startswith("text_"))
+            or (not binary and col in BINARY_COLS)
+            or (col.startswith("text_") and not text_delta) else
+            round(c["delta_bytes"] / GB, 4) if col == "delta_gb" else
+            round(c["delta_original_bytes"] / GB, 4)
+            if col == "delta_original_gb" else c[col]
             for col in REPO_COLS])
         t = tot[(org, repo)]
         for col in ("files_in_history", "files_at_head", "files_history_only",
@@ -358,6 +387,8 @@ def write_per_repo(st, out, text_delta):
             t["binary_versions_to_send"] += c["versions_to_send"]
             t["binary_delta_dedup"] += c["delta_dedup"]
             t["binary_delta_bytes"] += c["delta_bytes"]
+            t["binary_delta_original"] += c["delta_original"]
+            t["binary_delta_original_bytes"] += c["delta_original_bytes"]
         else:
             t["text_files_with_delta"] += c["text_files_with_delta"]
             t["text_lines_kept"] += c["text_lines_kept"]
@@ -365,18 +396,38 @@ def write_per_repo(st, out, text_delta):
               ["org", "repo", "ext", "group"] + REPO_COLS, rows)
     tcols = ["files_in_history", "files_at_head", "files_history_only",
              "files_active_only", "binary_versions_to_send",
-             "binary_delta_dedup", "binary_delta_gb", "text_files_with_delta",
+             "binary_delta_dedup", "binary_delta_gb", "binary_delta_original",
+             "binary_delta_original_gb", "text_files_with_delta",
              "text_lines_kept"]
     trows = []
     for (org, repo), t in sorted(tot.items(),
                                  key=lambda kv: -kv[1]["binary_delta_bytes"]):
         trows.append([org, repo] + [
             round(t["binary_delta_bytes"] / GB, 4) if col == "binary_delta_gb"
+            else round(t["binary_delta_original_bytes"] / GB, 4)
+            if col == "binary_delta_original_gb"
             else ("" if col.startswith("text_") and not text_delta else t[col])
             for col in tcols])
     write_csv(os.path.join(out, "repo_delta_totals.csv"), ["org", "repo"] + tcols,
               trows)
     return trows
+
+
+def write_unique_files(st, out):
+    """unique_files.csv: one row per unique file to send - the file
+    extract_versions.py stores, and the occurrence taken as its original."""
+    rows = []
+    for (e, d), g in st.distinct.items():
+        date, org, repo, path, commit = g[5]
+        b = d.hex()
+        rows.append([e, b, g[0], store_path(e, b), g[4], g[2], org, repo,
+                     path, commit, "" if date == "9999" else date])
+    rows.sort(key=lambda r: (r[0], r[6], r[7], r[8], r[1]))
+    write_csv(os.path.join(out, "unique_files.csv"),
+              ["ext", "blob", "bytes", "stored_as", "occurrences", "repos",
+               "original_org", "original_repo", "original_path",
+               "original_commit", "original_date"], rows)
+    return len(rows)
 
 
 # --------------------------------------------------------------------------
@@ -425,7 +476,7 @@ def report(st, root, out, text_delta=None):
     send_b = {e: sum(st.reason[(e, r)]["bytes"] for r in REASONS)
               for e in binary}
     dist_n, dist_b = Counter(), Counter()
-    for size, e, _r, _w in st.distinct.values():
+    for size, e, _r, _w, *_o in st.distinct.values():
         dist_n[e] += 1
         dist_b[e] += size
     rows = [[e, len(st.ext_repos[e]), st.ext[e]["files"], st.ext[e]["at_yes"],
@@ -500,7 +551,7 @@ def report(st, root, out, text_delta=None):
     # sizes
     by = defaultdict(Counter)
     byb = defaultdict(Counter)
-    for size, e, _r, _w in st.distinct.values():
+    for size, e, _r, _w, *_o in st.distinct.values():
         by[e][bucket(size)] += 1
         byb[e][bucket(size)] += size
     names = [n for _e, n in SIZE_BUCKETS]
@@ -511,7 +562,7 @@ def report(st, root, out, text_delta=None):
         tb.update(byb[e])
     rows.append(["**total**"] + ["%s / %s GB" % (
         f"{sum(by[e][n] for e in binary):,}", gb(tb[n])) for n in names])
-    empty = Counter(e for size, e, _r, _w in st.distinct.values() if size == 0)
+    empty = Counter(e for size, e, _r, _w, *_o in st.distinct.values() if size == 0)
     sec("Sizes of the distinct contents to send",
         "Files / GB per size band - what a --max-bytes limit would cut.",
         table(["ext"] + names, rows, max_rows=60)
@@ -609,22 +660,32 @@ def report(st, root, out, text_delta=None):
 
     # per repository
     trows = write_per_repo(st, out, text_delta or {})
+    n_unique = write_unique_files(st, out)
     with_bin = sum(1 for r in trows if r[6])
     sec("Per repository", "Every repo and extension in repo_delta.csv, one "
-        "row per repo in repo_delta_totals.csv. delta_dedup counts each "
-        "content once within the repo, so repos sharing a file both count it; "
-        "delta_only_in_this_repo is what no other repo has. Text columns are "
-        "filled when --text-delta points at file_delta.py's output.",
-        table(["", "repos"], [
-            ["with anything in history", len(trows)],
-            ["with binary versions to send", with_bin]]
-            + ([["with text lines to send", sum(1 for r in trows if r[9])]]
-               if text_delta else []))
+        "row per repo in repo_delta_totals.csv. unique in repo "
+        "(delta_dedup) counts each content once within the repo, so repos "
+        "sharing a file both count it. original (delta_original) gives each "
+        "unique file to ONE repo - where it first appeared - so it adds up "
+        "to the total; unique_files.csv lists every unique file with that "
+        "original occurrence. Text columns are filled when --text-delta "
+        "points at file_delta.py's output.",
+        table(["", "count"], [
+            ["unique files to send (unique_files.csv)", n_unique],
+            ["... sum of delta_original over repos",
+             sum(r[9] for r in trows)],
+            ["repos with anything in history", len(trows)],
+            ["repos with binary versions to send", with_bin],
+            ["repos that are the original of a unique file",
+             sum(1 for r in trows if r[9])]]
+            + ([["repos with text lines to send",
+                 sum(1 for r in trows if r[11])]] if text_delta else []))
         + "\n\n" + table(["org", "repo", "binary to send", "unique in repo",
-                           "GB"] + (["text files", "text lines"]
-                                    if text_delta else []),
-                          [[r[0], r[1], r[6], r[7], r[8]]
-                           + ([r[9], r[10]] if text_delta else [])
+                           "GB", "original", "GB original"]
+                          + (["text files", "text lines"]
+                             if text_delta else []),
+                          [[r[0], r[1], r[6], r[7], r[8], r[9], r[10]]
+                           + ([r[11], r[12]] if text_delta else [])
                            for r in trows[:20]]))
 
     # cross-check
