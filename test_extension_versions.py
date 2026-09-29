@@ -254,6 +254,33 @@ class ExtensionVersions(unittest.TestCase):
         self.assertIn("Binary extensions", md)
 
 
+class Analysis(unittest.TestCase):
+    def test_report_matches_counts(self):
+        tmp = tempfile.mkdtemp(prefix="extv_an_")
+        try:
+            arch, act, batch = build(tmp)
+            out = os.path.join(tmp, "out")
+            base = ["--batch", batch, "--repos-root", arch, "--active-root",
+                    act, "--out", out]
+            run("extension_versions.py", *base)
+            run("extension_versions.py", *base, "--identical")
+            run("ext_versions_analysis.py", out)
+            an = os.path.join(out, "analysis")
+            md = load(an, "ext_versions_analysis.md")
+            self.assertIn("All match.", md)
+            self.assertIn("| pass 2 ok | 3 |", md)
+            reasons = {(r["ext"], r["reason"]): int(r["versions"]) for r in
+                       read_csv(os.path.join(an, "to_send_by_ext_reason.csv"))}
+            self.assertEqual(reasons[("xlsx", "older_version")], 3)
+            self.assertEqual(reasons[("png", "no_active_repo")], 1)
+            self.assertEqual(reasons[("msg", "active_differs")], 1)
+            self.assertEqual(reasons[("docx", "history_only")], 1)
+            locks = read_csv(os.path.join(an, "lock_files.csv"))
+            self.assertEqual(locks[0]["file_name"], "gemfile.lock")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class PassOneOnly(unittest.TestCase):
     def test_latest_assumed_processed(self):
         tmp = tempfile.mkdtemp(prefix="extv_p1_")
