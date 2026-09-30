@@ -632,6 +632,52 @@ class AllExtensions(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class AllExtensionsOddNames(unittest.TestCase):
+    """File names with a carriage return, a comma, a quote or bytes that
+    are not UTF-8 count like any other; a row that does not read back is
+    listed, not a crash."""
+
+    def test_odd_names_and_bad_row(self):
+        tmp = tempfile.mkdtemp(prefix="extv_odd_")
+        try:
+            r = os.path.join(tmp, "archive", "o", "r")
+            os.makedirs(r)
+            git(r, "init", "-q")
+            for n in (b"a.txt", b"b.txt\r", b"Icon\r", b"c.x,y", b'd.q"t',
+                      b"e.caf\xe9"):
+                with open(os.path.join(r.encode(), n), "wb") as fh:
+                    fh.write(b"x")
+            git(r, "add", "-A")
+            git(r, "commit", "-qm", "c")
+            out = os.path.join(tmp, "out")
+            run("all_extension_counts.py", "--repo", "o/r", "--repos-root",
+                os.path.join(tmp, "archive"), "--out", out, "--history-only")
+            with open(os.path.join(out, "extension_counts.csv"), newline="",
+                      encoding="utf-8", errors="surrogateescape") as fh:
+                counts = {row[0]: row[1] for row in csv.reader(fh)}
+            self.assertEqual(counts["txt"], "1")
+            self.assertEqual(counts["txt\r"], "1")
+            self.assertEqual(counts["x,y"], "1")
+            self.assertEqual(counts['q"t'], "1")
+            self.assertEqual(counts["total"], "6")
+            self.assertEqual(len(read_csv(os.path.join(
+                out, "combine_problems.csv"))), 0)
+
+            # a damaged per-repo file: listed, the rest still combined
+            with open(os.path.join(out, "_state", "o", "r", "ext_counts.csv"),
+                      "a", encoding="utf-8") as fh:
+                fh.write("broken\n")
+            p = run("all_extension_counts.py", "--out", out, "--combine-only")
+            self.assertIn("combined 1 repo(s)", p.stdout)
+            self.assertIn("1 row(s)", p.stderr)
+            probs = read_csv(os.path.join(out, "combine_problems.csv"))
+            self.assertEqual((probs[0]["repo"], probs[0]["ext_as_read"]),
+                             ("r", "'broken'"))
+            self.assertIn("could not be read back", load(out, "summary.md"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class PassOneOnly(unittest.TestCase):
     def test_latest_assumed_processed(self):
         tmp = tempfile.mkdtemp(prefix="extv_p1_")

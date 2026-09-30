@@ -207,6 +207,7 @@ def combine(out):
     per_repo = []
     repos = 0
     statuses = Counter()
+    bad = []
     for org in sorted(os.listdir(state)) if os.path.isdir(state) else []:
         od = os.path.join(state, org)
         if not os.path.isdir(od):
@@ -220,6 +221,14 @@ def combine(out):
             repos += 1
             for r in read_rows(os.path.join(sd, "ext_counts.csv")):
                 e = r["ext"]
+                if e is None or any(not (r.get(c) or "").isdigit()
+                                    for c in COLS):
+                    # a row that does not read back as ext + numbers: kept
+                    # out of the totals and listed, never a crash
+                    bad.append([org, repo, repr(e),
+                                repr([r.get(c) for c in COLS])[:300],
+                                repr(r.get(None))[:300]])
+                    continue
                 vals = {c: int(r[c]) for c in COLS}
                 for c in COLS:
                     if c == "max_bytes":
@@ -261,11 +270,20 @@ def combine(out):
                             if acc[e]["files_in_history"]),
                            key=lambda r: (-r[1], r[0])))
         w.writerow(["total", sum(acc[e]["files_in_history"] for e in acc)])
-    write_summary(out, table, head, repos, statuses)
+    with open(os.path.join(out, "combine_problems.csv"), "w", newline="",
+              encoding="utf-8", errors="backslashreplace") as fh:
+        w = csv.writer(fh)
+        w.writerow(["org", "repo", "ext_as_read", "values_as_read", "extra"])
+        w.writerows(bad)
+    if bad:
+        print("WARNING %d row(s) in %d repo(s) did not read back and are not "
+              "counted - listed in combine_problems.csv"
+              % (len(bad), len({(b[0], b[1]) for b in bad})), file=sys.stderr)
+    write_summary(out, table, head, repos, statuses, len(bad))
     return repos, len(order)
 
 
-def write_summary(out, table, head, repos, statuses):
+def write_summary(out, table, head, repos, statuses, bad=0):
     ix = {c: i for i, c in enumerate(head)}
 
     def n(v):
@@ -309,7 +327,11 @@ def write_summary(out, table, head, repos, statuses):
            % (f"{len(small):,}", f"{tot('files_in_history', small):,}"), "",
            "Columns: see the docstring of all_extension_counts.py. "
            "\"(none)\" = files without an extension."]
-    with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as fh:
+    if bad:
+        md += ["", "**%d row(s) could not be read back and are not counted** "
+               "- see combine_problems.csv." % bad]
+    with open(os.path.join(out, "summary.md"), "w", encoding="utf-8",
+              errors="backslashreplace") as fh:
         fh.write("\n".join(md) + "\n")
 
 
