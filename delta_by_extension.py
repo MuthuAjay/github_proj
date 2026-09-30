@@ -28,7 +28,10 @@ Columns, per extension:
   files_nothing_left   files whose every line is still in today's file
   files_not_text       binary / empty / name too long - nothing to compare
   files_unreadable     today's file could not be read: whole history kept
-  files_error          the delta failed for the file
+  files_no_delta       no delta result: the file's repo has not been through
+                       file_delta.py (not run yet, or its delta failed) -
+                       the numbers are not final while this is not 0
+  files_delta_error    file_delta.py ran and recorded an error for the file
 
 and a total row. Lines are deduplicated WITHIN each file (every line once),
 not across files - the unit of a line-level delta. Repos the extraction
@@ -61,7 +64,7 @@ COLS = ["repos", "files_in_history", "files_at_head", "files_history_only",
         "files_no_active_repo", "versions", "files_with_text",
         "lines_in_history", "lines_removed", "lines_sent", "files_sent",
         "files_nothing_left", "files_not_text", "files_unreadable",
-        "files_error"]
+        "files_no_delta", "files_delta_error"]
 LEGEND = [
     ("repos", "Repositories with at least one file of this type"),
     ("files_in_history", "Unique file paths the extraction saw in history"),
@@ -78,7 +81,11 @@ LEGEND = [
     ("files_nothing_left", "Files whose every line is still in today's file"),
     ("files_not_text", "Binary, empty or name too long - nothing to compare"),
     ("files_unreadable", "Today's file could not be read: whole history sent"),
-    ("files_error", "The delta failed for the file"),
+    ("files_no_delta", "No delta result for the file: its repo has not been "
+                       "through file_delta.py (not run yet, or the repo's "
+                       "delta failed - see delta_repo_status in the .md)"),
+    ("files_delta_error", "file_delta.py ran and recorded an error for the "
+                          "file"),
 ]
 
 
@@ -109,6 +116,7 @@ def build(extract, delta, exts):
     acc = defaultdict(Counter)
     repos_of = defaultdict(set)
     failed = Counter()
+    delta_status = Counter()
     t0, n = time.time(), 0
     for org, repo, sd in state_repos(extract):
         n += 1
@@ -123,6 +131,12 @@ def build(extract, delta, exts):
         if status != "ok":
             failed[status] += 1
             continue
+        try:
+            with open(os.path.join(delta, "_state", org, repo, "done.json"),
+                      encoding="utf-8") as fh:
+                delta_status[json.load(fh).get("status", "?")] += 1
+        except (OSError, ValueError):
+            delta_status["not run"] += 1
         dl = {r["path"]: r for r in rows_of(os.path.join(
             delta, "_state", org, repo, "manifest.csv"))}
         for r in rows_of(os.path.join(sd, "manifest.csv")):
@@ -142,14 +156,14 @@ def build(extract, delta, exts):
             c["files_with_text"] += 1
             d = dl.get(p)
             if d is None:
-                c["files_error"] += 1          # no delta row for it
+                c["files_no_delta"] += 1       # repo not (yet) through delta
                 continue
             c["lines_in_history"] += num(d.get("lines_history"))
             c["lines_removed"] += num(d.get("lines_removed"))
             c["lines_sent"] += num(d.get("lines_kept"))
             action = d.get("action", "")
             if action == "error":
-                c["files_error"] += 1
+                c["files_delta_error"] += 1
             elif action == "unreadable_current":
                 c["files_unreadable"] += 1
                 c["files_sent"] += 1
@@ -160,7 +174,7 @@ def build(extract, delta, exts):
     for e in acc:
         acc[e]["repos"] = len(repos_of[e])
     all_repos = set().union(*repos_of.values()) if repos_of else set()
-    return acc, failed, n, len(all_repos)
+    return acc, failed, n, len(all_repos), delta_status
 
 
 def main():
@@ -181,7 +195,8 @@ def main():
             None if args.extensions == "all" else
             set(load_extensions(args.extensions)))
 
-    acc, failed, n, n_repos = build(args.extract, args.delta, exts)
+    acc, failed, n, n_repos, delta_status = build(args.extract, args.delta,
+                                                  exts)
     order = sorted(acc, key=lambda e: (-acc[e]["files_in_history"], e))
     rows = [[e] + [acc[e][c] for c in COLS] for e in order]
     total = ["total"] + [sum(r[i] for r in rows)
@@ -213,6 +228,9 @@ def main():
           "rows, not in these numbers): %s." % (
               f"{n:,}", ", ".join("%s %d" % kv for kv in failed.most_common())
               or "none"), "",
+          "delta_repo_status (file_delta.py, repos the extraction did): %s."
+          % (", ".join("%s %s" % (k, f"{v:,}")
+                       for k, v in delta_status.most_common()) or "-"), "",
           "| ext | " + " | ".join(show) + " |",
           "|---|" + "---:|" * len(show)]
     md += ["| %s | %s |" % (r[0], " | ".join(f(r[ix[c]]) for c in show))
@@ -231,6 +249,13 @@ def main():
     if failed:
         print("repos the extraction failed on (not counted): %s"
               % ", ".join("%s %d" % kv for kv in failed.most_common()))
+    print("delta per repo: %s" % (", ".join(
+        "%s %s" % (k, f"{v:,}") for k, v in delta_status.most_common())
+        or "-"))
+    nd = total[ix["files_no_delta"]]
+    if nd:
+        print("WARNING %s file(s) have no delta result - the delta is not "
+              "complete for their repos; these numbers are not final" % f(nd))
     return 0
 
 

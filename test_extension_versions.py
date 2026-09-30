@@ -823,6 +823,19 @@ class DeltaByExtension(unittest.TestCase):
                               g["total"]["files_sent"],
                               g["total"]["lines_sent"]), ("2", "5", "3", "3"))
             self.assertIn("Line-level delta", load(out + ".md"))
+            self.assertIn("delta per repo: ok 2", p.stdout)
+            self.assertEqual(g["total"]["files_no_delta"], "0")
+
+            # a repo not (yet) through the delta: its files are flagged
+            shutil.rmtree(os.path.join(ext + "_delta", "_state", "o", "r2"))
+            p = run("delta_by_extension.py", "--extract", ext, "--delta",
+                    ext + "_delta", "--out", out)
+            self.assertIn("not run 1", p.stdout)
+            self.assertIn("1 file(s) have no delta result", p.stdout)
+            with open(out, newline="") as fh:
+                rows = {x[0]: x for x in csv.reader(fh) if x}
+            y = dict(zip(rows["ext"], rows["yaml"]))
+            self.assertEqual((y["files_no_delta"], y["files_sent"]), ("1", "0"))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
