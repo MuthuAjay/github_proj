@@ -755,6 +755,78 @@ class ValidateGroup1(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class DeltaByExtension(unittest.TestCase):
+    """delta_by_extension.py on a real line-level chain: file_added_lines,
+    fill_at_head, file_delta."""
+
+    def test_group1_delta(self):
+        tmp = tempfile.mkdtemp(prefix="extv_dbe_")
+        try:
+            arch, act = os.path.join(tmp, "archive"), os.path.join(tmp, "act")
+            r = os.path.join(arch, "o", "r")
+            os.makedirs(r)
+            git(r, "init", "-q")
+            for n, d in (("a.json", "a\nb\n"), ("db/c.sql", "select 1;\n"),
+                         ("notes.md", "# n\n"), ("d.txt", "t\n"),
+                         ("e.png", "\x00png")):
+                put(r, n, d)
+            git(r, "add", "-A")
+            git(r, "commit", "-qm", "c1")
+            put(r, "a.json", "a\nc\n")                     # b -> c
+            git(r, "rm", "-q", "db/c.sql")
+            git(r, "commit", "-qam", "c2")
+            for n, d in (("a.json", "a\nc\n"), ("notes.md", "# n\n"),
+                         ("d.txt", "t\n"), ("e.png", "\x00png")):
+                put(os.path.join(act, "o", "r"), n, d)
+            r2 = os.path.join(arch, "o", "r2")               # no active copy
+            os.makedirs(r2)
+            git(r2, "init", "-q")
+            put(r2, "x.yaml", "k: 1\n")
+            git(r2, "add", "-A")
+            git(r2, "commit", "-qm", "c")
+            batch = os.path.join(tmp, "B.csv")
+            with open(batch, "w") as fh:
+                fh.write("org,repo\no,r\no,r2\no,gone\n")     # gone: fails
+            ext = os.path.join(tmp, "extract")
+            run("file_added_lines.py", "--batch", batch, "--repos-root", arch,
+                "--out", ext, "--quiet", "--min-free-disk-gb", "0")
+            run("fill_at_head.py", ext, "--disk-root", act)
+            run("file_delta.py", ext, "--active-root", act, "--out",
+                ext + "_delta")
+            out = os.path.join(tmp, "g1.csv")
+            p = run("delta_by_extension.py", "--extract", ext, "--delta",
+                    ext + "_delta", "--out", out)
+            self.assertIn("repo_missing 1", p.stdout)
+            with open(out, newline="") as fh:
+                rows = {x[0]: x for x in csv.reader(fh) if x}
+            head = rows["ext"]
+            g = {e: dict(zip(head, rows[e])) for e in
+                 ("json", "sql", "md", "txt", "yaml", "total")}
+            # a.json: lines a, b, c ever; a, c still there -> b is sent
+            self.assertEqual((g["json"]["lines_in_history"],
+                              g["json"]["lines_removed"],
+                              g["json"]["lines_sent"],
+                              g["json"]["files_sent"]), ("3", "2", "1", "1"))
+            # deleted c.sql: whole history sent
+            self.assertEqual((g["sql"]["files_history_only"],
+                              g["sql"]["lines_sent"], g["sql"]["files_sent"]),
+                             ("1", "1", "1"))
+            # unchanged files: nothing left
+            self.assertEqual(g["md"]["files_nothing_left"], "1")
+            self.assertEqual(g["txt"]["files_nothing_left"], "1")
+            # a repo with no active copy: whole history sent
+            self.assertEqual((g["yaml"]["files_no_active_repo"],
+                              g["yaml"]["files_sent"]), ("1", "1"))
+            self.assertNotIn("png", rows)                   # not group 1
+            self.assertEqual((g["total"]["repos"],
+                              g["total"]["files_in_history"],
+                              g["total"]["files_sent"],
+                              g["total"]["lines_sent"]), ("2", "5", "3", "3"))
+            self.assertIn("Line-level delta", load(out + ".md"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class PassOneOnly(unittest.TestCase):
     def test_latest_assumed_processed(self):
         tmp = tempfile.mkdtemp(prefix="extv_p1_")

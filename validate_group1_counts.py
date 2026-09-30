@@ -51,21 +51,33 @@ from repo_extension_summary import EXTENSIONS, ext_key
 GROUP_1 = set(EXTENSIONS)
 
 
-def repos_under(root):
+def repos_under(root, what=""):
+    """(org, repo, state dir) under root/_state; with `what`, a progress line
+    on stderr every 500 repos."""
     state = os.path.join(root, "_state")
+    t0, n = time.time(), 0
     for org in sorted(os.listdir(state)) if os.path.isdir(state) else []:
         od = os.path.join(state, org)
         if not os.path.isdir(od):
             continue
         for repo in sorted(os.listdir(od)):
             yield org, repo, os.path.join(od, repo)
+            n += 1
+            if what and n % 500 == 0:
+                print("  %s: %s repos read  %.0fs" % (what, f"{n:,}",
+                                                    time.time() - t0),
+                      file=sys.stderr, flush=True)
+    if what:
+        print("  %s: %s repos read  %.0fs - done" % (what, f"{n:,}",
+                                                    time.time() - t0),
+              file=sys.stderr, flush=True)
 
 
 def read_first(first):
     """{(org, repo): (status, {ext: n}, {path: row status})} - paths only
     kept later for drilled repos, so here: counts per extension."""
     out = {}
-    for org, repo, sd in repos_under(first):
+    for org, repo, sd in repos_under(first, "first run"):
         done = read_json(os.path.join(sd, "done.json"))
         status = done.get("status", "?") if done else "no done.json"
         per_ext = Counter()
@@ -85,7 +97,7 @@ def read_first(first):
 
 def read_new(counts):
     out = {}
-    for org, repo, sd in repos_under(counts):
+    for org, repo, sd in repos_under(counts, "new count"):
         done = read_json(os.path.join(sd, "done.json"))
         status = done.get("status", "?") if done else "no done.json"
         per_ext = Counter()
