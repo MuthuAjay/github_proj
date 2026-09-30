@@ -39,9 +39,12 @@ files_vendored, commits and versions per extension - no active copy (the
 mount is not needed), no sizes. That is all extension_counts.csv needs.
 
 Output, under --out:
-  extension_counts.csv   THE short answer: ext, files - every extension and
-                     how many files with it the history ever held, most
-                     first, and a total row
+  extension_counts.csv   THE short answer: ext, files, group - every
+                     extension and how many files with it the history ever
+                     held, most first; group: "group 1" = the 32 of the first
+                     extraction (repo_extension_summary.py), "group 2" = the
+                     27 of the second, "rest" = neither; a total per group
+                     and an overall total at the end
   _state/<org>/<repo>/ext_counts.csv, done.json     per repo (resume)
   _logs/<name>.log, <name>_repos.csv
   by_extension.csv   one row per extension, most files first; in_27 says
@@ -80,7 +83,7 @@ from extension_versions import (BINARY_EXTS, LOGS, STATE, TEXT_EXTS,
 from extract_commits import bind_job
 from file_delta import (MountDown, check_mount, csv_text, write_atomic)
 from file_history_for_list import RecoveredRepo, RepoJob, git_can_open
-from repo_extension_summary import ext_key
+from repo_extension_summary import EXTENSIONS, ext_key
 
 NONE = "(none)"
 COLS = ["files_in_history", "files_at_head", "files_history_only",
@@ -89,6 +92,13 @@ COLS = ["files_in_history", "files_at_head", "files_history_only",
         "bytes_in_repo", "max_bytes", "missing_objects"]
 GB = 1e9
 IN_27 = set(TEXT_EXTS) | set(BINARY_EXTS)
+GROUP_1 = set(EXTENSIONS)            # the 32 of the first extraction
+GROUP_2 = IN_27                      # the 27 of the second
+
+
+def group_label(ext):
+    return ("group 1" if ext in GROUP_1 else
+            "group 2" if ext in GROUP_2 else "rest")
 log = logging.getLogger("all_extension_counts")
 
 
@@ -265,11 +275,16 @@ def combine(out):
     with open(os.path.join(out, "extension_counts.csv"), "w", newline="",
               encoding="utf-8", errors="surrogateescape") as fh:
         w = csv.writer(fh)
-        w.writerow(["ext", "files"])
-        w.writerows(sorted(([e, acc[e]["files_in_history"]] for e in acc
-                            if acc[e]["files_in_history"]),
+        w.writerow(["ext", "files", "group"])
+        w.writerows(sorted(([e, acc[e]["files_in_history"], group_label(e)]
+                            for e in acc if acc[e]["files_in_history"]),
                            key=lambda r: (-r[1], r[0])))
-        w.writerow(["total", sum(acc[e]["files_in_history"] for e in acc)])
+        for g in ("group 1", "group 2", "rest"):
+            w.writerow(["total " + g, sum(acc[e]["files_in_history"]
+                                          for e in acc if group_label(e) == g),
+                        g])
+        w.writerow(["total", sum(acc[e]["files_in_history"] for e in acc),
+                    ""])
     with open(os.path.join(out, "combine_problems.csv"), "w", newline="",
               encoding="utf-8", errors="backslashreplace") as fh:
         w = csv.writer(fh)

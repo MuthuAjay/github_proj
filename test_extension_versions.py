@@ -623,10 +623,19 @@ class AllExtensions(unittest.TestCase):
             want = {e: r["files_in_history"] for e, r in got.items()
                     if r["files_in_history"] != "0"}
             want["total"] = str(sum(int(v) for v in want.values()))
+            groups = {r["ext"]: r["group"] for r in read_csv(os.path.join(
+                quick, "extension_counts.csv"))}
+            self.assertEqual((groups["md"], groups["xlsx"]),
+                             ("group 1", "group 2"))
+            self.assertEqual(counts.pop("total group 1"), "1")      # md
+            self.assertEqual(counts.pop("total rest"), "0")
+            self.assertEqual(counts.pop("total group 2"),
+                             str(int(want["total"]) - 1))
             self.assertEqual(counts, want)
             self.assertNotIn("(none)", counts)   # Makefile: active copy only
             full_counts = {r["ext"]: r["files"] for r in read_csv(
-                os.path.join(out, "extension_counts.csv"))}
+                os.path.join(out, "extension_counts.csv"))
+                if not r["ext"].startswith("total ")}
             self.assertEqual(full_counts, counts)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -674,6 +683,74 @@ class AllExtensionsOddNames(unittest.TestCase):
             self.assertEqual((probs[0]["repo"], probs[0]["ext_as_read"]),
                              ("r", "'broken'"))
             self.assertIn("could not be read back", load(out, "summary.md"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ValidateGroup1(unittest.TestCase):
+    """validate_group1_counts.py: the first extraction and the all-extension
+    count agree on the same archive; a path missing from the first run is
+    found and named."""
+
+    def test_agree_then_gap(self):
+        tmp = tempfile.mkdtemp(prefix="extv_val_")
+        try:
+            arch = os.path.join(tmp, "archive")
+            r = os.path.join(arch, "o", "r")
+            os.makedirs(r)
+            git(r, "init", "-q")
+            for n, d in (("a.json", "{}"), ("src/b.py", "x=1\n"),
+                         ("db/c.sql", "select 1;\n"), ("d.txt", "t\n"),
+                         ("notes.MD", "# n\n"), ("e.png", "\x00png")):
+                put(r, n, d)
+            git(r, "add", "-A")
+            git(r, "commit", "-qm", "c1")
+            git(r, "rm", "-q", "db/c.sql")
+            git(r, "commit", "-qm", "c2")
+            r2 = os.path.join(arch, "o", "r2")
+            os.makedirs(r2)
+            git(r2, "init", "-q")
+            put(r2, "x.yaml", "a: 1\n")
+            git(r2, "add", "-A")
+            git(r2, "commit", "-qm", "c")
+            unlink_refs(r2)                               # like the archive
+            batch = os.path.join(tmp, "B.csv")
+            with open(batch, "w") as fh:
+                fh.write("org,repo\no,r\no,r2\n")
+            first = os.path.join(tmp, "first")
+            run("file_added_lines.py", "--batch", batch, "--repos-root", arch,
+                "--out", first, "--quiet", "--min-free-disk-gb", "0")
+            counts = os.path.join(tmp, "counts")
+            run("all_extension_counts.py", "--batch", batch, "--repos-root",
+                arch, "--out", counts, "--history-only")
+
+            out = os.path.join(tmp, "val")
+            p = run("validate_group1_counts.py", "--first", first, "--counts",
+                    counts, "--out", out)
+            self.assertIn("difference +0; 0 repo(s) differ", p.stdout)
+            rows = {r["repo"]: r for r in read_csv(os.path.join(out,
+                                                               "by_repo.csv"))}
+            self.assertEqual((rows["r"]["first_files"], rows["r"]["new_files"]),
+                             ("5", "5"))          # json py sql txt md; not png
+            self.assertEqual(rows["r2"]["new_files"], "1")
+
+            # a gap in the first run: drop c.sql from its manifest
+            mp = os.path.join(first, "_state", "o", "r", "manifest.csv")
+            with open(mp, newline="") as fh:
+                keep = [x for x in csv.reader(fh) if x[2] != "db/c.sql"]
+            with open(mp, "w", newline="") as fh:
+                csv.writer(fh).writerows(keep)
+            p = run("validate_group1_counts.py", "--first", first, "--counts",
+                    counts, "--out", out, "--repos-root", arch, "--drill", "5")
+            self.assertIn("difference +1; 1 repo(s) differ", p.stdout)
+            pd = read_csv(os.path.join(out, "paths_diff.csv"))
+            self.assertEqual([(x["repo"], x["path"], x["in_first_run"],
+                               x["in_history_now"]) for x in pd],
+                             [("r", "db/c.sql", "no", "yes")])
+            ext = {x["ext"]: x for x in read_csv(os.path.join(
+                out, "by_extension.csv"))}
+            self.assertEqual(ext["sql"]["diff"], "1")
+            self.assertIn("## Drill: exact paths", load(out, "summary.md"))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
