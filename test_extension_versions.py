@@ -296,6 +296,17 @@ class Analysis(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def ext_counts(path):
+    """extension_counts.csv rows up to the legend."""
+    out = []
+    for r in read_csv(path):
+        if r["ext"] == "column":
+            break
+        if r["ext"]:
+            out.append(r)
+    return out
+
+
 def blob_id(data):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
@@ -618,13 +629,22 @@ class AllExtensions(unittest.TestCase):
             quick = os.path.join(tmp, "quick")
             run("all_extension_counts.py", "--batch", batch, "--repos-root",
                 arch, "--out", quick, "--history-only")
-            counts = {r["ext"]: r["files"] for r in read_csv(os.path.join(
+            counts = {r["ext"]: r["files"] for r in ext_counts(os.path.join(
                 quick, "extension_counts.csv"))}
             want = {e: r["files_in_history"] for e, r in got.items()
                     if r["files_in_history"] != "0"}
             want["total"] = str(sum(int(v) for v in want.values()))
-            groups = {r["ext"]: r["group"] for r in read_csv(os.path.join(
+            groups = {r["ext"]: r["group"] for r in ext_counts(os.path.join(
                 quick, "extension_counts.csv"))}
+            # both version measures, as extension_versions.py counts them
+            ev = {r["ext"]: r for r in ext_counts(os.path.join(
+                quick, "extension_counts.csv"))}
+            for e in ("xlsx", "pptx", "lock"):
+                self.assertEqual(ev[e]["versions(changes)"], ref[e]["commits"])
+                self.assertEqual(ev[e]["distinct_versions"],
+                                 ref[e]["versions_per_file"])
+            self.assertEqual((ev["xlsx"]["versions(changes)"],
+                              ev["xlsx"]["distinct_versions"]), ("4", "4"))
             self.assertEqual((groups["md"], groups["xlsx"]),
                              ("group 1", "group 2"))
             self.assertEqual(counts.pop("total group 1"), "1")      # md
@@ -633,7 +653,7 @@ class AllExtensions(unittest.TestCase):
                              str(int(want["total"]) - 1))
             self.assertEqual(counts, want)
             self.assertNotIn("(none)", counts)   # Makefile: active copy only
-            full_counts = {r["ext"]: r["files"] for r in read_csv(
+            full_counts = {r["ext"]: r["files"] for r in ext_counts(
                 os.path.join(out, "extension_counts.csv"))
                 if not r["ext"].startswith("total ")}
             self.assertEqual(full_counts, counts)
@@ -663,7 +683,12 @@ class AllExtensionsOddNames(unittest.TestCase):
                 os.path.join(tmp, "archive"), "--out", out, "--history-only")
             with open(os.path.join(out, "extension_counts.csv"), newline="",
                       encoding="utf-8", errors="surrogateescape") as fh:
-                counts = {row[0]: row[1] for row in csv.reader(fh)}
+                counts = {}
+                for row in csv.reader(fh):
+                    if row and row[0] == "column":
+                        break
+                    if row:
+                        counts[row[0]] = row[1]
             self.assertEqual(counts["txt"], "1")
             self.assertEqual(counts["txt\r"], "1")
             self.assertEqual(counts["x,y"], "1")
@@ -836,6 +861,52 @@ class DeltaByExtension(unittest.TestCase):
                 rows = {x[0]: x for x in csv.reader(fh) if x}
             y = dict(zip(rows["ext"], rows["yaml"]))
             self.assertEqual((y["files_no_delta"], y["files_sent"]), ("1", "0"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class SentDuplicates(unittest.TestCase):
+    """sent_duplicates.py on a real line-level chain."""
+
+    def test_js_duplicates(self):
+        tmp = tempfile.mkdtemp(prefix="extv_dup_")
+        try:
+            arch, act = os.path.join(tmp, "archive"), os.path.join(tmp, "act")
+            lib = "function a(){}\nvar b = 1;\n"
+            for name, files in (
+                    ("r1", [("lib/jq.js", lib), ("app.js", "own1\n")]),
+                    ("r2", [("vendor/jq.js", lib),
+                            ("node_modules/x/jq.js", lib)])):
+                r = os.path.join(arch, "o", name)
+                os.makedirs(r)
+                git(r, "init", "-q")
+                for n, d in files:
+                    put(r, n, d)
+                git(r, "add", "-A")
+                git(r, "commit", "-qm", "c")
+                os.makedirs(os.path.join(act, "o", name))   # repo exists,
+            batch = os.path.join(tmp, "B.csv")               # files deleted
+            with open(batch, "w") as fh:
+                fh.write("org,repo\no,r1\no,r2\n")
+            ext = os.path.join(tmp, "extract")
+            run("file_added_lines.py", "--batch", batch, "--repos-root", arch,
+                "--out", ext, "--quiet", "--min-free-disk-gb", "0")
+            put(os.path.join(act, "o", "r1"), "keep.txt", "x")
+            put(os.path.join(act, "o", "r2"), "keep.txt", "x")
+            run("fill_at_head.py", ext, "--disk-root", act)
+            run("file_delta.py", ext, "--active-root", act, "--out",
+                ext + "_delta")
+            out = os.path.join(tmp, "js.csv")
+            p = run("sent_duplicates.py", "--delta", ext + "_delta", "--ext",
+                    "js", "--out", out)
+            # 4 js files sent: 3 identical copies of lib + app.js
+            self.assertIn("files sent 4, unique 2, duplicates 2", p.stdout)
+            dups = read_csv(out)
+            self.assertEqual(len(dups), 1)
+            self.assertEqual((dups[0]["copies"], dups[0]["repos"],
+                              dups[0]["vendored_copies"]), ("3", "2", "2"))
+            md = load(out + ".md")
+            self.assertIn("| 2-10 | 1 |", md)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

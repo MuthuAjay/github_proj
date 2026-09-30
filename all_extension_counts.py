@@ -39,9 +39,11 @@ files_vendored, commits and versions per extension - no active copy (the
 mount is not needed), no sizes. That is all extension_counts.csv needs.
 
 Output, under --out:
-  extension_counts.csv   THE short answer: ext, files, group - every
-                     extension and how many files with it the history ever
-                     held, most first; group: "group 1" = the 32 of the first
+  extension_counts.csv   THE short answer: ext, files, versions(changes),
+                     distinct_versions, group - every extension, how many
+                     files with it the history ever held, the commits that
+                     changed them and their different contents, most first;
+                     group: "group 1" = the 32 of the first
                      extraction (repo_extension_summary.py), "group 2" = the
                      27 of the second, "rest" = neither; a total per group
                      and an overall total at the end
@@ -275,16 +277,28 @@ def combine(out):
     with open(os.path.join(out, "extension_counts.csv"), "w", newline="",
               encoding="utf-8", errors="surrogateescape") as fh:
         w = csv.writer(fh)
-        w.writerow(["ext", "files", "group"])
-        w.writerows(sorted(([e, acc[e]["files_in_history"], group_label(e)]
+        cnt = ["files_in_history", "commits", "versions"]
+        w.writerow(["ext", "files", "versions(changes)", "distinct_versions",
+                    "group"])
+        w.writerows(sorted(([e] + [acc[e][c] for c in cnt] + [group_label(e)]
                             for e in acc if acc[e]["files_in_history"]),
                            key=lambda r: (-r[1], r[0])))
         for g in ("group 1", "group 2", "rest"):
-            w.writerow(["total " + g, sum(acc[e]["files_in_history"]
-                                          for e in acc if group_label(e) == g),
-                        g])
-        w.writerow(["total", sum(acc[e]["files_in_history"] for e in acc),
-                    ""])
+            w.writerow(["total " + g] + [
+                sum(acc[e][c] for e in acc if group_label(e) == g)
+                for c in cnt] + [g])
+        w.writerow(["total"] + [sum(acc[e][c] for e in acc) for c in cnt]
+                   + [""])
+        w.writerow([])
+        w.writerow(["column", "meaning"])
+        w.writerows([
+            ("files", "Unique file paths ever in the history"),
+            ("versions(changes)", "Commits that changed these files - the "
+             "'versions' of the delta files (file_added_lines.py)"),
+            ("distinct_versions", "Different contents each file had, added "
+             "up (a change back to an earlier content is not new)"),
+            ("group", "group 1 = the 32 of the first extraction, group 2 = "
+             "the 27 of the second, rest = neither")])
     with open(os.path.join(out, "combine_problems.csv"), "w", newline="",
               encoding="utf-8", errors="backslashreplace") as fh:
         w = csv.writer(fh)
