@@ -184,13 +184,14 @@ def read_history(gp, exts, job):
     files = {}
 
     def keep(status, path, old_path):
-        return ext_key(path) in exts
+        return exts is None or ext_key(path) in exts
 
     cmd = GIT + ["-c", "core.quotePath=false", "-C", gp, "log", "--all",
                  "--stdin", "--full-history", "--topo-order", "--raw", "-z",
                  "--no-abbrev", "--no-renames", "--diff-merges=first-parent",
                  "--format=%x1e%H" + FS + "%cI"]
-    specs = [":(glob,icase)**/*." + e for e in sorted(exts)]
+    # exts=None: every path (all_extension_counts.py)
+    specs = [":(glob,icase)**/*." + e for e in sorted(exts or ())]
     job.phase = "reading history"
     with tempfile.TemporaryFile() as err:
         proc = spawn(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -289,7 +290,8 @@ def active_listing(root, org, repo, exts, job):
         dirnames[:] = [d for d in dirnames if d != ".git"]
         rel = os.path.relpath(dirpath, base)
         rel = "" if rel == "." else rel.replace(os.sep, "/") + "/"
-        out.update(rel + f for f in filenames if ext_key(f) in exts)
+        out.update(rel + f for f in filenames
+                   if exts is None or ext_key(f) in exts)
     return out
 
 

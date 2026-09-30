@@ -14,6 +14,9 @@ delta that is sent for PII scanning.
                              repo's active copy (already scanned)
   lfs_stubs(not_in_archive)  binary: Git LFS pointers, content not archived
   versions_to_send           binary: versions - processed - LFS stubs
+  duplicates_removed         binary: versions_to_send that are exact copies
+                             of another one (same file in several places or
+                             repos) - sent once: versions_to_send - delta_dedup
   delta_dedup                binary: versions_to_send with identical copies
                              stored once - the files extracted;
                              text: files that still have lines to send
@@ -52,9 +55,10 @@ from ext_versions_analysis import read_text_delta
 HEADER = ["ext", "group", "repos", "total_files_in_pack",
           "files_at_head(active)", "files_history_only", "versions",
           "versions_processed(in_active)", "lfs_stubs(not_in_archive)",
-          "versions_to_send", "delta_dedup", "delta_dedup_gb", "delta_lines",
+          "versions_to_send", "duplicates_removed", "delta_dedup",
+          "delta_dedup_gb", "delta_lines",
           "extracted_files", "extracted_gb", "note"]
-SUMMED = HEADER[3:15]
+SUMMED = HEADER[3:16]
 
 
 def read_csv(path):
@@ -89,10 +93,12 @@ def build(counts_dir, text_delta=None, extraction=None):
         if binary:
             lfs = int(r["lfs_stub_versions"])
             send = int(r["versions_to_send"])
+            dedup = int(r["versions_to_send_all_repos"])
             row.update({"versions_processed(in_active)": versions - lfs - send,
                         "lfs_stubs(not_in_archive)": lfs,
                         "versions_to_send": send,
-                        "delta_dedup": int(r["versions_to_send_all_repos"]),
+                        "duplicates_removed": send - dedup,
+                        "delta_dedup": dedup,
                         "delta_dedup_gb": float(r["gb_to_send_all_repos"])})
             x = extracted.get(e)
             if x:
@@ -152,9 +158,9 @@ def main():
         w.writerows(rows)
     t = rows[-1]
     print("%d extension(s) -> %s" % (len(rows) - 1, out))
-    print("binary: %s versions to send, %s unique files, %s GB"
-          % (f"{t[9]:,}" if t[9] != "" else "-",
-             f"{t[10]:,}" if t[10] != "" else "-", t[11]))
+    print("binary: %s versions to send, %s duplicates removed, %s unique "
+          "files, %s GB" % tuple(f"{t[i]:,}" if t[i] != "" else "-"
+                                 for i in (9, 10, 11, 12)))
     return 0
 
 

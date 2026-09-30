@@ -542,6 +542,11 @@ class DeltaSummary(unittest.TestCase):
             self.assertEqual(s1["xlsx"]["versions_processed(in_active)"], "1")
             self.assertEqual(s1["xlsx"]["versions_to_send"], "3")
             self.assertEqual(s1["xlsx"]["delta_dedup"], "3")
+            self.assertEqual(s1["xlsx"]["duplicates_removed"], "0")
+            # the docx content is in repoA and repoB: 2 to send, 1 copy
+            self.assertEqual((s1["docx"]["versions_to_send"],
+                              s1["docx"]["duplicates_removed"],
+                              s1["docx"]["delta_dedup"]), ("2", "1", "1"))
             self.assertEqual(s1["mpg"]["lfs_stubs(not_in_archive)"], "1")
             self.assertEqual(s1["rst"]["delta_dedup"], "")
             self.assertIn("--text-delta", s1["rst"]["note"])
@@ -562,6 +567,67 @@ class DeltaSummary(unittest.TestCase):
             self.assertEqual(s2["total"]["delta_dedup"],
                              str(sum(int(r["delta_dedup"]) for r in bin_rows)))
             self.assertEqual(s2["total"]["delta_lines"], "1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class AllExtensions(unittest.TestCase):
+    """all_extension_counts.py: every extension, and for the 27 the same
+    numbers as extension_versions.py."""
+
+    def test_counts(self):
+        tmp = tempfile.mkdtemp(prefix="extv_all_")
+        try:
+            arch, act, batch = build(tmp)
+            put(os.path.join(act, "org1", "repoA"), "Makefile", "all:\n")
+            ev = os.path.join(tmp, "ev")
+            run("extension_versions.py", "--batch", batch, "--repos-root",
+                arch, "--active-root", act, "--out", ev)
+            out = os.path.join(tmp, "all")
+            p = run("all_extension_counts.py", "--batch", batch,
+                    "--repos-root", arch, "--active-root", act, "--out", out)
+            self.assertIn("(ok 3)", p.stdout)
+            got = {r["ext"]: r for r in read_csv(os.path.join(
+                out, "by_extension.csv"))}
+            ref = {r["ext"]: r for r in read_csv(os.path.join(
+                ev, "by_extension.csv"))}
+            # every extension of the archive, not only the 27
+            self.assertEqual(got["md"]["files_in_history"], "1")  # README.md
+            self.assertEqual(got["md"]["in_27"], "")
+            self.assertEqual(got["(none)"]["files_active_only"], "1")
+            self.assertEqual(got["xlsx"]["in_27"], "yes")
+            # the 27: identical to extension_versions.py
+            for e in ref:
+                for a, b in (("files_in_history", "files_in_history"),
+                             ("files_at_head", "files_at_head"),
+                             ("files_history_only", "files_history_only"),
+                             ("files_no_active_repo", "files_no_active_repo"),
+                             ("files_active_only", "files_active_only"),
+                             ("commits", "commits"),
+                             ("versions", "versions_per_file"),
+                             ("versions_in_repo", "versions_per_repo"),
+                             ("files_vendored", "files_vendored")):
+                    self.assertEqual(got[e][a], ref[e][b], (e, a))
+            per = read_csv(os.path.join(out, "by_repo.csv"))
+            self.assertEqual(sum(int(r["files_in_history"]) for r in per
+                                 if r["ext"] == "xlsx"),
+                             int(got["xlsx"]["files_in_history"]))
+            self.assertIn("# All file extensions", load(out, "summary.md"))
+
+            # history only (no active copy): ext -> files, the same counts
+            quick = os.path.join(tmp, "quick")
+            run("all_extension_counts.py", "--batch", batch, "--repos-root",
+                arch, "--out", quick, "--history-only")
+            counts = {r["ext"]: r["files"] for r in read_csv(os.path.join(
+                quick, "extension_counts.csv"))}
+            want = {e: r["files_in_history"] for e, r in got.items()
+                    if r["files_in_history"] != "0"}
+            want["total"] = str(sum(int(v) for v in want.values()))
+            self.assertEqual(counts, want)
+            self.assertNotIn("(none)", counts)   # Makefile: active copy only
+            full_counts = {r["ext"]: r["files"] for r in read_csv(
+                os.path.join(out, "extension_counts.csv"))}
+            self.assertEqual(full_counts, counts)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
