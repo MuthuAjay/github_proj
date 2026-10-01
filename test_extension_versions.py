@@ -20,7 +20,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from collections import Counter
+from collections import Counter, defaultdict
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -907,6 +907,123 @@ class SentDuplicates(unittest.TestCase):
                               dups[0]["vendored_copies"]), ("3", "2", "2"))
             md = load(out + ".md")
             self.assertIn("| 2-10 | 1 |", md)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ExtensionRnd(unittest.TestCase):
+    """extension_rnd.py: counts, where, and content of sampled versions -
+    pickles read with pickletools, never unpickled."""
+
+    def test_rnd(self):
+        import pickle
+        from collections import OrderedDict
+        tmp = tempfile.mkdtemp(prefix="extv_rnd_")
+        try:
+            arch, act = os.path.join(tmp, "archive"), os.path.join(tmp, "act")
+            r = os.path.join(arch, "o", "r")
+            os.makedirs(r)
+            git(r, "init", "-q")
+            model = pickle.dumps(OrderedDict(a=1), protocol=4)
+            put(r, "models/m.pkl", model)
+            put(r, "lib/site-packages/dec/abs.decTest",
+                "-- abs test\nabsx001 abs 1 -> 1\n")
+            put(r, "build/.done.sentinel", "")
+            put(r, "x.noun", "apple\n")
+            git(r, "add", "-A")
+            git(r, "commit", "-qm", "c1")
+            put(r, "models/m.pkl", pickle.dumps([1, 2], protocol=2))
+            git(r, "commit", "-qam", "c2")
+            git(r, "rm", "-q", "x.noun")
+            git(r, "commit", "-qm", "c3")
+            put(os.path.join(act, "o", "r"), "models/m.pkl", b"\x80\x02]q\x00.")
+            batch = os.path.join(tmp, "B.csv")
+            with open(batch, "w") as fh:
+                fh.write("org,repo\no,r\n")
+            counts = os.path.join(tmp, "counts")
+            run("extension_versions.py", "--batch", batch, "--repos-root", arch,
+                "--active-root", act, "--out", counts,
+                "--extensions", "pkl,sentinel,decTest,noun")
+            out = os.path.join(tmp, "rnd")
+            run("extension_rnd.py", "--counts", counts, "--repos-root", arch,
+                "--out", out)
+            rows = read_csv(os.path.join(out, "samples.csv"))
+            by = defaultdict(list)
+            for x in rows:
+                by[x["ext"]].append(x)
+            self.assertEqual(sorted(by), ["dectest", "noun", "pkl", "sentinel"])
+            self.assertEqual(len(by["pkl"]), 2)                # two versions
+            pk = {x["detail"] for x in by["pkl"]}
+            self.assertTrue(any("collections.OrderedDict" in d for d in pk), pk)
+            self.assertTrue(any("protocol 2" in d for d in pk), pk)
+            self.assertEqual({x["kind"] for x in by["pkl"]}, {"binary"})
+            self.assertEqual(by["dectest"][0]["kind"], "text")
+            self.assertIn("abs test", by["dectest"][0]["preview"])
+            self.assertEqual(by["sentinel"][0]["kind"], "empty")
+            md = load(out, "rnd_report.md")
+            self.assertIn("## .pkl", md)
+            self.assertIn("`collections.OrderedDict`", md)
+            self.assertIn("| vendored files (node_modules, site-packages, ...) "
+                          "| 1 |", md)                     # the decTest
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class SampleExtFiles(unittest.TestCase):
+    """sample_ext_files.py: real files saved per extension; pickles get an
+    .inspect.txt with their classes and strings, never unpickled."""
+
+    def test_samples(self):
+        import pickle
+        from collections import OrderedDict
+        tmp = tempfile.mkdtemp(prefix="extv_smp_")
+        try:
+            arch = os.path.join(tmp, "archive")
+            for name, files in (
+                    ("r1", [("data/cache.pkl", pickle.dumps(
+                        {"name": "John Smith", "email": "john@example.com"},
+                        protocol=4)),
+                            ("t/abs.decTest", "-- abs\nabsx001 abs 1 -> 1\n"),
+                            ("b/.ok.sentinel", "")]),
+                    ("r2", [("m/model.pkl", pickle.dumps(OrderedDict(k=[1.5]),
+                                                         protocol=2)),
+                            ("wn/index.noun", "apple 1\n")])):
+                r = os.path.join(arch, "o", name)
+                os.makedirs(r)
+                git(r, "init", "-q")
+                for n, d in files:
+                    put(r, n, d)
+                git(r, "add", "-A")
+                git(r, "commit", "-qm", "c")
+            unlink_refs(os.path.join(arch, "o", "r2"))      # like the archive
+            counts = os.path.join(tmp, "counts")
+            batch = os.path.join(tmp, "B.csv")
+            with open(batch, "w") as fh:
+                fh.write("org,repo\no,r1\no,r2\n")
+            run("all_extension_counts.py", "--batch", batch, "--repos-root",
+                arch, "--out", counts, "--history-only")
+            out = os.path.join(tmp, "smp")
+            run("sample_ext_files.py", "--by-repo",
+                os.path.join(counts, "by_repo.csv"), "--repos-root", arch,
+                "--out", out, "--extensions", "pkl,sentinel,decTest,noun")
+            idx = read_csv(os.path.join(out, "index.csv"))
+            per = Counter(r["ext"] for r in idx)
+            self.assertEqual(dict(per), {"pkl": 2, "sentinel": 1,
+                                         "dectest": 1, "noun": 1})
+            for r in idx:
+                with open(os.path.join(out, r["saved_as"]), "rb") as fh:
+                    self.assertEqual(len(fh.read()), int(r["bytes"]))
+            cache = [r for r in idx if r["path"] == "data/cache.pkl"][0]
+            insp = load(out, cache["saved_as"] + ".inspect.txt")
+            self.assertIn("John Smith", insp)
+            self.assertIn("john@example.com", insp)
+            self.assertIn("protocol:   4", insp)
+            model = [r for r in idx if r["path"] == "m/model.pkl"][0]
+            self.assertIn("collections.OrderedDict",
+                          load(out, model["saved_as"] + ".inspect.txt"))
+            self.assertEqual([r["kind"] for r in idx if r["ext"] == "sentinel"],
+                             ["empty"])
+            self.assertIn("## .pkl (2 samples", load(out, "index.md"))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
