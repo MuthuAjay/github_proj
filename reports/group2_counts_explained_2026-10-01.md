@@ -37,7 +37,8 @@ only once.
 | Not available: Git LFS pointers (file not in the archive), empty or non-text files | 21,492 |
 | **Delivered for scanning** | **228,774** |
 
-How it adds up exactly (Office, email and image files are counted in
+The steps above mix versions and files, so they don't subtract directly from
+847,407. How it adds up exactly (Office, email and image files are counted in
 versions, because every old version is a separate file; text files are
 counted in files, because the old lines of a file go into one file):
 
