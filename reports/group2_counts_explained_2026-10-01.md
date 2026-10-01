@@ -77,5 +77,5 @@ rechecked:
   versions_to_send`, then `versions_to_send − duplicates_removed − empty_files
   = files_for_pii`. Example, png: 670,145 − 256,187 − 8,164 = 405,794;
   405,794 − 305,911 − 1 = 99,882.
-- Text types: `files_in_history − nothing_left − not_text = files_for_pii`.
+- Text types: `files_in_history − text_no_new_lines − text_unreadable_or_empty = files_for_pii`.
   Example, feature: 12,833 − 1,317 − 17 = 11,499.
