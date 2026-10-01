@@ -1028,6 +1028,78 @@ class SampleExtFiles(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class RepoExtensionStatus(unittest.TestCase):
+    """repo_extension_status.py on the real outputs of every stage."""
+
+    def test_status(self):
+        tmp = tempfile.mkdtemp(prefix="extv_res_")
+        try:
+            arch, act, batch = build(tmp)
+            W = lambda *p: os.path.join(tmp, *p)          # noqa: E731
+            run("all_extension_counts.py", "--batch", batch, "--repos-root",
+                arch, "--out", W("counts"), "--history-only")
+            for name, exts in (("g1", None), ("g2t", "lock,rst,tfvars,groovy")):
+                extra = ["--extensions", exts] if exts else []
+                run("file_added_lines.py", "--batch", batch, "--repos-root",
+                    arch, "--out", W(name), "--quiet", "--min-free-disk-gb",
+                    "0", *extra)
+                run("fill_at_head.py", W(name), "--disk-root", act)
+                run("file_delta.py", W(name), "--active-root", act, "--out",
+                    W(name + "_delta"))
+            base = ["--batch", batch, "--repos-root", arch, "--active-root",
+                    act, "--out", W("ev")]
+            run("extension_versions.py", *base)
+            run("extension_versions.py", *base, "--identical")
+            run("extract_versions.py", "--state", W("ev"), "--repos-root", arch,
+                "--out", W("bin"), "--batch", batch, "--workers", "1",
+                "--min-free-disk-gb", "0")
+            out = W("status.csv")
+            p = run("repo_extension_status.py", "--repo", "org1/repoA",
+                    "--repo", "orgX/repoB", "--repo", "org1/nope",
+                    "--counts", W("counts"), "--group1-extract", W("g1"),
+                    "--group1-delta", W("g1_delta"), "--group2-text",
+                    W("g2t_delta"), "--group2-binary", W("bin"), "--out", out)
+            self.assertIn("orgX/repoB: not found as given - using org1/repoB",
+                          p.stdout)
+            self.assertIn("org1/nope: no repository", p.stdout)
+            rows = {(r["repo"], r["ext"]): r for r in read_csv(out)}
+            md = rows[("repoA", "md")]                 # README.md, gone today
+            self.assertEqual((md["stage"], md["files_sent"]),
+                             ("Group 1 - text", "1"))
+            x = rows[("repoA", "xlsx")]
+            self.assertEqual((x["stage"], x["files_in_history"],
+                              x["versions(changes)"], x["files_sent"]),
+                             ("Group 2 - whole files", "1", "4", "3"))
+            self.assertEqual(rows[("repoA", "rst")]["files_sent"], "1")
+            self.assertEqual(rows[("repoA", "lock")]["files_sent"], "0")
+            # the docx of repoB is stored once (repoA's copy) - still counted
+            self.assertEqual(rows[("repoB", "docx")]["files_sent"], "1")
+            self.assertNotIn(("repoA", "bicep"), rows)   # active copy only
+            md_text = load(out + ".md")
+            self.assertIn("## org1/repoB (asked as orgX/repoB)", md_text)
+            self.assertIn("| Group 2 - whole files |", md_text)
+
+            # a repo the first extraction failed on: flagged, not "0 sent"
+            with open(W("g1", "_state", "org1", "repoA", "done.json")) as fh:
+                d = json.load(fh)
+            d["status"] = "timeout"
+            with open(W("g1", "_state", "org1", "repoA", "done.json"),
+                      "w") as fh:
+                json.dump(d, fh)
+            run("repo_extension_status.py", "--repo", "org1/repoA",
+                "--counts", W("counts"), "--group1-extract", W("g1"),
+                "--group1-delta", W("g1_delta"), "--group2-text",
+                W("g2t_delta"), "--group2-binary", W("bin"), "--out", out)
+            rows = {(r["repo"], r["ext"]): r for r in read_csv(out)}
+            self.assertEqual(rows[("repoA", "md")]["files_sent"],
+                             "not sent (first extraction: timeout)")
+            self.assertEqual(rows[("repoA", "xlsx")]["files_sent"], "3")
+            self.assertIn("did not complete for this repository (timeout)",
+                          load(out + ".md"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class PassOneOnly(unittest.TestCase):
     def test_latest_assumed_processed(self):
         tmp = tempfile.mkdtemp(prefix="extv_p1_")
