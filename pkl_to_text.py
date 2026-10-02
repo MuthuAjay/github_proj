@@ -38,8 +38,8 @@ Output, under --out:
   summary.csv                          totals per way of reading, per repo
 
 Usage:
-    python3 pkl_to_text.py --in /data/workarea/binary_versions_g3 \\
-        --out /data/workarea/pkl_text_g3 --batch batches/S01.csv \\
+    python3 pkl_to_text.py --in /data/workarea/group3/extract \\
+        --out /data/workarea/group3/pkl_text --batch batches/S01.csv \\
         --active-root /home/ganeshk/blobcontainer/EYGCO_13082026_777Gb/AllRepos
 """
 

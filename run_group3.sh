@@ -22,7 +22,8 @@
 # 3 stopped (disk low / the active copy's mount not answering) - fix it and
 # run again; anything else: a step crashed, see its log.
 #
-#   nohup ./run_group3.sh > /data/workarea/run_group3.out 2>&1 &
+#   mkdir -p /data/workarea/group3
+#   nohup ./run_group3.sh > /data/workarea/group3/run_group3.out 2>&1 &
 #
 # Steps 3 and 4 need: pip install pypdfium2 pypdf (pdf only; pkl needs
 # nothing). Use PYTHON=/path/to/venv/bin/python3 if they are in a venv.
@@ -33,10 +34,10 @@ SCRIPTS="${SCRIPTS:-/data/workarea/scripts}"
 BATCHES="${BATCHES:-/data/workarea/file_history_out_4/batches}"
 ROOT="${ROOT:-/data/workarea/archive}"
 ACTIVE="${ACTIVE:-/home/ganeshk/blobcontainer/EYGCO_13082026_777Gb/AllRepos}"
-COUNTS="${COUNTS:-/data/workarea/ext_versions_g3}"
-EXTRACT="${EXTRACT:-/data/workarea/binary_versions_g3}"
-PKL_OUT="${PKL_OUT:-/data/workarea/pkl_text_g3}"
-PDF_OUT="${PDF_OUT:-/data/workarea/pdf_merged_g3}"
+COUNTS="${COUNTS:-/data/workarea/group3/counts}"
+EXTRACT="${EXTRACT:-/data/workarea/group3/extract}"
+PKL_OUT="${PKL_OUT:-/data/workarea/group3/pkl_text}"
+PDF_OUT="${PDF_OUT:-/data/workarea/group3/pdf_merged}"
 STEPS="${STEPS:-counts extract pkl pdf}"
 WORKERS="${WORKERS:-8}"               # steps 3 and 4: repos at once
 PKL_ACTIVE="${PKL_ACTIVE:-1}"         # 1 = include today's .pkl in the text

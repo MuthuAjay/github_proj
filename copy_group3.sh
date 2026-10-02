@@ -13,23 +13,23 @@
 #             listed in $REPORT_DIR/name_problems.csv; after: data file
 #             counts source vs share (and content with CHECKSUM=1)
 #
-#   nohup ./copy_group3.sh > /data/workarea/copy_group3.out 2>&1 &
+#   nohup ./copy_group3.sh > /data/workarea/group3/copy_group3.out 2>&1 &
 #   ONLY=verify ./copy_group3.sh      only the checks
 #   CHECKSUM=1 ./copy_group3.sh       compare contents, not size + date
 #
 # The share needs sudo: sudo bash -c 'cd /data/workarea/scripts && nohup
-# ./copy_group3.sh > /data/workarea/copy_group3.out 2>&1 &'
+# ./copy_group3.sh > /data/workarea/group3/copy_group3.out 2>&1 &'
 # Exit code: 0 = copied and checked, 1 = a copy or check failed (see log).
 
 set -u
 
-PDF_OUT="${PDF_OUT:-/data/workarea/pdf_merged_g3}"
-PKL_OUT="${PKL_OUT:-/data/workarea/pkl_text_g3}"
-COUNTS="${COUNTS:-/data/workarea/ext_versions_g3}"
-EXTRACT="${EXTRACT:-/data/workarea/binary_versions_g3}"
+PDF_OUT="${PDF_OUT:-/data/workarea/group3/pdf_merged}"
+PKL_OUT="${PKL_OUT:-/data/workarea/group3/pkl_text}"
+COUNTS="${COUNTS:-/data/workarea/group3/counts}"
+EXTRACT="${EXTRACT:-/data/workarea/group3/extract}"
 DST="${DST:-/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1/group3}"
 DST_TRACKING="${DST_TRACKING:-${DST}_tracking}"
-REPORT_DIR="${REPORT_DIR:-/data/workarea/copy_group3_checks}"
+REPORT_DIR="${REPORT_DIR:-/data/workarea/group3/copy_checks}"
 CHECKSUM="${CHECKSUM:-0}"
 ONLY="${ONLY:-}"
 PYTHON="${PYTHON:-python3}"

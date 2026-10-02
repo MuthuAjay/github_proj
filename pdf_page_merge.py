@@ -53,8 +53,8 @@ Output, under --out:
   summary.csv                          per repo and totals, with a legend
 
 Usage:
-    python3 pdf_page_merge.py --in /data/workarea/binary_versions_g3 \\
-        --out /data/workarea/pdf_merged_g3 --batch batches/S01.csv --workers 8
+    python3 pdf_page_merge.py --in /data/workarea/group3/extract \\
+        --out /data/workarea/group3/pdf_merged --batch batches/S01.csv --workers 8
 """
 
 import argparse
