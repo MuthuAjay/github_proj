@@ -1152,5 +1152,147 @@ class MountDrop(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+PDF = [b"%PDF-1.4\n% version " + str(i).encode() + b"\n%%EOF\n" for i in range(1, 4)]
+PKL = [b"\x80\x04\x95" + b"pickle-%d" % i + b"\x94." for i in range(1, 3)]
+
+
+def build_group3(tmp):
+    """repoA: report.pdf in 3 versions (v3 active), the same v1 bytes under a
+    second path, model.pkl in 2 versions (no active copy of it); repoB (no
+    active copy): the same v1 pdf as repoA - per repo it is stored again."""
+    arch, act = os.path.join(tmp, "archive"), os.path.join(tmp, "active")
+    a = os.path.join(arch, "org1", "repoA")
+    os.makedirs(a)
+    git(a, "init", "-q", "-b", "master")
+    commit(a, "c1", [("docs/report.pdf", PDF[0]), ("copy/Report.PDF", PDF[0]),
+                     ("model.pkl", PKL[0]), ("notes.xlsx", b"\x00x")])
+    commit(a, "c2", [("docs/report.pdf", PDF[1]), ("model.pkl", PKL[1])])
+    commit(a, "c3", [("docs/report.pdf", PDF[2])])
+    b = os.path.join(arch, "org1", "repoB")
+    os.makedirs(b)
+    git(b, "init", "-q", "-b", "master")
+    commit(b, "b1", [("old/report.pdf", PDF[0])])
+    unlink_refs(b)
+    put(os.path.join(act, "org1", "repoA"), "docs/report.pdf", PDF[2])
+    put(os.path.join(act, "org1", "repoA"), "copy/Report.PDF", PDF[0])
+    batch = os.path.join(tmp, "B01.csv")
+    with open(batch, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["org", "repo", "tier", "weight", "listed_files"])
+        for r in ("repoA", "repoB"):
+            w.writerow(["org1", r, "small", 1, 1])
+    return arch, act, batch
+
+
+class Group3(unittest.TestCase):
+    """--binary-exts (counts) and --per-repo (extraction) for pdf and pkl."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="g3_")
+        cls.arch, cls.act, cls.batch = build_group3(cls.tmp)
+        cls.state = os.path.join(cls.tmp, "counts")
+        base = ["--batch", cls.batch, "--repos-root", cls.arch, "--active-root",
+                cls.act, "--out", cls.state, "--extensions", "pdf,pkl"]
+        run("extension_versions.py", *base, "--binary-exts", "pdf,pkl")
+        run("extension_versions.py", *base, "--identical")   # not told again
+        cls.out = os.path.join(cls.tmp, "g3")
+        cls.args = ["--state", cls.state, "--repos-root", cls.arch,
+                    "--out", cls.out, "--batch", cls.batch, "--workers", "1",
+                    "--min-free-disk-gb", "0", "--extensions", "pdf,pkl"]
+        run("extract_versions.py", *cls.args, "--per-repo")
+        cls.rows = read_csv(os.path.join(cls.out, "manifest.csv"))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_counted_as_binary_and_remembered(self):
+        self.assertEqual(load(self.state, "binary_exts.txt").split(),
+                         ["pdf", "pkl"])
+        files = read_csv(os.path.join(self.state, "_state", "org1", "repoA",
+                                      "files.csv"))
+        self.assertEqual({f["path"]: f["group"] for f in files},
+                         {"docs/report.pdf": "binary", "copy/Report.PDF": "binary",
+                          "model.pkl": "binary"})        # xlsx not asked for
+        ident = read_csv(os.path.join(self.state, "_state", "org1", "repoA",
+                                      "identical.csv"))
+        self.assertEqual({r["path"]: r["result"] for r in ident},
+                         {"docs/report.pdf": "same_as_latest",
+                          "copy/Report.PDF": "same_as_latest"})
+        run("extension_versions.py", "--out", self.state, "--combine-only")
+        ext = {r["ext"]: r for r in
+               read_csv(os.path.join(self.state, "by_extension.csv"))}
+        self.assertEqual(ext["pdf"]["group"], "binary")
+        self.assertEqual(ext["pkl"]["group"], "binary")
+
+    def test_per_repo_layout_and_dedup(self):
+        got = sorted((r["repo"], r["path"], r["blob"], r["action"], r["stored_as"])
+                     for r in self.rows)
+        v1, v2 = blob_id(PDF[0]), blob_id(PDF[1])
+        k1, k2 = blob_id(PKL[0]), blob_id(PKL[1])
+        self.assertEqual(got, sorted([
+            # v3 and v1 are active in repoA: v1 is the active copy/Report.PDF,
+            # so neither path sends it (same repo); v2 is sent once
+            ("repoA", "docs/report.pdf", v2, "written",
+             "files/pdf/org1/repoA/%s.pdf" % v2),
+            ("repoA", "model.pkl", k1, "written", "files/pkl/org1/repoA/%s.pkl" % k1),
+            ("repoA", "model.pkl", k2, "written", "files/pkl/org1/repoA/%s.pkl" % k2),
+            # repoB has the same v1 bytes: stored again, under repoB
+            ("repoB", "old/report.pdf", v1, "written",
+             "files/pdf/org1/repoB/%s.pdf" % v1)]))
+        for r in self.rows:
+            with open(os.path.join(self.out, r["stored_as"]), "rb") as fh:
+                self.assertEqual(blob_id(fh.read()), r["blob"])
+        self.assertNotIn("deduped", {r["action"] for r in self.rows})
+        ext = {r["ext"]: r for r in read_csv(os.path.join(self.out,
+                                                          "by_extension.csv"))}
+        self.assertEqual((ext["pdf"]["files_stored"], ext["pdf"]["files_on_disk"]),
+                         ("2", "2"))
+        self.assertEqual((ext["pkl"]["files_stored"], ext["pkl"]["files_on_disk"]),
+                         ("2", "2"))
+
+    def test_same_content_twice_in_one_repo_stored_once(self):
+        tmp = tempfile.mkdtemp(prefix="g3_dup_")
+        try:
+            arch, act, batch = build_group3(tmp)
+            os.remove(os.path.join(act, "org1", "repoA", "copy", "Report.PDF"))
+            state, out = os.path.join(tmp, "counts"), os.path.join(tmp, "g3")
+            base = ["--batch", batch, "--repos-root", arch, "--active-root", act,
+                    "--out", state, "--extensions", "pdf", "--binary-exts", "pdf"]
+            run("extension_versions.py", *base)
+            run("extension_versions.py", *base, "--identical")
+            run("extract_versions.py", "--state", state, "--repos-root", arch,
+                "--out", out, "--batch", batch, "--min-free-disk-gb", "0",
+                "--extensions", "pdf", "--per-repo")
+            rows = [r for r in read_csv(os.path.join(out, "manifest.csv"))
+                    if r["repo"] == "repoA" and r["blob"] == blob_id(PDF[0])]
+            # v1 under two paths (docs/ old version, copy/ deleted today)
+            self.assertEqual(sorted(r["path"] for r in rows),
+                             ["copy/Report.PDF", "docs/report.pdf"])
+            self.assertEqual(len({r["stored_as"] for r in rows}), 1)
+            self.assertEqual({r["action"] for r in rows}, {"written"})
+            folder = os.path.join(out, "files", "pdf", "org1", "repoA")
+            self.assertEqual(len(os.listdir(folder)), 2)          # v1, v2
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_resume_and_layout_guard(self):
+        # an interrupted repo (no done.json) redone: its files are already
+        # there - still "written", never "deduped" in the per-repo layout
+        os.remove(os.path.join(self.out, "_state", "org1", "repoA", "done.json"))
+        run("extract_versions.py", *self.args, "--per-repo")
+        rows = read_csv(os.path.join(self.out, "manifest.csv"))
+        self.assertEqual(sorted(r["action"] for r in rows), ["written"] * 4)
+        p = run("extract_versions.py", *self.args, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("per_repo layout", p.stderr)
+
+    def test_default_layout_unchanged(self):
+        self.assertEqual(
+            __import__("extract_versions").store_path("png", "3fab"),
+            os.path.join("files", "png", "3f", "3fab.png"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

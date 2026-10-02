@@ -25,6 +25,13 @@ and every (org, repo, path, version) that has it is a manifest row pointing
 at that file. A repo finding its content already stored (another repo wrote
 it) records it as `deduped` and writes nothing.
 
+With --per-repo (group 3: the scope is one repo, nothing is shared across
+repos) a content is stored once per repo instead:
+
+    files/<ext>/<org>/<repo>/<blob>.<ext>
+
+so a file in two repos is written twice, and `deduped` never occurs.
+
 Manifest action per version:
   written          stored now
   deduped          already stored by an earlier repo (same content)
@@ -102,8 +109,18 @@ class DiskLow(RuntimeError):
     pass
 
 
-def store_path(ext, blob):
+def store_path(ext, blob, org=None, repo=None):
+    """Where a content is stored: once per extension across all repos
+    (files/<ext>/<ab>/<blob>.<ext>), or with --per-repo once per repo
+    (files/<ext>/<org>/<repo>/<blob>.<ext>)."""
+    if org is not None:
+        return os.path.join("files", ext, org, repo, "%s.%s" % (blob, ext))
     return os.path.join("files", ext, blob[:2], "%s.%s" % (blob, ext))
+
+
+def where(cfg, org, repo):
+    """(org, repo) for store_path in --per-repo mode, else (None, None)."""
+    return (org, repo) if cfg.per_repo else (None, None)
 
 
 def why_sent(at_head, result):
@@ -261,7 +278,7 @@ def plan_repo(cfg, org, repo, sd):
         elif cfg.max_bytes and n > cfg.max_bytes:
             row[6] = "too_large"
         else:
-            row[7] = store_path(e, b)
+            row[7] = store_path(e, b, *where(cfg, org, repo))
             want[(e, b)] = n
         rows.append(row)
     return rows, want
@@ -291,10 +308,15 @@ def run_repo(cfg, org, repo, job):
         # what is not stored yet, per extension (a content wanted under two
         # extensions is stored once for each, so each keeps an openable name)
         by_ext = defaultdict(list)
-        for (e, b), n in sorted(want.items()):
-            if not os.path.exists(os.path.join(cfg.out, store_path(e, b))):
-                by_ext[e].append((b, n))
         results = {}
+        for (e, b), n in sorted(want.items()):
+            if not os.path.exists(os.path.join(
+                    cfg.out, store_path(e, b, *where(cfg, org, repo)))):
+                by_ext[e].append((b, n))
+            elif cfg.per_repo:
+                # only this repo writes under its own folder: the file is
+                # from an earlier, interrupted attempt of the same repo
+                results[(e, b)] = "written"
         if by_ext:
             rp = os.path.join(cfg.repos_root, org, repo)
             if not is_repo_dir(rp):
@@ -303,7 +325,9 @@ def run_repo(cfg, org, repo, job):
                 for e, blobs in sorted(by_ext.items()):
                     got = fetch(gp, blobs,
                                 lambda b, e=e: os.path.join(
-                                    cfg.out, store_path(e, b)), cfg, job)
+                                    cfg.out, store_path(
+                                        e, b, *where(cfg, org, repo))),
+                                cfg, job)
                     for b, action in got.items():
                         results[(e, b)] = action
         for row in rows:
@@ -364,8 +388,8 @@ def combine(out):
                     acc[e]["versions"] += 1
                     acc[e]["why_" + r["why"]] += 1
                     repos_of[e].add((org, repo))
-                    if a in STORED:
-                        stored[e][r["blob"]] = int(r["bytes"])
+                    if a in STORED:      # one stored file per stored_as
+                        stored[e][r["stored_as"]] = int(r["bytes"])
     os.replace(comb + ".tmp", comb)
 
     on_disk = Counter()
@@ -436,6 +460,10 @@ def main():
                     help="only this repo (repeatable)")
     ap.add_argument("--extensions", help="comma list or file (default: the 18 "
                                          "binary extensions)")
+    ap.add_argument("--per-repo", action="store_true",
+                    help="store each content once per repo "
+                         "(files/<ext>/<org>/<repo>/<blob>.<ext>), not once "
+                         "across all repos")
     ap.add_argument("--skip-vendored", action="store_true",
                     help="do not extract files in node_modules, packages, "
                          "bin, obj, ... (listed as skipped_vendored)")
@@ -474,6 +502,18 @@ def main():
         sys.exit("no _state folder under " + args.state)
     if os.path.realpath(args.out) == os.path.realpath(args.state):
         sys.exit("--out must be a different folder from --state")
+    # one layout per folder: a resumed run with the other one would mix them
+    layout = "per_repo" if args.per_repo else "shared"
+    lpath = os.path.join(args.out, "layout.txt")
+    before = open(lpath, encoding="utf-8").read().strip() \
+        if os.path.isfile(lpath) else ""
+    if before and before != layout:
+        sys.exit("%s was written with the %s layout; run it again %s "
+                 "--per-repo, or use another --out"
+                 % (args.out, before, "with" if before == "per_repo" else "without"))
+    if not before:
+        os.makedirs(args.out, exist_ok=True)
+        write_atomic(lpath, layout + "\n")
     os.makedirs(os.path.join(args.out, LOGS), exist_ok=True)
     if args.min_free_disk_gb and free_gb(args.out) < args.min_free_disk_gb:
         print("STOPPED: less than %s GB free on %s"
@@ -523,6 +563,7 @@ def main():
     cfg.state, cfg.repos_root, cfg.out = args.state, args.repos_root, args.out
     cfg.exts = set(load_extensions(args.extensions or ",".join(BINARY_EXTS)))
     cfg.skip_vendored, cfg.max_bytes = args.skip_vendored, args.max_bytes
+    cfg.per_repo = args.per_repo
     cfg.min_free_gb = args.min_free_disk_gb
     workers = max(1, args.workers)
     log.info("START %s repos=%d workers=%d exts=%s skip_vendored=%s "

@@ -7,6 +7,13 @@
 #   ./run_ext_versions.sh S01 S02          just these, in this order
 #   PASSES=1 ./run_ext_versions.sh         pass 1 only (PASSES=2: pass 2 only)
 #
+# Other extensions than group 2's 27 (e.g. group 3, in its own folder):
+#   EXTS="pdf pkl" BINARY_EXTS="pdf pkl" OUT=/data/workarea/ext_versions_g3 \
+#       ./run_ext_versions.sh
+# EXTS = the extensions to count; BINARY_EXTS = those of them to treat as
+# binary (pass 2 compares them with the active copy; remembered in
+# $OUT/binary_exts.txt). Use the same values when resuming a run.
+#
 # Per batch it runs with the tier's workers and timeout (from the batch
 # name's first letter). A finished batch is marked with
 # $OUT/_logs/<batch>.pass1_done / .identical_done and skipped next time; a
@@ -37,6 +44,11 @@ OUT="${OUT:-/data/workarea/ext_versions}"
 PASSES="${PASSES:-1 2}"
 RETRY="${RETRY:-1}"                 # 0 = skip the --retry-failed passes
 PYTHON="${PYTHON:-python3}"
+EXTS="${EXTS:-}"                    # empty = the script's default (27)
+BINARY_EXTS="${BINARY_EXTS:-}"
+EXT_ARGS=()
+[ -n "$EXTS" ] && EXT_ARGS+=(--extensions "$(echo $EXTS | tr ' ' ',')")
+[ -n "$BINARY_EXTS" ] && EXT_ARGS+=(--binary-exts "$(echo $BINARY_EXTS | tr ' ' ',')")
 
 # workers, per-repo timeout (seconds) - by tier
 settings() {
@@ -79,7 +91,8 @@ run_one() {    # pass, batch, workers, timeout, extra flags...
     "$PYTHON" "$SCRIPTS/extension_versions.py" \
         --repos-root "$ROOT" --active-root "$ACTIVE" --out "$OUT" \
         --batch "$BATCHES/$b.csv" --workers "$workers" \
-        --repo-timeout "$timeout" --no-combine "$@" >> "$log" 2>&1
+        --repo-timeout "$timeout" --no-combine ${EXT_ARGS[@]+"${EXT_ARGS[@]}"} \
+        "$@" >> "$log" 2>&1
 }
 
 mount_down() {
@@ -96,6 +109,7 @@ fi
 
 mkdir -p "$OUT/_logs"
 say "runner start: passes '$PASSES', ${#list[@]} batch(es): ${list[*]}"
+say "extensions: ${EXTS:-default 27}${BINARY_EXTS:+ | also binary: $BINARY_EXTS} | out=$OUT"
 
 for pass in $PASSES; do
     if [ "$pass" = 2 ]; then

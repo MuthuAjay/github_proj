@@ -165,8 +165,29 @@ SKIP_MODES = {"120000", "160000"}            # symlink, submodule: no content
 log = logging.getLogger("extension_versions")
 
 
+BINARY = set(BINARY_EXTS)  # + --binary-exts, remembered in <out>/binary_exts.txt
+BINARY_FILE = "binary_exts.txt"
+
+
 def group_of(ext):
-    return "binary" if ext in BINARY_EXTS else "text"
+    return "binary" if ext in BINARY else "text"
+
+
+def add_binary(out, exts=()):
+    """Treat `exts` as binary too (pass 2, extraction) and remember them in
+    <out>/binary_exts.txt, so a later pass 2 or --combine-only on the same
+    folder keeps them binary without being told again. -> the extra list."""
+    path = os.path.join(out, BINARY_FILE)
+    known = []
+    if os.path.isfile(path):
+        known = load_extensions(path)
+    extra = [e for e in known + list(exts) if e not in BINARY_EXTS]
+    extra = list(dict.fromkeys(extra))
+    if exts and extra != known:
+        os.makedirs(out, exist_ok=True)
+        write_atomic(path, "".join(e + "\n" for e in extra))
+    BINARY.update(extra)
+    return extra
 
 
 # --------------------------------------------------------------------------
@@ -771,9 +792,16 @@ def main():
     ap.add_argument("--name", help="log name (default: batch name or 'run', "
                                    "+ '_identical' for pass 2)")
     ap.add_argument("--extensions",
-                    help="comma list or file (default: the 27 above)")
+                    help="comma list or file (default: the 27 above, plus "
+                         "--binary-exts)")
+    ap.add_argument("--binary-exts", metavar="LIST",
+                    help="comma list or file: treat these as binary too "
+                         "(pass 2 checks them, extract_versions.py writes "
+                         "them); remembered in <out>/binary_exts.txt")
     args = ap.parse_args()
 
+    extra = add_binary(args.out, load_extensions(args.binary_exts)
+                       if args.binary_exts else ())
     if args.combine_only:
         repos, exts = combine(args.out)
         print("combined %s repo(s), %d extension(s) -> %s"
@@ -838,7 +866,7 @@ def main():
     cfg.out, cfg.repos_root, cfg.active_root = (args.out, args.repos_root,
                                                 args.active_root)
     cfg.exts = set(load_extensions(args.extensions or
-                                   ",".join(TEXT_EXTS + BINARY_EXTS)))
+                                   ",".join(TEXT_EXTS + BINARY_EXTS + extra)))
     worker = run_identical if args.identical else run_repo
     workers = max(1, args.workers)
     log.info("START %s %s repos=%d workers=%d exts=%s active=%s",
