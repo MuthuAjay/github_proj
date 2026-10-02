@@ -1152,6 +1152,39 @@ class MountDrop(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class PathList(unittest.TestCase):
+    """ext_path_list.py: unique paths + commits from a pass 1 folder."""
+
+    def test_paths_and_commits(self):
+        tmp = tempfile.mkdtemp(prefix="pathlist_")
+        try:
+            arch, act, batch = build(tmp)
+            out = os.path.join(tmp, "out")
+            run("extension_versions.py", "--batch", batch, "--repos-root", arch,
+                "--active-root", act, "--out", out)
+            lst = os.path.join(tmp, "list", "paths.csv")
+            run("ext_path_list.py", out, "--out", lst,
+                "--extensions", "xlsx,docx,png,pptx,bicep")
+            rows = {(r["repo"], r["path"]): r for r in read_csv(lst)}
+            got = {k: (r["commits"], r["last_event"], r["still_today"])
+                   for k, r in rows.items()}
+            self.assertEqual(got[("repoA", "docs/report.xlsx")], ("4", "M", "yes"))
+            self.assertEqual(got[("repoA", "Old.DOCX")], ("2", "D", "no"))
+            self.assertEqual(got[("repoB", "old.docx")], ("1", "A", ""))
+            self.assertNotIn("distinct_versions", read_csv(lst)[0])
+            self.assertEqual(len(rows), 8)
+            self.assertNotIn(("repoA", "extra.bicep"), rows)    # today only
+            by = {r["ext"]: r for r in read_csv(os.path.join(
+                tmp, "list", "paths_by_extension.csv"))}
+            self.assertEqual((by["total"]["paths"], by["total"]["commits"]),
+                             ("8", "13"))
+            self.assertEqual(by["png"]["repos"], "2")
+            self.assertTrue(os.path.exists(os.path.join(tmp, "list",
+                                                        "paths_legend.csv")))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 PDF = [b"%PDF-1.4\n% version " + str(i).encode() + b"\n%%EOF\n" for i in range(1, 4)]
 PKL = [b"\x80\x04\x95" + b"pickle-%d" % i + b"\x94." for i in range(1, 3)]
 
