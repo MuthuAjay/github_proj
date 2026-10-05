@@ -207,6 +207,19 @@ class Unpack(unittest.TestCase):
         arcs = read_csv(os.path.join(out, "_state", "org1", "repoA", "archives.csv"))
         self.assertIn("limit_archive_bytes", {a["status"] for a in arcs})
 
+    def test_report(self):
+        p = run("archive_unpack_report.py", self.out)
+        self.assertIn("repos 1 |", p.stdout)
+        rows = [r for r in read_csv(os.path.join(self.out, "stats",
+                                                 "archives_per_repo.csv")) if r["org"] == "org1"]
+        by = {r["type"]: r for r in read_csv(os.path.join(self.out, "stats", "by_type.csv"))}
+        # the report and archive_unpack.py's own stats agree
+        self.assertEqual(rows[0]["files_inside"], by["total"]["occurrences"])
+        self.assertEqual(rows[0]["distinct_files_written"], by["total"]["distinct"])
+        self.assertTrue(os.path.exists(os.path.join(self.out, "stats", "report.md")))
+        bad = run("archive_unpack_report.py", self.tmp, check=False)
+        self.assertNotEqual(bad.returncode, 0)
+
     @unittest.skipUnless(HAVE_PDF, "pip install pypdfium2 pypdf")
     def test_pdf_page_merge_runs_on_it(self):
         out = os.path.join(self.tmp, "pdfm")
