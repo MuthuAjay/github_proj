@@ -19,6 +19,7 @@ repo.
 | `scripts/fill_at_head.py` | Step 2: marks each file as still in today's copy (`at_head = yes/no`) |
 | `scripts/file_delta.py` | Step 3: removes the lines still in today's file → the delta (send this) |
 | `scripts/delta_by_extension.py` | Report afterwards: per extension, files and lines in history, removed, sent |
+| `scripts/copy_group4_5.sh` | Copy to the share: data and tracking kept apart, name check, count check |
 | `scripts/file_history_for_list.py`, `extract_commits.py`, `explore_input_csv.py`, `repo_extension_summary.py`, `analyse_file_summary.py` | Helpers the scripts above import. They must sit in the same folder |
 | `text_extensions.txt` | **You fill this in:** the extensions to run, one per line |
 | `md5sums.txt` | Checksums of every script, to check the copy on the server |
@@ -148,27 +149,40 @@ sent**. The `files_no_delta` column must be 0 before the numbers are final.
 
 ## Copy to the share
 
-The share needs sudo, and the whole command goes inside `sudo bash -c`
-(a background `sudo nohup ...` waits for a password nobody sees):
+`scripts/copy_group4_5.sh` does the copy and the checks. Run it after the
+full run has finished (its log ends with `runner done`). Check the settings
+at its top first, mainly `DST`, the folder on the share.
 
 ```bash
-sudo bash -c 'nohup rsync -rt --no-perms --no-owner --no-group --partial \
-    --exclude _logs /data/workarea/text_rest_extract_delta/ \
-    /home/ganeshk/eng-gh2-data-fs/diff_analysis/p1/<folder>/ \
-    > /data/workarea/copy_text_rest.out 2>&1 &'
+sudo bash -c 'cd /data/workarea/scripts/handover/text_rest_kit/scripts && \
+    OUT=/data/workarea/output \
+    DST=/home/rohitr/eng-gh2-data-fs/diff_analysis/p1/group4_5 \
+    nohup ./copy_group4_5.sh > /data/workarea/copy_group4_5.out 2>&1 &'
+tail -f /data/workarea/copy_group4_5.out
 ```
 
-Then compare file counts, source vs share:
+What it does:
 
-```bash
-find /data/workarea/text_rest_extract_delta -name '*.txt' -not -path '*/_logs/*' | wc -l
-sudo find /home/ganeshk/eng-gh2-data-fs/diff_analysis/p1/<folder> -name '*.txt' | wc -l
-```
+1. **Report:** `delta_by_extension.py`, files and lines sent per extension
+   (`<OUT>_delta_by_extension.csv` + `.md` with a legend), if not made yet.
+2. **Name check:** lists the `.txt` files whose names the share cannot keep
+   apart: names differing only by case (`Readme.md` / `README.md`) or with
+   characters it does not allow. Written to `<OUT>_copy_checks/name_problems.csv`.
+   The share is case-insensitive; in group 2, 98 files went missing this way
+   without an rsync error.
+3. **Data:** the `.txt` files of the delta go to `DST`. Nothing from `_state/`
+   or `_logs/` goes there.
+4. **Tracking:** the per-repo `manifest.csv` and `done.json`, the report, the
+   extension list and the name check go to `DST_tracking` (default:
+   `DST` + `_tracking`), kept out of the scan. In group 2 the scanner took
+   every manifest and `done.json` in the folder as data.
+5. **Checks:** the number of `.txt` files must match, source vs share, and no
+   tracking file may be in the data folder. It ends with `ALL DONE` (exit 0)
+   or `FINISHED WITH PROBLEMS` (exit 1).
 
-The share is case-insensitive. Two names differing only by case, or names
-with characters it does not allow, can go missing **without an rsync error**
-(group 2 lost 98 files this way). If the counts differ, find the missing
-names and copy them under adjusted names, plus a `renamed_files.csv`.
+Rerunning is safe: files already on the share are skipped.
+`ONLY=verify` in front runs only the checks; `CHECKSUM=1` also compares the
+contents. If the counts differ, look at `name_problems.csv` first.
 
 ## Ask if unsure
 

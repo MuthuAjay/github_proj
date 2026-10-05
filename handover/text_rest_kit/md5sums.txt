@@ -7,4 +7,5 @@ f4b5f63b415dd52a28d2a4fd5ece5bd3  explore_input_csv.py
 da1cad6f907ebad633d3ae793ddc1388  file_history_for_list.py
 f669ab23f6e04af81801e620a27d068e  fill_at_head.py
 cd63ee9b43b1c354de968afcf1823753  repo_extension_summary.py
+e8ae05568434bfa21e67ec8b904eef18  copy_group4_5.sh
 0ec209d9c5ca1ddc9cb7af533ca7b97f  run_text_versions.sh
