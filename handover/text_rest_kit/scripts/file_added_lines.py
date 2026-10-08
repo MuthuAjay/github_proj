@@ -20,7 +20,10 @@ Two ways to say which files:
   history mode   --batch batches/S01.csv (org, repo per row) and/or
                  --repo ORG/REPO, no input CSV: EVERY file that ever existed
                  in the repo's history, on any branch, whose extension is in
-                 the list - deleted files and node_modules included
+                 the list - deleted files and node_modules included,
+                 unless --skip-vendored leaves out paths in node_modules,
+                 packages, vendor, bin, obj, dist, build, ... (the rule of
+                 explain_file_counts.py, as the extension counts use it)
   list mode      an input CSV (file_summary.csv from file_history_for_list.py,
                  or its deduped version): only the files it lists, by
                  matched_path, status `found` only. --batch / --repo narrow it
@@ -85,6 +88,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
+from explain_file_counts import vendor_of
 from explore_input_csv import detect_delimiter, is_repo_dir
 from extract_commits import GIT, Progress, bind_job, spawn
 from file_history_for_list import (RecoveredRepo, RepoJob, full_path,
@@ -329,10 +333,11 @@ def _feed(stdin, specs):
         pass
 
 
-def collect(gp, out_root, job, paths=None, exts=None):
+def collect(gp, out_root, job, paths=None, exts=None, skipped=None):
     """Stream the repo's history once and fill a FileLines per file: the
     listed `paths` (list mode) or every path with an extension in `exts`
-    (history mode, paths=None)."""
+    (history mode, paths=None). `skipped` (a set, history mode only): leave
+    out vendored paths and collect their names in it."""
 
     def new_file(p):
         parts = p.split("/")
@@ -370,7 +375,10 @@ def collect(gp, out_root, job, paths=None, exts=None):
                         cur = files.get(p)
                         if cur is None and paths is None and (
                                 exts is None or ext_key(p) in exts):
-                            cur = files[p] = new_file(p)
+                            if skipped is not None and vendor_of(p):
+                                skipped.add(p)
+                            else:
+                                cur = files[p] = new_file(p)
                         if cur is not None:
                             cur.versions += 1
                 elif cur is None:
@@ -481,7 +489,9 @@ def process_repo(cfg, org, repo, paths, job):
             gp = recovery.tmp
         else:
             gp = rp
-        files = collect(gp, out_root, job, good, cfg.exts)
+        skipped = set() if cfg.skip_vendored and paths is None else None
+        files = collect(gp, out_root, job, good, cfg.exts, skipped)
+        job.skipped_vendored = len(skipped or ())
         job.phase = "checking HEAD"
         head = head_paths(gp, set(files))
     except Exception as exc:                  # noqa: BLE001 - one repo only
@@ -540,6 +550,7 @@ def run_repo(cfg, org, repo, paths, job):
            "lines_kept": sum(r[8] for r in rows),
            "bytes": sum(r[9] for r in rows),
            "file_status": dict(Counter(r[4] for r in rows)),
+           "skipped_vendored": getattr(job, "skipped_vendored", 0),
            "error": error}
     write_atomic(os.path.join(sd, "done.json"), json.dumps(rec, indent=1))
     return rec
@@ -613,6 +624,10 @@ def main():
                          "repo_extension_summary.py)")
     ap.add_argument("--all-extensions", action="store_true",
                     help="every file, whatever its extension")
+    ap.add_argument("--skip-vendored", action="store_true",
+                    help="history mode: leave out files in node_modules, "
+                         "packages, vendor, bin, obj, dist, build, ... "
+                         "(counted in done.json as skipped_vendored)")
     ap.add_argument("--workers", type=int, default=8,
                     help="repos processed in parallel (default 8)")
     ap.add_argument("--retry-failed", action="store_true",
@@ -704,11 +719,13 @@ def main():
     cfg = Cfg()
     cfg.repos_root, cfg.out, cfg.exts, cfg.name = (args.repos_root, args.out,
                                                    exts, name)
+    cfg.skip_vendored = args.skip_vendored
     deadline = deadline_for(args.until) if args.until else None
     log.info("START %s mode=%s repos=%d todo=%d done=%d failed=%d workers=%d "
-             "timeout=%s until=%s exts=%s out=%s", name, mode, len(order),
-             len(todo), n_ok, n_failed, args.workers, args.repo_timeout or "-",
-             args.until or "-", "all" if exts is None else len(exts), args.out)
+             "timeout=%s until=%s exts=%s skip_vendored=%s out=%s", name, mode,
+             len(order), len(todo), n_ok, n_failed, args.workers,
+             args.repo_timeout or "-", args.until or "-",
+             "all" if exts is None else len(exts), args.skip_vendored, args.out)
 
     repos_csv = os.path.join(args.out, LOGS, name + "_repos.csv")
     new_csv = not os.path.exists(repos_csv)

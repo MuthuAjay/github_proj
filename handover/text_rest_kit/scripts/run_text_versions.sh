@@ -27,6 +27,8 @@
 # Settings can be overridden from the environment:
 #   OUT=/data/workarea/text9_extract MIN_DISK_GB=50 ./run_text_versions.sh
 #   EXTS="tfvars bicep" OUT=/data/workarea/tf_extract ./run_text_versions.sh
+#   SKIP_VENDORED=1 leaves out files in node_modules, packages, vendor, bin,
+#   obj, dist, build, ... (file_added_lines.py --skip-vendored)
 # Run it detached so an SSH drop does not stop it:
 #   nohup ./run_text_versions.sh > /data/workarea/run_text_versions.out 2>&1 &
 
@@ -43,6 +45,7 @@ MIN_DISK_GB="${MIN_DISK_GB:-20}"
 WORKERS_AT_HEAD="${WORKERS_AT_HEAD:-16}"
 WORKERS_DELTA="${WORKERS_DELTA:-16}"
 RETRY="${RETRY:-1}"                 # 0 = skip the --retry-failed pass
+SKIP_VENDORED="${SKIP_VENDORED:-0}" # 1 = leave out vendored paths
 PYTHON="${PYTHON:-python3}"
 
 # workers, per-repo timeout (seconds) - by tier, as run_batches.sh
@@ -80,7 +83,8 @@ extract() {    # batch, workers, timeout, extra flags...
     "$PYTHON" "$SCRIPTS/file_added_lines.py" --batch "$BATCHES/$b.csv" \
         --repos-root "$ROOT" --out "$OUT" --extensions "$EXTFILE" \
         --workers "$workers" --repo-timeout "$timeout" \
-        --min-free-disk-gb "$MIN_DISK_GB" --quiet "$@" \
+        --min-free-disk-gb "$MIN_DISK_GB" --quiet \
+        $([ "$SKIP_VENDORED" = 1 ] && echo --skip-vendored) "$@" \
         >> "$OUT/_logs/$b.text.out" 2>&1
 }
 
@@ -108,7 +112,7 @@ mkdir -p "$OUT/_logs"
 EXTFILE="$OUT/_logs/text_extensions.txt"
 printf '%s\n' $EXTS > "$EXTFILE"
 say "runner start: ${#list[@]} batch(es): ${list[*]}"
-say "extensions: $(tr '\n' ' ' < "$EXTFILE")| out=$OUT delta=$DELTA active=$ACTIVE"
+say "extensions: $(tr '\n' ' ' < "$EXTFILE")| out=$OUT delta=$DELTA active=$ACTIVE skip_vendored=$SKIP_VENDORED"
 
 # ---------------------------------------------------------------- 1. extract
 say "=== STEP 1: extract"

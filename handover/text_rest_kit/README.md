@@ -20,7 +20,7 @@ repo.
 | `scripts/file_delta.py` | Step 3: removes the lines still in today's file → the delta (send this) |
 | `scripts/delta_by_extension.py` | Report afterwards: per extension, files and lines in history, removed, sent |
 | `scripts/copy_group4_5.sh` | Copy to the share: data and tracking kept apart, name check, count check |
-| `scripts/file_history_for_list.py`, `extract_commits.py`, `explore_input_csv.py`, `repo_extension_summary.py`, `analyse_file_summary.py` | Helpers the scripts above import. They must sit in the same folder |
+| `scripts/file_history_for_list.py`, `extract_commits.py`, `explore_input_csv.py`, `explain_file_counts.py`, `repo_extension_summary.py`, `analyse_file_summary.py` | Helpers the scripts above import. They must sit in the same folder |
 | `text_extensions.txt` | **You fill this in:** the extensions to run, one per line |
 | `md5sums.txt` | Checksums of every script, to check the copy on the server |
 
@@ -92,6 +92,10 @@ nohup ./run_text_versions.sh > /data/workarea/text_rest.out 2>&1 &
 ```
 
 - `nohup ... &` keeps it running if your SSH session drops.
+- `SKIP_VENDORED=1` in front leaves out files in third-party and build
+  folders (node_modules, packages, vendor, bin, obj, dist, build, ...), the
+  same rule as the extension counts. Each repo's `done.json` then says how
+  many were left out (`skipped_vendored`).
 - The delta is written to `$OUT` + `_delta`:
   `/data/workarea/text_rest_extract_delta`.
 - Repos are processed in batches (G01–G05, L01–L08, M01–M04, S01–S06, from
