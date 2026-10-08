@@ -47,6 +47,10 @@ tail -f /data/workarea/group4_5_R.out
 After an SSH drop: do NOT start it again; `tail -f` the .out file.
 If it stopped (exit 3: disk or mount), run the same command again.
 The delta (what to send) is `/data/workarea/group4_5_R/extract_delta`.
+The skipped vendored files are listed in
+`/data/workarea/group4_5_R/extract/skipped_vendored_all.csv` (org, repo,
+path, vendored folder, versions); one list per repo in `extract/_state`.
+The copy step puts it in the tracking folder on the share.
 
 ## 4. Report
 

@@ -28,7 +28,8 @@
 #   OUT=/data/workarea/text9_extract MIN_DISK_GB=50 ./run_text_versions.sh
 #   EXTS="tfvars bicep" OUT=/data/workarea/tf_extract ./run_text_versions.sh
 #   SKIP_VENDORED=1 leaves out files in node_modules, packages, vendor, bin,
-#   obj, dist, build, ... (file_added_lines.py --skip-vendored)
+#   obj, dist, build, ... (file_added_lines.py --skip-vendored); the list of
+#   what was left out: $OUT/skipped_vendored_all.csv (one per repo in _state)
 # Run it detached so an SSH drop does not stop it:
 #   nohup ./run_text_versions.sh > /data/workarea/run_text_versions.out 2>&1 &
 
@@ -218,6 +219,31 @@ else
         3) stop "delta: the active copy stopped answering ($ACTIVE)" ;;
         *) say "FAIL delta exit=$rc - see $OUT/_logs/delta.out"; exit "$rc" ;;
     esac
+fi
+
+# ------------------------------------------- skipped vendored files, one list
+if [ "$SKIP_VENDORED" = 1 ]; then
+    "$PYTHON" - "$OUT" <<'PY'
+import csv, glob, os, sys
+out = sys.argv[1]
+dst = os.path.join(out, "skipped_vendored_all.csv")
+n = 0
+with open(dst + ".tmp", "w", newline="", encoding="utf-8",
+          errors="surrogateescape") as fh:
+    w = csv.writer(fh)
+    w.writerow(["org", "repo", "path", "vendored_folder", "versions"])
+    for f in sorted(glob.glob(os.path.join(out, "_state", "*", "*",
+                                           "skipped_vendored.csv"))):
+        with open(f, newline="", encoding="utf-8",
+                  errors="surrogateescape") as src:
+            rows = csv.reader(src)
+            next(rows, None)
+            for r in rows:
+                w.writerow(r)
+                n += 1
+os.replace(dst + ".tmp", dst)
+print("skipped vendored files: %d -> %s" % (n, dst))
+PY
 fi
 
 say "runner done - send $DELTA (its _state/*/manifest.csv says what each file is)"

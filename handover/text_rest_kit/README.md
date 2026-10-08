@@ -95,7 +95,9 @@ nohup ./run_text_versions.sh > /data/workarea/text_rest.out 2>&1 &
 - `SKIP_VENDORED=1` in front leaves out files in third-party and build
   folders (node_modules, packages, vendor, bin, obj, dist, build, ...), the
   same rule as the extension counts. Each repo's `done.json` then says how
-  many were left out (`skipped_vendored`).
+  many were left out (`skipped_vendored`), `_state/<org>/<repo>/skipped_vendored.csv`
+  lists them, and at the end `$OUT/skipped_vendored_all.csv` has them all
+  (path, vendored folder, versions); the copy step puts it in the tracking folder.
 - The delta is written to `$OUT` + `_delta`:
   `/data/workarea/text_rest_extract_delta`.
 - Repos are processed in batches (G01–G05, L01–L08, M01–M04, S01–S06, from

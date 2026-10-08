@@ -3,12 +3,12 @@
 1b0bc1b7ffd3a9fd7b7bd9e5fba97f57  explain_file_counts.py
 f4b5f63b415dd52a28d2a4fd5ece5bd3  explore_input_csv.py
 4f3c29a1d1f420f200aba1a5d29203eb  extract_commits.py
-5a2c844c08375866975e300584542041  file_added_lines.py
+acbb49822b4d9e054351dc21193024f8  file_added_lines.py
 55ac26624401c722a0e123e4dd2242d2  file_delta.py
 da1cad6f907ebad633d3ae793ddc1388  file_history_for_list.py
 f669ab23f6e04af81801e620a27d068e  fill_at_head.py
 cd63ee9b43b1c354de968afcf1823753  repo_extension_summary.py
-e8ae05568434bfa21e67ec8b904eef18  copy_group4_5.sh
-9eaad83a03ffdbfc3b5c9c06ee84275e  run_text_versions.sh
+c531ee832d3b938e3f6fd13aa7ea0582  copy_group4_5.sh
+a3d7808053c45c3b791771a5a7ca168b  run_text_versions.sh
 c0997c214d4169cd7f5ca33083465660  text_extensions.txt
-71beb4130a6a3aa9d62304b8c642804c  RUN_4_5_R.md
+b14a35fcc4c861220d4f7252328909b8  RUN_4_5_R.md

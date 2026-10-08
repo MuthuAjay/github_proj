@@ -46,6 +46,9 @@ Output, under --out:
                                  (still in HEAD's tree), versions (commits
                                  that touched it), lines added across all
                                  versions, lines kept, bytes written
+  _state/<org>/<repo>/skipped_vendored.csv
+                                 with --skip-vendored: every path left out,
+                                 the vendored folder it is in, versions
   _state/<org>/<repo>/done.json  the repo's outcome - written LAST, so its
                                  presence means the repo is complete
   _logs/<name>.log               run log: settings, one line per repo start /
@@ -101,6 +104,8 @@ MANIFEST_HEADER = ["org", "repo", "path", "output", "status", "at_head",
                    "versions", "lines_added", "lines_kept", "bytes", "error"]
 REPOS_HEADER = ["finished", "batch", "org", "repo", "status", "seconds",
                 "files_seen", "files_written", "lines_kept", "bytes", "error"]
+SKIPPED_CSV = "skipped_vendored.csv"
+SKIPPED_HEADER = ["org", "repo", "path", "vendored_folder", "versions"]
 FLUSH_CHARS = 64 * 1024 * 1024      # buffered text per repo before writing out
 NAME_MAX = 255                      # bytes per path component (ext4, xfs)
 PATH_MAX = 4000
@@ -336,8 +341,8 @@ def _feed(stdin, specs):
 def collect(gp, out_root, job, paths=None, exts=None, skipped=None):
     """Stream the repo's history once and fill a FileLines per file: the
     listed `paths` (list mode) or every path with an extension in `exts`
-    (history mode, paths=None). `skipped` (a set, history mode only): leave
-    out vendored paths and collect their names in it."""
+    (history mode, paths=None). `skipped` (a Counter, history mode only):
+    leave out vendored paths and count their versions in it."""
 
     def new_file(p):
         parts = p.split("/")
@@ -376,7 +381,7 @@ def collect(gp, out_root, job, paths=None, exts=None, skipped=None):
                         if cur is None and paths is None and (
                                 exts is None or ext_key(p) in exts):
                             if skipped is not None and vendor_of(p):
-                                skipped.add(p)
+                                skipped[p] += 1
                             else:
                                 cur = files[p] = new_file(p)
                         if cur is not None:
@@ -489,9 +494,9 @@ def process_repo(cfg, org, repo, paths, job):
             gp = recovery.tmp
         else:
             gp = rp
-        skipped = set() if cfg.skip_vendored and paths is None else None
+        skipped = Counter() if cfg.skip_vendored and paths is None else None
         files = collect(gp, out_root, job, good, cfg.exts, skipped)
-        job.skipped_vendored = len(skipped or ())
+        job.skipped_vendored = skipped
         job.phase = "checking HEAD"
         head = head_paths(gp, set(files))
     except Exception as exc:                  # noqa: BLE001 - one repo only
@@ -540,6 +545,11 @@ def run_repo(cfg, org, repo, paths, job):
     os.makedirs(sd, exist_ok=True)
     buf = _csv_text([MANIFEST_HEADER] + rows)
     write_atomic(os.path.join(sd, "manifest.csv"), buf)
+    skipped = getattr(job, "skipped_vendored", None)
+    if skipped is not None and status == "ok":
+        write_atomic(os.path.join(sd, SKIPPED_CSV), _csv_text(
+            [SKIPPED_HEADER] + [[org, repo, p, vendor_of(p), n]
+                                for p, n in sorted(skipped.items())]))
     written = [r for r in rows if r[3]]
     rec = {"org": org, "repo": repo, "status": status, "batch": cfg.name,
            "mode": "list" if paths is not None else "history",
@@ -550,7 +560,7 @@ def run_repo(cfg, org, repo, paths, job):
            "lines_kept": sum(r[8] for r in rows),
            "bytes": sum(r[9] for r in rows),
            "file_status": dict(Counter(r[4] for r in rows)),
-           "skipped_vendored": getattr(job, "skipped_vendored", 0),
+           "skipped_vendored": len(getattr(job, "skipped_vendored", None) or ()),
            "error": error}
     write_atomic(os.path.join(sd, "done.json"), json.dumps(rec, indent=1))
     return rec

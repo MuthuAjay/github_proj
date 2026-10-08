@@ -9,6 +9,7 @@
 #             (nothing from _state/ or _logs/; hard-linked files are
 #             copied as real files)
 #   tracking  $DELTA/_state (per repo manifest.csv, done.json), the
+#             list of skipped vendored files (with SKIP_VENDORED=1), the
 #             report, the extension list, the name check  -> $DST_TRACKING/
 #   checks    before: names the share cannot keep apart (differ only by
 #             case) or hold at all (\ : * ? " < > |, trailing dot or
@@ -104,7 +105,8 @@ if [ "$ONLY" != verify ]; then
     # ------------------------------------------------------------- tracking
     say "=== tracking -> $DST_TRACKING (not for scanning)"
     rsync "${OPTS[@]}" "$DELTA/_state/" "$DST_TRACKING/_state/" || fail=1
-    for f in "$REPORT" "$REPORT.md" "$EXTS_FILE" "$CHECKS/name_problems.csv"; do
+    for f in "$REPORT" "$REPORT.md" "$EXTS_FILE" "$CHECKS/name_problems.csv" \
+             "$OUT/skipped_vendored_all.csv"; do
         [ -f "$f" ] && { cp "$f" "$DST_TRACKING/" || fail=1; }
     done
 fi
