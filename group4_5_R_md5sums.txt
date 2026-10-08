@@ -1,0 +1,6 @@
+acbb49822b4d9e054351dc21193024f8  file_added_lines.py
+a3d7808053c45c3b791771a5a7ca168b  run_text_versions.sh
+1b0bc1b7ffd3a9fd7b7bd9e5fba97f57  explain_file_counts.py
+65239cffb01064f1a355833232087172  copy_group4_5_R.sh
+c0997c214d4169cd7f5ca33083465660  group4_5_R_extensions.txt
+30d8f9be1047b57113e969d911705be8  delta_by_extension.py
