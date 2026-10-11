@@ -26,6 +26,9 @@
 #   tail -f /data/workarea/copy_group4_5_R.out
 #
 #   ONLY=verify ...    only the checks (after a finished copy)
+#   PARALLEL=16 ...    rsync processes at once for the data, one per
+#                      <org>/<repo> folder, biggest repos first (default 16;
+#                      1 = one rsync for everything, as before)
 #   CHECKSUM=1 ...     compare contents too, not only size + date
 #
 # Settings (put them in front, e.g. DST=/path ./copy_group4_5_R.sh):
@@ -47,6 +50,7 @@ EXTS_FILE="${EXTS_FILE:-$HERE/group4_5_R_extensions.txt}"
 REPORT="${REPORT:-${OUT}_delta_by_extension.csv}"
 CHECKSUM="${CHECKSUM:-0}"
 ONLY="${ONLY:-}"
+PARALLEL="${PARALLEL:-16}"
 PYTHON="${PYTHON:-python3}"
 OPTS=(-rt --no-perms --no-owner --no-group --partial)
 [ "$CHECKSUM" = 1 ] && OPTS+=(--checksum)
@@ -101,8 +105,36 @@ if [ "$ONLY" != verify ]; then
     mkdir -p "$DST" "$DST_TRACKING" || { say "ERROR: cannot create $DST"; exit 1; }
     say "free on the share: $(df -h "$DST" | awk 'NR==2 {print $4}'), to send: $(du -sh --exclude=_state --exclude=_logs "$DELTA" 2>/dev/null | cut -f1)"
     # ----------------------------------------------------------------- data
-    say "=== data -> $DST"
-    rsync "${OPTS[@]}" "${DATA_EXCL[@]}" "$DELTA/" "$DST/" || fail=1
+    if [ "$PARALLEL" -le 1 ]; then
+        say "=== data -> $DST"
+        rsync "${OPTS[@]}" "${DATA_EXCL[@]}" "$DELTA/" "$DST/" || fail=1
+    else
+        say "=== data -> $DST ($PARALLEL rsync at a time, one per repo folder)"
+        # repo folders (org/repo) by number of files, most first
+        awk -F/ 'NF > 2 {c[$1 "/" $2]++} END {for (k in c) printf "%d\t%s\n", c[k], k}' \
+            "$CHECKS/data_files.txt" | sort -t "$(printf '\t')" -k1,1rn | cut -f2- \
+            > "$CHECKS/copy_repos.txt"
+        : > "$CHECKS/copy_failed.txt"
+        export DELTA DST CHECKS
+        export OPTS_STR="${OPTS[*]}"
+        copy_one() {
+            mkdir -p "$DST/$1" \
+                && rsync $OPTS_STR --exclude "*.tmp.*" "$DELTA/$1/" "$DST/$1/" \
+                || { echo "$1" >> "$CHECKS/copy_failed.txt"; return 1; }
+        }
+        export -f copy_one
+        n_rep=$(wc -l < "$CHECKS/copy_repos.txt")
+        say "  $n_rep repo folder(s)"
+        tr '\n' '\0' < "$CHECKS/copy_repos.txt" \
+            | xargs -0 -r -P "$PARALLEL" -n 1 bash -c 'copy_one "$1"' _ || fail=1
+        # files not inside an org/repo folder (none expected)
+        awk -F/ 'NF <= 2' "$CHECKS/data_files.txt" > "$CHECKS/copy_loose.txt"
+        if [ -s "$CHECKS/copy_loose.txt" ]; then
+            rsync "${OPTS[@]}" --files-from="$CHECKS/copy_loose.txt" "$DELTA/" "$DST/" || fail=1
+        fi
+        n_bad=$(wc -l < "$CHECKS/copy_failed.txt")
+        say "  repo folders done: $(( n_rep - n_bad )) of $n_rep$([ "$n_bad" -gt 0 ] && echo " - FAILED: $n_bad, listed in $CHECKS/copy_failed.txt (run again to retry)")"
+    fi
     # ------------------------------------------------------------- tracking
     say "=== tracking -> $DST_TRACKING (not for scanning)"
     rsync "${OPTS[@]}" "$DELTA/_state/" "$DST_TRACKING/_state/" || fail=1
