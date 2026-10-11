@@ -294,6 +294,64 @@ class Formats(unittest.TestCase):
         self.assertEqual(au.route_of("sqlite"), "group4_1_db")
         self.assertEqual(au.route_of("scss"), "group4_5_text")
 
+    def test_unitypackage_paths(self):
+        g1, g2 = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"
+        data = tgz([(g1 + "/pathname", b"Assets/Scripts/Player.cs\n00\n"),
+                    (g1 + "/asset", b"class Player {}\n"),
+                    (g1 + "/asset.meta", b"guid: 0123\n"),
+                    (g2 + "/pathname", b"Assets/Data/users.csv\n"),
+                    (g2 + "/asset", b"name,email\njane,jane@example.com\n"),
+                    (g2 + "/preview.png", b"PNG")])
+        tmp = tempfile.mkdtemp(prefix="g42u_")
+        try:
+            p = os.path.join(tmp, "x.unitypackage")
+            with open(p, "wb") as fh:
+                fh.write(data)
+            fmt, members = au.open_archive(p, type("C", (), {"sevenzip": None})())
+            got = {}
+            for name, size, kind, opener in members:
+                with opener() as fh:
+                    got[name] = fh.read()
+            self.assertEqual(fmt, "unitypackage")
+            self.assertEqual(sorted(got), ["Assets/Data/users.csv",
+                                           "Assets/Data/users.csv.preview.png",
+                                           "Assets/Scripts/Player.cs",
+                                           "Assets/Scripts/Player.cs.meta"])
+            self.assertIn(b"jane@example.com", got["Assets/Data/users.csv"])
+            self.assertEqual(au.route_of("unitypackage"), "archive")
+            # an ordinary tar.gz keeps its own names
+            q = os.path.join(tmp, "y.tgz")
+            with open(q, "wb") as fh:
+                fh.write(tgz([("docs/a.txt", b"1")]))
+            fmt, members = au.open_archive(q, type("C", (), {"sevenzip": None})())
+            self.assertEqual((fmt, [m[0] for m in members]), ("tar.gz", ["docs/a.txt"]))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bundles_recognised_not_opened(self):
+        tmp = tempfile.mkdtemp(prefix="g42b_")
+        try:
+            repo = os.path.join(tmp, "r")
+            os.makedirs(repo)
+            git(repo, "init", "-q")
+            put(repo, "a.txt", "hello\n")
+            git(repo, "add", "-A")
+            git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x")
+            gb = os.path.join(tmp, "repo.bundle")
+            git(repo, "bundle", "create", "-q", gb, "--all")
+            ub = os.path.join(tmp, "asset.bundle")
+            with open(ub, "wb") as fh:
+                fh.write(b"UnityFS\x00\x00\x00\x00\x07" + b"\x00" * 40)
+            cfg = type("C", (), {"sevenzip": None})()
+            for fp, kind in ((gb, "git_bundle"), (ub, "unity_assetbundle")):
+                self.assertEqual(au.detect(fp), kind)
+                with self.assertRaises(ValueError) as cm:
+                    au.open_archive(fp, cfg)
+                self.assertEqual(str(cm.exception), kind)
+            self.assertEqual(au.route_of("bundle"), "package_or_asset")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

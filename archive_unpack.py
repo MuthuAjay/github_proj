@@ -91,13 +91,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE, LOGS = "_state", "_logs"
 STORED = ("written", "deduped")
 CHUNK = 1 << 20
-# category A of group 4.2: opened. B (packages) and C (assets) are files.
+# category A of group 4.2: opened (unitypackage moved here: a tar.gz whose
+# files get back their Unity project paths). B (packages) and C (assets,
+# incl. .bundle: git or Unity bundles, recognised by content) are files.
 ARCHIVE_EXTS = {"zip", "gz", "gzip", "tar", "tgz", "bz2", "xz", "z", "lzma",
-                "7z", "rar", "zst", "lz4", "zipx", "cab"}
+                "7z", "rar", "zst", "lz4", "zipx", "cab", "unitypackage"}
 PACKAGE_EXTS = {"nupkg", "snupkg", "jar", "war", "whl", "egg", "aar", "apk",
                 "aab", "ipa", "xpi", "crx", "deb", "rpm", "phar", "msix",
-                "intunewin", "dmg", "pkg", "pak", "pck", "img", "bundle",
-                "unitypackage"}
+                "intunewin", "dmg", "pkg", "pak", "pck", "img", "bundle"}
 MANIFEST_HEADER = ["org", "repo", "path", "ext", "blob", "bytes", "action",
                    "stored_as", "why", "vendored", "first_commit", "first_date",
                    "last_commit", "last_date", "archive_path", "archive_blob",
@@ -149,9 +150,13 @@ def route_of(ext):
 
 def detect(fp):
     """Format by magic bytes: zip, tar, gz, bz2, xz, zst, lz4, 7z, rar, cab,
-    Z, or '' (not an archive we know)."""
+    Z, git_bundle, unity_assetbundle, or '' (not an archive we know)."""
     with open(fp, "rb") as fh:
         head = fh.read(512)
+    if head.startswith((b"# v2 git bundle", b"# v3 git bundle")):
+        return "git_bundle"
+    if head.startswith((b"UnityFS", b"UnityWeb", b"UnityRaw", b"UnityArchive")):
+        return "unity_assetbundle"
     if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
         return "zip"
     if head[:2] == b"\x1f\x8b":
@@ -232,6 +237,44 @@ def members_tar(fp):
             yield ti.name, ti.size, "link", None
             continue
         yield ti.name, ti.size, "file", (lambda ti=ti: tf.extractfile(ti))
+
+
+UNITY_MEMBER = re.compile(r"^(?:\./)?([0-9a-f]{32})/(asset|asset\.meta|pathname|preview\.png)$")
+
+
+def is_unitypackage(fp):
+    """A Unity package: a gzip'd tar of <guid>/asset, asset.meta, pathname
+    (the file's path in the Unity project) and preview.png."""
+    try:
+        with tarfile.open(fp, mode="r:*") as tf:
+            names = [ti.name for ti in tf if not ti.isdir()]
+    except (tarfile.TarError, OSError, EOFError):
+        return False
+    return bool(names) and all(UNITY_MEMBER.match(n) for n in names) \
+        and any(n.endswith("/pathname") for n in names)
+
+
+def members_unitypackage(fp):
+    """Like members_tar, but each asset under its original project path
+    (from <guid>/pathname); asset.meta and preview.png next to it."""
+    tf = tarfile.open(fp, mode="r:*")
+    paths = {}
+    for ti in tf:
+        m = UNITY_MEMBER.match(ti.name)
+        if m and m.group(2) == "pathname" and ti.isfile():
+            text = tf.extractfile(ti).read().decode("utf-8", "replace")
+            paths[m.group(1)] = (text.splitlines() or [""])[0].strip()
+    suffix = {"asset": "", "asset.meta": ".meta", "preview.png": ".preview.png"}
+    for ti in tf:
+        m = UNITY_MEMBER.match(ti.name)
+        if not m or m.group(2) == "pathname" or ti.isdir():
+            continue
+        guid, part = m.groups()
+        name = (paths.get(guid) or guid + "/asset") + suffix[part]
+        if not ti.isfile():
+            yield name, ti.size, "link", None
+            continue
+        yield name, ti.size, "file", (lambda ti=ti: tf.extractfile(ti))
 
 
 def single_opener(fmt, fp):
@@ -328,6 +371,8 @@ def open_archive(fp, cfg):
         return "tar", members_tar(fp)
     if fmt in ("gz", "bz2", "xz", "lzma", "zst", "lz4"):
         if fmt in ("gz", "bz2", "xz") and tarfile.is_tarfile(fp):
+            if is_unitypackage(fp):
+                return "unitypackage", members_unitypackage(fp)
             try:
                 return "tar." + fmt, members_tar(fp)
             except tarfile.TarError:
@@ -337,6 +382,8 @@ def open_archive(fp, cfg):
         if not cfg.sevenzip:
             raise LookupError("no_tool")
         return fmt, members_7z(fp, cfg.sevenzip)
+    if fmt in ("git_bundle", "unity_assetbundle"):
+        raise ValueError(fmt)                # recognised, not opened here
     raise ValueError("not_an_archive")
 
 
@@ -416,8 +463,10 @@ class Repo:
         except PermissionError:
             return "", "encrypted", cnt
         except ValueError as exc:
-            return "", ("not_an_archive" if "not_an_archive" in str(exc)
-                        else "damaged: %s" % str(exc)[:150]), cnt
+            msg = str(exc)
+            return "", (msg if msg in ("not_an_archive", "git_bundle",
+                                       "unity_assetbundle")
+                        else "damaged: %s" % msg[:150]), cnt
         except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError,
                 lzma.LZMAError) as exc:
             return "", "damaged: %s" % str(exc)[:150], cnt
