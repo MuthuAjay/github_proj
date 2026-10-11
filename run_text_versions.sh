@@ -30,6 +30,9 @@
 #   SKIP_VENDORED=1 leaves out files in node_modules, packages, vendor, bin,
 #   obj, dist, build, ... (file_added_lines.py --skip-vendored); the list of
 #   what was left out: $OUT/skipped_vendored_all.csv (one per repo in _state)
+#   MATCH_IN_PYTHON=1 gives git log no extension patterns and lets
+#   file_added_lines.py pick the files (--match-in-python): same output,
+#   far faster with hundreds of extensions (git's pattern matching is slow)
 # Run it detached so an SSH drop does not stop it:
 #   nohup ./run_text_versions.sh > /data/workarea/run_text_versions.out 2>&1 &
 
@@ -47,6 +50,7 @@ WORKERS_AT_HEAD="${WORKERS_AT_HEAD:-16}"
 WORKERS_DELTA="${WORKERS_DELTA:-16}"
 RETRY="${RETRY:-1}"                 # 0 = skip the --retry-failed pass
 SKIP_VENDORED="${SKIP_VENDORED:-0}" # 1 = leave out vendored paths
+MATCH_IN_PYTHON="${MATCH_IN_PYTHON:-0}" # 1 = no git patterns (many extensions)
 PYTHON="${PYTHON:-python3}"
 
 # workers, per-repo timeout (seconds) - by tier, as run_batches.sh
@@ -85,7 +89,8 @@ extract() {    # batch, workers, timeout, extra flags...
         --repos-root "$ROOT" --out "$OUT" --extensions "$EXTFILE" \
         --workers "$workers" --repo-timeout "$timeout" \
         --min-free-disk-gb "$MIN_DISK_GB" --quiet \
-        $([ "$SKIP_VENDORED" = 1 ] && echo --skip-vendored) "$@" \
+        $([ "$SKIP_VENDORED" = 1 ] && echo --skip-vendored) \
+        $([ "$MATCH_IN_PYTHON" = 1 ] && echo --match-in-python) "$@" \
         >> "$OUT/_logs/$b.text.out" 2>&1
 }
 
@@ -113,7 +118,7 @@ mkdir -p "$OUT/_logs"
 EXTFILE="$OUT/_logs/text_extensions.txt"
 printf '%s\n' $EXTS > "$EXTFILE"
 say "runner start: ${#list[@]} batch(es): ${list[*]}"
-say "extensions: $(tr '\n' ' ' < "$EXTFILE")| out=$OUT delta=$DELTA active=$ACTIVE skip_vendored=$SKIP_VENDORED"
+say "extensions: $(tr '\n' ' ' < "$EXTFILE")| out=$OUT delta=$DELTA active=$ACTIVE skip_vendored=$SKIP_VENDORED match_in_python=$MATCH_IN_PYTHON"
 
 # ---------------------------------------------------------------- 1. extract
 say "=== STEP 1: extract"

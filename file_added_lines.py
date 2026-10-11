@@ -338,11 +338,15 @@ def _feed(stdin, specs):
         pass
 
 
-def collect(gp, out_root, job, paths=None, exts=None, skipped=None):
+def collect(gp, out_root, job, paths=None, exts=None, skipped=None,
+            git_filter=True):
     """Stream the repo's history once and fill a FileLines per file: the
     listed `paths` (list mode) or every path with an extension in `exts`
     (history mode, paths=None). `skipped` (a Counter, history mode only):
-    leave out vendored paths and count their versions in it."""
+    leave out vendored paths and count their versions in it. git_filter=False
+    (history mode): git reads every path and only the extension check here
+    picks the files - same result, much faster with hundreds of extensions,
+    where git's own pattern matching is the slow part."""
 
     def new_file(p):
         parts = p.split("/")
@@ -357,7 +361,9 @@ def collect(gp, out_root, job, paths=None, exts=None, skipped=None):
                      stdout=subprocess.PIPE, stderr=err)
         # the pathspecs go in on stdin after "--": no argv limit however many
         feeder = threading.Thread(target=_feed,
-                                  args=(proc.stdin, pathspecs(paths, exts)),
+                                  args=(proc.stdin, pathspecs(
+                                      paths, exts if git_filter or paths is not None
+                                      else None)),
                                   daemon=True)
         feeder.start()
         cur = blob = None
@@ -495,7 +501,8 @@ def process_repo(cfg, org, repo, paths, job):
         else:
             gp = rp
         skipped = Counter() if cfg.skip_vendored and paths is None else None
-        files = collect(gp, out_root, job, good, cfg.exts, skipped)
+        files = collect(gp, out_root, job, good, cfg.exts, skipped,
+                        git_filter=not cfg.match_in_python)
         job.skipped_vendored = skipped
         job.phase = "checking HEAD"
         head = head_paths(gp, set(files))
@@ -634,6 +641,11 @@ def main():
                          "repo_extension_summary.py)")
     ap.add_argument("--all-extensions", action="store_true",
                     help="every file, whatever its extension")
+    ap.add_argument("--match-in-python", action="store_true",
+                    help="history mode: do not limit git log to the "
+                         "extensions; every path is read and the extension "
+                         "check picks the files (same result; much faster "
+                         "with hundreds of extensions)")
     ap.add_argument("--skip-vendored", action="store_true",
                     help="history mode: leave out files in node_modules, "
                          "packages, vendor, bin, obj, dist, build, ... "
@@ -730,12 +742,14 @@ def main():
     cfg.repos_root, cfg.out, cfg.exts, cfg.name = (args.repos_root, args.out,
                                                    exts, name)
     cfg.skip_vendored = args.skip_vendored
+    cfg.match_in_python = args.match_in_python
     deadline = deadline_for(args.until) if args.until else None
     log.info("START %s mode=%s repos=%d todo=%d done=%d failed=%d workers=%d "
-             "timeout=%s until=%s exts=%s skip_vendored=%s out=%s", name, mode,
-             len(order), len(todo), n_ok, n_failed, args.workers,
-             args.repo_timeout or "-", args.until or "-",
-             "all" if exts is None else len(exts), args.skip_vendored, args.out)
+             "timeout=%s until=%s exts=%s skip_vendored=%s match_in_python=%s "
+             "out=%s", name, mode, len(order), len(todo), n_ok, n_failed,
+             args.workers, args.repo_timeout or "-", args.until or "-",
+             "all" if exts is None else len(exts), args.skip_vendored,
+             args.match_in_python, args.out)
 
     repos_csv = os.path.join(args.out, LOGS, name + "_repos.csv")
     new_csv = not os.path.exists(repos_csv)
