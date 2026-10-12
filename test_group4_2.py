@@ -321,6 +321,13 @@ class Formats(unittest.TestCase):
                 with next(members)[3]() as fh:
                     while fh.read(1 << 20):
                         pass
+            with open(p, "wb") as fh:                 # not brotli at all
+                fh.write(b"version https://git-lfs.github.com/spec/v1\n" * 50)
+            fmt, members = au.open_archive(p, cfg, "br")
+            with self.assertRaises(IOError):          # a file error, not the repo's
+                with next(members)[3]() as fh:
+                    while fh.read(1 << 20):
+                        pass
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -333,6 +340,10 @@ class Formats(unittest.TestCase):
             dyn = os.path.join(tmp, "d")               # copy at the start too
             with open(dyn, "wb") as fh:
                 fh.write(b"conectix" + b"\x00" * 2000)
+            old = os.path.join(tmp, "o")               # 511-byte footer
+            with open(old, "wb") as fh:
+                fh.write(b"\x00" * 4096 + b"conectix" + b"\x00" * 503)
+            self.assertEqual(au.detect(old), "vhd")
             vx = os.path.join(tmp, "x")
             with open(vx, "wb") as fh:
                 fh.write(b"vhdxfile" + b"\x00" * 100)

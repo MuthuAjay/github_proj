@@ -192,8 +192,8 @@ def detect(fp):
         return "tar"
     if head[:8] == b"vhdxfile":
         return "vhdx"
-    if head[:8] == b"conectix" or _tail(fp, 512)[:8] == b"conectix":
-        return "vhd"                                 # dynamic: also at the start
+    if head[:8] == b"conectix" or b"conectix" in _tail(fp, 512):
+        return "vhd"                # footer: 512 bytes (511 on old disks) at the end
     if head[:1] == b"\x5d" and head[1:5] != b"\x00\x00\x00\x00":
         return "lzma"                                # LZMA alone (best effort)
     return ""
@@ -342,7 +342,10 @@ class BrotliReader(io.RawIOBase):
                 if not self.dec.is_finished():
                     raise IOError("brotli: data ends early")
                 return b""
-            out = self.dec.process(chunk)
+            try:
+                out = self.dec.process(chunk)
+            except Exception as exc:                  # brotli.error: not OSError
+                raise IOError("brotli: %s" % exc) from None
             if out:
                 return out
 
