@@ -5,8 +5,9 @@ Covers 8-12 Oct. Previous handoff: `notes/session_handoff_2026-10-07.md`
 anything not repeated here. Server: `ganeshk@USSPNXT1778009520LVM20`,
 scripts in `/data/workarea/scripts`, Python 3.10.
 
-**Next up:** look at the Group 4.2_R results (stats below) and decide
-routing; redo the one failed 4.2_R test repo; ovf when the user asks.
+**Next up:** copy the new archive_unpack.py and redo the billing repo
+(below); then look at the Group 4.2_R results (stats) and decide routing,
+copy + mail; ovf when the user asks.
 
 ## How we work (additions)
 
@@ -70,15 +71,17 @@ test batch M4T = first 20).
   Stats: `/data/workarea/group4_2_R/unpacked/stats/` (by_type.csv with
   route, by_archive_type.csv, problems.csv);
   `python3 archive_unpack_report.py /data/workarea/group4_2_R/unpacked` for report.md.
-- **Open:** test repo `ey-org/assurance-eyv-eydna-appstore-billing` failed
-  in M4T ("brotli: decoder failed", fixed in 5ae9401) and was not redone by
-  the full run. Redo:
-  `python3 archive_unpack.py --in $G/4_2_extract --counts $G/counts
-  --active-root /home/ganeshk/blobcontainer/EYGCO_13082026_777Gb/AllRepos
-  --out $G/unpacked --repo ey-org/assurance-eyv-eydna-appstore-billing
-  --extensions <the 19, comma list> --redo --name M4T_fix`, then
-  `--combine-only`. Check the server has archive_unpack.py md5
-  `2cf12ae302fc31ef47c364bbe4d61df2`.
+- Test repo `ey-org/assurance-eyv-eydna-appstore-billing` failed in M4T
+  ("brotli: decoder failed", fixed in 5ae9401); **redone 12 Oct (M4T_fix):
+  ok**, all 242 repos ok. Its 3 versions of `app/env/.env.prod.br` are
+  `error` rows (not stored).
+- Status change (commit below): an archive whose files inside ALL failed is
+  now `damaged: no file inside could be read` (or `encrypted`), not `ok`,
+  so it lands in problems.csv. **Open:** copy archive_unpack.py (md5
+  `958d5c7c556e21849969d470f19640b2`) to the server and redo the billing
+  repo (`--repo … --redo --name M4T_fix2`): its 3 rows should turn damaged,
+  problems 637 -> 640. Other repos keep the old status until redone (a
+  full `--redo` of the 242 takes ~2 min; optional).
 - The full run's counts step ran before `--match-in-python` was added to
   it (fine, same output).
 - Findings: its `.env.prod.br` is NOT brotli (BR = Brazil prod env profile,
@@ -115,6 +118,7 @@ test batch M4T = first 20).
 | 9b0288e | archive_unpack: split sets joined (001/002/003; parts = `split_part`, set = `split_set`, gaps = `incomplete_set`), `.br` (brotli module or tool), vhd/vhdx via 7z |
 | 5ae9401 | bad .br = file error not repo error; vhd 511-byte footer |
 | 7384fd6 | `extension_versions.py --match-in-python`; on in run_group4_2.sh |
+| ad3958c | archive_unpack: archive with no readable file inside = damaged/encrypted, not ok |
 
 Tests: `test_group4_2.py` 21 OK (7z and pdf tests skip without the tools;
 brotli test needs `pip install brotli`), `test_extension_versions.py` 36 OK.
