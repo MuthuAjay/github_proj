@@ -194,7 +194,7 @@ def add_binary(out, exts=()):
 # pass 1: the archive
 # --------------------------------------------------------------------------
 
-def read_history(gp, exts, job):
+def read_history(gp, exts, job, git_filter=True):
     """{path: rec} for every path with one of `exts` that any commit on any
     branch touched. Newest first (no --reverse: git streams it), so the
     first change seen for a path is its last event and the first blob seen
@@ -211,8 +211,10 @@ def read_history(gp, exts, job):
                  "--stdin", "--full-history", "--topo-order", "--raw", "-z",
                  "--no-abbrev", "--no-renames", "--diff-merges=first-parent",
                  "--format=%x1e%H" + FS + "%cI"]
-    # exts=None: every path (all_extension_counts.py)
-    specs = [":(glob,icase)**/*." + e for e in sorted(exts or ())]
+    # exts=None: every path (all_extension_counts.py). git_filter=False:
+    # no git patterns either - keep() picks the extensions; many icase glob
+    # patterns make git log many times slower than reading every path
+    specs = [":(glob,icase)**/*." + e for e in sorted(exts or ())] if git_filter else []
     job.phase = "reading history"
     with tempfile.TemporaryFile() as err:
         proc = spawn(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -332,7 +334,8 @@ def process_repo(cfg, org, repo, job):
             gp = recovery.tmp
         else:
             gp = rp
-        hist = read_history(gp, cfg.exts, job)
+        hist = read_history(gp, cfg.exts, job,
+                            git_filter=not cfg.match_in_python)
         job.phase = "blob sizes"
         blobs = sorted({b for r in hist.values() for b in r["blobs"]})
         sizes = blob_sizes(gp, blobs)
@@ -794,6 +797,10 @@ def main():
     ap.add_argument("--extensions",
                     help="comma list or file (default: the 27 above, plus "
                          "--binary-exts)")
+    ap.add_argument("--match-in-python", action="store_true",
+                    help="give git no path patterns and pick the extensions "
+                         "in Python - same result, much faster with many "
+                         "extensions or long histories")
     ap.add_argument("--binary-exts", metavar="LIST",
                     help="comma list or file: treat these as binary too "
                          "(pass 2 checks them, extract_versions.py writes "
@@ -867,11 +874,14 @@ def main():
                                                 args.active_root)
     cfg.exts = set(load_extensions(args.extensions or
                                    ",".join(TEXT_EXTS + BINARY_EXTS + extra)))
+    cfg.match_in_python = args.match_in_python
     worker = run_identical if args.identical else run_repo
     workers = max(1, args.workers)
-    log.info("START %s %s repos=%d workers=%d exts=%s active=%s",
+    log.info("START %s %s repos=%d workers=%d exts=%s active=%s "
+             "match_in_python=%s",
              name, "identical" if args.identical else "pass1", len(todo),
-             workers, ",".join(sorted(cfg.exts)), args.active_root)
+             workers, ",".join(sorted(cfg.exts)), args.active_root,
+             cfg.match_in_python)
 
     t0 = time.time()
     statuses, results = Counter(), Counter()

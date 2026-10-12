@@ -49,6 +49,8 @@ BINARY_EXTS="${BINARY_EXTS:-}"
 EXT_ARGS=()
 [ -n "$EXTS" ] && EXT_ARGS+=(--extensions "$(echo $EXTS | tr ' ' ',')")
 [ -n "$BINARY_EXTS" ] && EXT_ARGS+=(--binary-exts "$(echo $BINARY_EXTS | tr ' ' ',')")
+MATCH_IN_PYTHON="${MATCH_IN_PYTHON:-0}" # 1 = no git patterns (many extensions)
+[ "$MATCH_IN_PYTHON" = 1 ] && EXT_ARGS+=(--match-in-python)
 
 # workers, per-repo timeout (seconds) - by tier
 settings() {

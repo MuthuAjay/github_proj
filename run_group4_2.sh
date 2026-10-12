@@ -37,9 +37,10 @@ UNPACKED="${UNPACKED:-$G/unpacked}"
 EXTS="${EXTS:-zip gz gzip tar tgz bz2 xz z lzma 7z rar zst lz4 zipx cab}"
 STEPS="${STEPS:-batches counts extract unpack}"
 WORKERS="${WORKERS:-8}"
+MATCH_IN_PYTHON="${MATCH_IN_PYTHON:-1}"  # counts: no git patterns (much faster)
 MIN_DISK_GB="${MIN_DISK_GB:-20}"
 PYTHON="${PYTHON:-python3}"
-export SCRIPTS ROOT ACTIVE PYTHON MIN_DISK_GB BATCHES
+export SCRIPTS ROOT ACTIVE PYTHON MIN_DISK_GB BATCHES MATCH_IN_PYTHON
 
 say() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 mkdir -p "$G"
