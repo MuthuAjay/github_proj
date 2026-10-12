@@ -3,7 +3,8 @@
 test_group4_2.py - archive_unpack.py on a throwaway archive: counts ->
 per-repo extraction -> unpack, with today's copy read too. Covers dedup of
 the same file across versions and archives, nesting (zip > tar.gz > zip),
-a single .csv.gz, 7z (when a 7z tool is found: SEVENZIP=... or 7zz/7z on
+a single .csv.gz, split archives (x.zip.001 + .002, numbered wiki
+attachments, an incomplete set), 7z (when a 7z tool is found: SEVENZIP=... or 7zz/7z on
 PATH), a password-protected zip, a damaged zip, a vendored archive, the
 depth and size limits, resume, and pdf_page_merge.py running on the output.
 
@@ -31,7 +32,7 @@ from test_extension_versions import put, unlink_refs          # noqa: E402
 from test_group3 import HAVE_PDF, commit_on, make_pdf         # noqa: E402
 
 SEVEN = au.sevenzip()
-EXTS = ",".join(sorted(au.ARCHIVE_EXTS))
+EXTS = ",".join(sorted(au.ARCHIVE_EXTS | {"001", "002", "003"}))
 PDF = make_pdf(["Quarterly report", "Contact: jane@example.com"])
 
 
@@ -94,7 +95,16 @@ def build(tmp):
                ("backup/locked.zip", seven(tmp, "l.zip", [("s.txt", b"x")],
                                            "zip", password="pw"))]
     commit_on(a, 2, "c2", c2)
-    commit_on(a, 3, "c3", [("data/export.zip", v3)])
+    big = zbytes([("inner.txt", b"split zip: bob@example.com"),
+                  ("more.csv", b"id\n" + b"7" * 3000)])
+    cut = len(big) // 2
+    num = zbytes([("att.txt", b"wiki attachment: eve@example.com")])
+    commit_on(a, 3, "c3", [("data/export.zip", v3),
+                           ("data/big.zip.001", big[:cut]),
+                           ("data/big.zip.002", big[cut:]),
+                           ("attachments/42/1111.001", num[:20]),
+                           ("attachments/42/2222.002", num[20:]),
+                           ("attachments/43/3333.002", b"a middle part only")])
     unlink_refs(a)
     ra = os.path.join(act, "org1", "repoA")
     put(ra, "data/export.zip", v3)                   # today = v3
@@ -121,7 +131,8 @@ class Unpack(unittest.TestCase):
         cls.act, cls.batch, cls.st, cls.x = build(cls.tmp)
         cls.out = os.path.join(cls.tmp, "unpacked")
         cls.base = ["--in", cls.x, "--counts", cls.st, "--active-root", cls.act,
-                    "--batch", cls.batch, "--min-free-disk-gb", "0", "--workers", "2"]
+                    "--batch", cls.batch, "--min-free-disk-gb", "0", "--workers", "2",
+                    "--extensions", EXTS]
         cls.p = run("archive_unpack.py", *cls.base, "--out", cls.out)
         sd = os.path.join(cls.out, "_state", "org1", "repoA")
         cls.rows = read_csv(os.path.join(sd, "manifest.csv"))
@@ -175,6 +186,22 @@ class Unpack(unittest.TestCase):
         probs = read_csv(os.path.join(self.out, "stats", "problems.csv"))
         self.assertIn("old/broken.zip", {p["archive_path"] for p in probs})
 
+    def test_split_sets_joined(self):
+        self.assertEqual(self.of("data/big.zip/inner.txt")[0]["action"], "written")
+        self.assertEqual(self.of("attachments/42/1111.001-002/att.txt")[0]["action"],
+                         "written")
+        st = {a["archive_path"]: (a["status"], a["format"]) for a in self.arcs}
+        self.assertEqual(st["data/big.zip.001"], ("split_part", "split"))
+        self.assertEqual(st["data/big.zip.002"], ("split_part", "split"))
+        self.assertEqual(st["data/big.zip"], ("ok", "split:zip"))
+        self.assertEqual(st["attachments/43/3333.002"][0], "incomplete_set")
+        self.assertEqual(self.of("attachments/43/3333.002/")[0]["action"],
+                         "incomplete_set")
+        by = {r["archive_type"]: r for r in read_csv(os.path.join(
+            self.out, "stats", "by_archive_type.csv"))}
+        self.assertEqual(by["001"]["versions"], "2")          # the parts, not the sets
+        self.assertEqual(by["001"]["files_inside"], "3")      # both sets' files
+
     @unittest.skipUnless(SEVEN, "no 7z tool (set SEVENZIP)")
     def test_7z_and_password(self):
         self.assertEqual(self.of("backup/b.7z/secret.txt")[0]["action"], "written")
@@ -188,7 +215,7 @@ class Unpack(unittest.TestCase):
         self.assertEqual(by["pdf"]["route"], "group3")
         self.assertEqual(by["png"]["route"], "group2_binary")
         self.assertEqual((by["pdf"]["occurrences"], by["pdf"]["distinct"]), ("3", "1"))
-        self.assertEqual(by["csv"]["distinct"], "3")    # 2 contacts + data.csv
+        self.assertEqual(by["csv"]["distinct"], "4")    # 2 contacts, data.csv, more.csv
         self.assertIn("END", self.p.stdout)
 
     def test_resume(self):
@@ -267,6 +294,61 @@ class Formats(unittest.TestCase):
                     self.assertIn(b"jane@example.com", fh.read())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_brotli_single_file(self):
+        try:
+            import brotli
+        except ImportError:
+            self.skipTest("pip install brotli")
+        tmp = tempfile.mkdtemp(prefix="g42br_")
+        try:
+            data = b"DB_PASSWORD=hunter2\n" + os.urandom(200000).hex().encode()
+            p = os.path.join(tmp, "x")                # stored by blob: no name
+            with open(p, "wb") as fh:
+                fh.write(brotli.compress(data))
+            cfg = type("C", (), {"sevenzip": None})()
+            self.assertEqual(au.detect(p), "")        # no magic bytes
+            fmt, members = au.open_archive(p, cfg, "br")
+            name, size, kind, opener = next(members)
+            self.assertEqual((fmt, kind), ("br", "single"))
+            with opener() as fh:
+                got = b"".join(iter(lambda: fh.read(1 << 20), b""))
+            self.assertEqual(got, data)
+            with open(p, "wb") as fh:                 # cut short -> an error
+                fh.write(brotli.compress(data)[:5000])
+            fmt, members = au.open_archive(p, cfg, "br")
+            with self.assertRaises(IOError):
+                with next(members)[3]() as fh:
+                    while fh.read(1 << 20):
+                        pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_vhd_detected(self):
+        tmp = tempfile.mkdtemp(prefix="g42v_")
+        try:
+            fixed = os.path.join(tmp, "f")             # footer at the end only
+            with open(fixed, "wb") as fh:
+                fh.write(b"\x00" * 4096 + b"conectix" + b"\x00" * 504)
+            dyn = os.path.join(tmp, "d")               # copy at the start too
+            with open(dyn, "wb") as fh:
+                fh.write(b"conectix" + b"\x00" * 2000)
+            vx = os.path.join(tmp, "x")
+            with open(vx, "wb") as fh:
+                fh.write(b"vhdxfile" + b"\x00" * 100)
+            self.assertEqual([au.detect(f) for f in (fixed, dyn, vx)],
+                             ["vhd", "vhd", "vhdx"])
+            with self.assertRaises(LookupError):      # 7z opens them
+                au.open_archive(fixed, type("C", (), {"sevenzip": None})())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_split_part_names(self):
+        others, sets = au.split_sets([{"path": p} for p in (
+            "a/x.7z.001", "a/x.7z.002", "w/1/11.001", "w/1/22.002", "b/y.zip")])
+        self.assertEqual([o["path"] for o in others], ["b/y.zip"])
+        self.assertEqual({k: sorted(v) for k, v in sets.items()},
+                         {"a/x.7z": [1, 2], "w/1/#numbered": [1, 2]})
 
     def test_no_7z_tool(self):
         tmp = tempfile.mkdtemp(prefix="g42n_")

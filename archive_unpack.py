@@ -21,7 +21,13 @@ Per repo, archive versions oldest first (today's last):
     (tarfile), gz / bz2 / xz / lzma (one file inside, or a tar), zst
     (zstandard), lz4 (lz4.frame), 7z / rar / cab / zipx / .Z and zips
     Python cannot read (the 7z tool, one member at a time to stdout - 7z
-    never writes files itself)
+    never writes files itself); .br (brotli module or the brotli tool, by
+    name - brotli has no magic bytes); vhd / vhdx disks (7z)
+  * split archives (x.7z.001 + x.7z.002 ..., or numbered wiki attachments
+    <id>.001 / <id>.002 in one folder): the newest version of each part,
+    joined in order and opened as one archive (archive_source split_set);
+    the parts are rows with status split_part. A set without part 1 or with
+    a gap is incomplete_set, not opened
   * every regular file inside is streamed, hashed (sha256) and written as
     files/<type>/<org>/<repo>/<sha256>.<type> - only the first time that
     content is seen in the repo; later occurrences are manifest rows
@@ -95,7 +101,11 @@ CHUNK = 1 << 20
 # files get back their Unity project paths). B (packages) and C (assets,
 # incl. .bundle: git or Unity bundles, recognised by content) are files.
 ARCHIVE_EXTS = {"zip", "gz", "gzip", "tar", "tgz", "bz2", "xz", "z", "lzma",
-                "7z", "rar", "zst", "lz4", "zipx", "cab", "unitypackage"}
+                "7z", "rar", "zst", "lz4", "zipx", "cab", "unitypackage",
+                "br", "vhd", "vhdx"}
+# parts of one archive cut by a split tool (x.7z.001, x.zip.002, or wiki
+# attachments <id>.001 / <id>.002 in one folder): joined, then opened
+SPLIT_PART = re.compile(r"^(?P<stem>.*)\.(?P<n>\d{3})$")
 PACKAGE_EXTS = {"nupkg", "snupkg", "jar", "war", "whl", "egg", "aar", "apk",
                 "aab", "ipa", "xpi", "crx", "deb", "rpm", "phar", "msix",
                 "intunewin", "dmg", "pkg", "pak", "pck", "img", "bundle"}
@@ -150,7 +160,8 @@ def route_of(ext):
 
 def detect(fp):
     """Format by magic bytes: zip, tar, gz, bz2, xz, zst, lz4, 7z, rar, cab,
-    Z, git_bundle, unity_assetbundle, or '' (not an archive we know)."""
+    Z, vhd, vhdx, git_bundle, unity_assetbundle, or '' (not an archive we
+    know). Brotli has no magic bytes: open_archive goes by the name."""
     with open(fp, "rb") as fh:
         head = fh.read(512)
     if head.startswith((b"# v2 git bundle", b"# v3 git bundle")):
@@ -179,9 +190,21 @@ def detect(fp):
         return "Z"
     if len(head) >= 262 and head[257:262] == b"ustar":
         return "tar"
+    if head[:8] == b"vhdxfile":
+        return "vhdx"
+    if head[:8] == b"conectix" or _tail(fp, 512)[:8] == b"conectix":
+        return "vhd"                                 # dynamic: also at the start
     if head[:1] == b"\x5d" and head[1:5] != b"\x00\x00\x00\x00":
         return "lzma"                                # LZMA alone (best effort)
     return ""
+
+
+def _tail(fp, n):
+    with open(fp, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - n))
+        return fh.read(n)
 
 
 def safe_type(ext):
@@ -290,7 +313,42 @@ def single_opener(fmt, fp):
     if fmt == "lz4":
         import lz4.frame                              # pip install lz4
         return lambda: lz4.frame.open(fp, "rb")
+    if fmt == "br":
+        try:
+            import brotli                             # pip install brotli
+            return lambda: BrotliReader(fp, brotli.Decompressor())
+        except ImportError:
+            tool = shutil.which("brotli")             # apt brotli
+            if not tool:
+                raise
+            return lambda: Proc(subprocess.Popen(
+                [tool, "-d", "-c", fp], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL))
     raise ValueError(fmt)
+
+
+class BrotliReader(io.RawIOBase):
+    """A .br file decompressed as it is read (brotli has no file object)."""
+    def __init__(self, fp, dec):
+        self.fh, self.dec = open(fp, "rb"), dec
+
+    def readable(self):
+        return True
+
+    def read(self, n=-1):
+        while True:
+            chunk = self.fh.read(CHUNK)
+            if not chunk:
+                if not self.dec.is_finished():
+                    raise IOError("brotli: data ends early")
+                return b""
+            out = self.dec.process(chunk)
+            if out:
+                return out
+
+    def close(self):
+        self.fh.close()
+        super().close()
 
 
 def members_7z(fp, tool):
@@ -351,11 +409,14 @@ class Proc(io.RawIOBase):
             raise IOError("7z exited %d" % rc)
 
 
-def open_archive(fp, cfg):
+def open_archive(fp, cfg, ext=""):
     """-> (format, iterator of (name, size, kind, opener)) for an archive,
     or raises. Single-file compression yields one member, which the caller
-    opens again when it is a tar."""
+    opens again when it is a tar. `ext` is the archive's own type, for
+    formats without magic bytes (br)."""
     fmt = detect(fp)
+    if not fmt and ext == "br":
+        return "br", iter([("", None, "single", single_opener("br", fp))])
     if fmt == "zip":
         try:
             zf = zipfile.ZipFile(fp)
@@ -378,7 +439,7 @@ def open_archive(fp, cfg):
             except tarfile.TarError:
                 pass
         return fmt, iter([("", None, "single", single_opener(fmt, fp))])
-    if fmt in ("7z", "rar", "cab", "Z"):
+    if fmt in ("7z", "rar", "cab", "Z", "vhd", "vhdx"):
         if not cfg.sevenzip:
             raise LookupError("no_tool")
         return fmt, members_7z(fp, cfg.sevenzip)
@@ -457,7 +518,7 @@ class Repo:
         cfg = self.cfg
         cnt = Counter()
         try:
-            fmt, members = open_archive(fp, cfg)
+            fmt, members = open_archive(fp, cfg, ext_key(prefix.rstrip("/")))
         except LookupError:
             return "", "no_tool", cnt
         except PermissionError:
@@ -609,6 +670,58 @@ def archive_versions(cfg, org, repo):
     return out
 
 
+def split_sets(avs):
+    """Split the archive versions into (single ones, split sets). A set is
+    the parts of one cut archive: x.7z.001 + x.7z.002 (same name), or wiki
+    attachments <id>.001 + <other id>.002 in one folder (numeric names).
+    -> (others, {set key: {part number: [versions, oldest first]}})."""
+    others, sets = [], defaultdict(lambda: defaultdict(list))
+    for av in avs:
+        m = SPLIT_PART.match(av["path"])
+        if not m:
+            others.append(av)
+            continue
+        stem = m.group("stem")
+        d, base = os.path.split(stem)
+        key = (d + "/#numbered") if base.isdigit() else stem
+        sets[key][int(m.group("n"))].append(av)
+    return others, sets
+
+
+def join_set(R, key, parts):
+    """-> (joined version or None, rows for the parts). The newest version
+    of each part, in order 1..N, joined into one temp file; a set without
+    part 1 or with a gap is listed as incomplete_set, not opened."""
+    nums = sorted(parts)
+    chosen = {n: next((a for a in reversed(parts[n]) if a["file"]), None)
+              for n in nums}
+    complete = nums == list(range(1, len(nums) + 1)) and all(chosen.values())
+    first = chosen.get(1) or parts[nums[0]][-1]
+    if key.endswith("/#numbered"):                    # .../7881.001-003
+        name = first["path"] + ("-%03d" % nums[-1] if len(nums) > 1 else "")
+    else:
+        name = key                                    # .../x.7z
+    joined = None
+    if complete:
+        fd, tmp = tempfile.mkstemp(dir=R.tmpdir)
+        h = hashlib.sha1()
+        with os.fdopen(fd, "wb") as out:
+            for n in nums:
+                with open(chosen[n]["file"], "rb") as fh:
+                    for c in iter(lambda: fh.read(CHUNK), b""):
+                        out.write(c)
+                        h.update(c)
+        joined = dict(first, path=name, blob="joined:" + h.hexdigest(),
+                      source="split_set", file=tmp)
+    rows = []
+    for n in nums:
+        for a in parts[n]:
+            st = ("split_part" if complete and a is chosen[n] else
+                  "split_part_older_version" if complete else "incomplete_set")
+            rows.append((a, st, name))
+    return joined, rows
+
+
 def run_repo(cfg, org, repo):
     t0 = time.time()
     sd = os.path.join(cfg.out, STATE, org, repo)
@@ -628,8 +741,19 @@ def run_repo(cfg, org, repo):
     R = Repo(cfg, org, repo)
     status, error = "ok", ""
     try:
+        avs, sets = split_sets(avs)
+        for key in sorted(sets):
+            joined, parts = join_set(R, key, sets[key])
+            for a, st, name in parts:
+                rec["archive_versions"] += 1
+                R.row(a, a["path"] + "/", "", 0, st)
+                R.archives.append([a["path"], a["blob"], a["source"],
+                                   os.path.getsize(a["file"]) if a["file"] else "",
+                                   "split", st, 0, 0, 0, 0, 0, "set: " + name])
+            if joined:
+                avs.append(joined)
         for av in avs:
-            rec["archive_versions"] += 1
+            rec["archive_versions"] += av["source"] != "split_set"   # parts counted
             if not av["file"]:
                 R.row(av, av["path"] + "/", "", 0, av["action"] or "not_extracted")
                 R.archives.append([av["path"], av["blob"], av["source"], "", "",
@@ -640,6 +764,9 @@ def run_repo(cfg, org, repo):
             budget = {"left": min(cfg.max_archive_bytes,
                                   max(size * cfg.max_ratio, cfg.ratio_floor))}
             fmt, st, c = R.unpack(av, av["file"], av["path"] + "/", 1, budget)
+            if av["source"] == "split_set":
+                os.remove(av["file"])
+                fmt = "split:" + fmt
             if st != "ok" and not c["members"]:
                 R.row(av, av["path"] + "/", "", 0,
                       st.split(":")[0])
@@ -731,11 +858,18 @@ def combine(out):
             for a in read_rows(os.path.join(sd, "archives.csv")):
                 e = ext_key(a["archive_path"])
                 st = a["status"].split(":")[0]
+                if a["archive_source"] == "split_set":    # its parts are the versions
+                    by_arch["001"]["members"] += int(a["members"] or 0)
+                    if st != "ok":
+                        problems.append([org, repo, a["archive_path"], a["archive_blob"],
+                                         a["archive_source"], a["format"], a["status"],
+                                         a["members"]])
+                    continue
                 ca = by_arch[e]
                 ca["versions"] += 1
                 ca["status:" + st] += 1
                 ca["members"] += int(a["members"] or 0)
-                if st != "ok":
+                if st not in ("ok", "split_part"):
                     problems.append([org, repo, a["archive_path"], a["archive_blob"],
                                      a["archive_source"], a["format"], a["status"],
                                      a["members"]])

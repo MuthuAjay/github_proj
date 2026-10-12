@@ -93,12 +93,14 @@ def main():
             paths = set()
             c = Counter()
             for a in rows_of(os.path.join(sd, "archives.csv")):
+                if a["archive_source"] == "split_set":
+                    continue                          # counted by its parts
                 paths.add(a["archive_path"])
                 c["versions"] += 1
                 st = a["status"].split(":")[0]
                 ext = os.path.splitext(a["archive_path"])[1].lstrip(".").lower() or "_noext"
                 arch_type[ext]["versions"] += 1
-                if st == "ok":
+                if st in ("ok", "split_part"):        # a part: opened in its set
                     c["opened"] += 1
                     arch_type[ext]["opened"] += 1
                 elif st in ("limit_members", "limit_archive_bytes", "too_deep"):
