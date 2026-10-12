@@ -104,7 +104,8 @@ def build(tmp):
                            ("data/big.zip.002", big[cut:]),
                            ("attachments/42/1111.001", num[:20]),
                            ("attachments/42/2222.002", num[20:]),
-                           ("attachments/43/3333.002", b"a middle part only")])
+                           ("attachments/43/3333.002", b"a middle part only"),
+                           ("env/.env.prod.br", b"# not brotli\nDB_PASSWORD=x\n")])
     unlink_refs(a)
     ra = os.path.join(act, "org1", "repoA")
     put(ra, "data/export.zip", v3)                   # today = v3
@@ -183,6 +184,10 @@ class Unpack(unittest.TestCase):
         self.assertTrue(v and all(r["action"] == "skipped_vendored" for r in v))
         st = {a["archive_path"]: a["status"] for a in self.arcs}
         self.assertTrue(st["old/broken.zip"].startswith("damaged"))
+        # a .br that is plain text: opened by name, nothing inside readable
+        # -> not "ok", so it is in problems.csv
+        self.assertTrue(st["env/.env.prod.br"].startswith(("damaged", "no_tool")),
+                        st["env/.env.prod.br"])
         probs = read_csv(os.path.join(self.out, "stats", "problems.csv"))
         self.assertIn("old/broken.zip", {p["archive_path"] for p in probs})
 

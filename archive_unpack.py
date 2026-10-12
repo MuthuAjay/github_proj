@@ -581,11 +581,14 @@ class Repo:
                         or "encrypted" in str(exc).lower() else "error"
                     self.row(av, path, inner, depth, act)
                     cnt["not_stored"] += 1
+                    cnt["unreadable"] += 1
+                    cnt["encrypted"] += act == "encrypted"
                     continue
                 except (OSError, EOFError, zipfile.BadZipFile, tarfile.TarError,
                         lzma.LZMAError, ValueError) as exc:
                     self.row(av, path, inner, depth, "error")
                     cnt["not_stored"] += 1
+                    cnt["unreadable"] += 1
                     log.warning("member error %s/%s %s: %s", self.org, self.repo,
                                 path, exc)
                     continue
@@ -620,6 +623,10 @@ class Repo:
         except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError,
                 lzma.LZMAError, ValueError, subprocess.SubprocessError) as exc:
             status = "damaged: %s" % str(exc)[:150]
+        if status == "ok" and cnt["members"] and cnt["unreadable"] == cnt["members"]:
+            # opened, but not one file inside could be read: not "ok"
+            status = ("encrypted" if cnt["encrypted"] == cnt["members"]
+                      else "damaged: no file inside could be read")
         return fmt, status, cnt
 
 
