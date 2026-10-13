@@ -135,8 +135,19 @@ class GroupText(unittest.TestCase):
                                          "vendored": 1})
         bt = {r["type"]: r for r in read_csv(
             os.path.join(self.out, "stats", "by_type.csv"))}
-        self.assertEqual(bt["json"]["status_ok"], "1")
-        self.assertEqual(bt["json"]["left_docfx_cache"], "1")
+        j = bt["json"]   # app.json x4 versions, ._app.json, DocFX x.json
+        self.assertEqual((j["scope_files"], j["scope_paths"], j["left_macos"],
+                          j["left_docfx_cache"], j["merged_paths"],
+                          j["merged_versions"], j["files_written"],
+                          j["status_ok"]), ("6", "3", "1", "1", "1", "4", "1", "1"))
+        self.assertEqual(bt["total"]["scope_files"], "11")
+        self.assertEqual(s["scope_files"], 11)
+        # both runs summed per type
+        p = self.run_it("--stats-only", "--combine", self.out, self.out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        cb = {r["type"]: r for r in read_csv(os.path.join(
+            self.out, "stats_combined", "by_type.csv"))}
+        self.assertEqual(cb["json"]["scope_files"], "12")
         # resume: nothing to do the second time
         p = self.run_it()
         self.assertIn("(0 to do)", p.stderr)

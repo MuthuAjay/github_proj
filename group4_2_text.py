@@ -33,9 +33,13 @@ Output, under --out:
       versions, contents (distinct), lines_added, lines_kept, bytes,
       not_stored (versions archive_unpack.py could not store)
   _state/<org>/<repo>/left_out.csv, done.json (written last: resume)
-  stats/by_type.csv (per type: paths, files written, versions, lines,
-      paths per status, paths left out per reason), stats/summary.json,
-  _logs/<name>.log
+  stats/by_type.csv per type from scope to output: files in every archive
+      version -> paths -> left out -> merged -> .txt written (and why the
+      rest got none) -> lines, bytes; a total row; by_type_legend.csv
+  stats/summary.json, _logs/<name>.log
+  --stats-only rebuilds stats/ from the finished repos (seconds);
+  --stats-only --combine OUT1 OUT2 also sums both runs per type into
+  <--out>/stats_combined/by_type.csv
 
 Status per path: ok, partly_binary, binary, no_text (only blank lines),
 not_stored (no version was stored), name_too_long (counted, not written).
@@ -261,8 +265,36 @@ def read_done(out, org, repo):
         return None
 
 
+# per type, from scope to output: files in every archive version -> paths
+# -> left out -> merged -> .txt written (+ why the rest got none) -> lines
+BY_TYPE_COLS = [
+    ("scope_files", "files of the type inside the archives, every version"),
+    ("scope_paths", "the same file across versions counted once: repo + "
+                    "archive path + path inside"),
+    ("left_vendored", "paths left out: a vendored folder in the path"),
+    ("left_macos", "paths left out: macOS metadata"),
+    ("left_docfx_cache", "paths left out: DocFX build cache"),
+    ("left_versions", "versions of the left-out paths"),
+    ("merged_paths", "paths merged (scope_paths - left out)"),
+    ("merged_versions", "versions of the merged paths read"),
+    ("contents", "different contents read (per path)"),
+    ("files_written", ".txt written (status ok + partly_binary)"),
+    ("st_ok", "written; every version text"),
+    ("st_no_text", "no .txt: only empty / blank lines"),
+    ("st_binary", "no .txt: every version binary"),
+    ("st_not_stored", "no .txt: no version stored by archive_unpack.py"),
+    ("st_name_too_long", "no .txt: name too long for the disk"),
+    ("st_partly_binary", "written; some versions binary"),
+    ("not_stored_versions", "versions archive_unpack.py could not store"),
+    ("lines_added", "lines in all versions read (blank lines not counted)"),
+    ("lines_kept", "lines written, each once per path"),
+    ("bytes", "size of the .txt written"),
+]
+
+
 def stats(out):
-    """stats/by_type.csv and stats/summary.json over every done repo."""
+    """stats/by_type.csv (+ by_type_legend.csv) and stats/summary.json over
+    every done repo."""
     st = os.path.join(out, STATE)
     by_type, status, left, repos = {}, Counter(), Counter(), Counter()
     for org in sorted(os.listdir(st)) if os.path.isdir(st) else []:
@@ -276,41 +308,90 @@ def stats(out):
                       encoding="utf-8", errors="surrogateescape") as fh:
                 for r in csv.DictReader(fh):
                     t = by_type.setdefault(r["ext"], Counter())
-                    t["paths"] += 1
+                    t["merged_paths"] += 1
+                    t["merged_versions"] += int(r["versions"])
                     t["files_written"] += bool(r["output"])
-                    for k in ("versions", "contents", "lines_added",
-                              "lines_kept", "bytes", "not_stored"):
+                    t["not_stored_versions"] += int(r["not_stored"])
+                    for k in ("contents", "lines_added", "lines_kept", "bytes"):
                         t[k] += int(r[k])
                     t["st_" + r["status"]] += 1
                     status[r["status"]] += 1
             with open(os.path.join(sd, "left_out.csv"), newline="",
                       encoding="utf-8", errors="surrogateescape") as fh:
                 for r in csv.DictReader(fh):
-                    by_type.setdefault(r["ext"], Counter())["left_" + r["reason"]] += 1
+                    t = by_type.setdefault(r["ext"], Counter())
+                    t["left_" + r["reason"]] += 1
+                    t["left_versions"] += int(r["versions"])
                     left[r["reason"]] += 1
-    os.makedirs(os.path.join(out, "stats"), exist_ok=True)
-    cols = ["paths", "files_written", "versions", "contents", "lines_added",
-            "lines_kept", "bytes", "not_stored", "st_ok", "st_partly_binary",
-            "st_binary", "st_no_text", "st_not_stored", "st_name_too_long",
-            "left_docfx_cache", "left_macos", "left_vendored"]
-    with open(os.path.join(out, "stats", "by_type.csv"), "w", newline="",
-              encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["type"] + [c.replace("st_", "status_") for c in cols])
-        for t, c in sorted(by_type.items(), key=lambda x: -x[1]["paths"]):
-            w.writerow([t] + [c.get(k, 0) for k in cols])
     tot = Counter()
     for c in by_type.values():
+        c["scope_paths"] = c["merged_paths"] + c["left_vendored"] + \
+            c["left_macos"] + c["left_docfx_cache"]
+        c["scope_files"] = c["merged_versions"] + c["left_versions"]
         tot.update(c)
-    summary = {"repos": dict(repos), "paths": tot["paths"],
+    write_by_type(os.path.join(out, "stats"), by_type, tot)
+    summary = {"repos": dict(repos), "scope_files": tot["scope_files"],
+               "scope_paths": tot["scope_paths"],
+               "left_out_paths": dict(left),
+               "left_out_versions": tot["left_versions"],
+               "paths": tot["merged_paths"],
+               "versions": tot["merged_versions"],
+               "contents": tot["contents"],
                "files_written": tot["files_written"],
-               "versions": tot["versions"], "contents": tot["contents"],
                "lines_added": tot["lines_added"],
                "lines_kept": tot["lines_kept"], "bytes": tot["bytes"],
                "status": dict(status), "left_out": dict(left)}
     write_atomic(os.path.join(out, "stats", "summary.json"),
                  json.dumps(summary, indent=1))
     return summary
+
+
+def write_by_type(sd, by_type, tot, extra=()):
+    """by_type.csv: a row per type (most scope files first), a total row;
+    by_type_legend.csv beside it. extra: more (column, text) at the end."""
+    os.makedirs(sd, exist_ok=True)
+    cols = [c for c, _ in BY_TYPE_COLS] + [c for c, _ in extra]
+    name = {c: c.replace("st_", "status_") for c in cols}
+    with open(os.path.join(sd, "by_type.csv"), "w", newline="",
+              encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["type"] + [name[c] for c in cols] + ["gb"])
+        rows = sorted(by_type.items(), key=lambda x: (-x[1]["scope_files"], x[0]))
+        for t, c in rows + [("total", tot)]:
+            w.writerow([t] + [c.get(k, 0) for k in cols]
+                       + [round(c.get("bytes", 0) / 1e9, 3)])
+    with open(os.path.join(sd, "by_type_legend.csv"), "w", newline="",
+              encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["column", "meaning"])
+        w.writerow(["type", "file type (extension) inside the archives"])
+        for c, text in list(BY_TYPE_COLS) + list(extra):
+            w.writerow([name[c], text])
+        w.writerow(["gb", "bytes in GB"])
+
+
+def combine(outs, to):
+    """Several runs' stats/by_type.csv -> one by_type.csv in `to`: every
+    column summed, plus scope_files and files_written per run."""
+    by_type, tot, extra = {}, Counter(), []
+    for o in outs:
+        run = os.path.basename(os.path.dirname(os.path.abspath(o))) or o
+        extra += [(run + "_scope_files", "scope_files in " + o),
+                  (run + "_files_written", "files_written in " + o)]
+        with open(os.path.join(o, "stats", "by_type.csv"), newline="",
+                  encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                if r["type"] == "total":
+                    continue
+                c = by_type.setdefault(r["type"], Counter())
+                for k, _ in BY_TYPE_COLS:
+                    c[k] += int(r[k.replace("st_", "status_")])
+                c[run + "_scope_files"] += int(r["scope_files"])
+                c[run + "_files_written"] += int(r["files_written"])
+    for c in by_type.values():
+        tot.update(c)
+    write_by_type(to, by_type, tot, extra)
+    return tot
 
 
 def setup_logging(out, name):
@@ -340,7 +421,11 @@ def main():
                     help="do repos again that are already done")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--name", default="run", help="log name")
-    ap.add_argument("--stats-only", action="store_true")
+    ap.add_argument("--stats-only", action="store_true",
+                    help="only rebuild stats/ from the finished repos")
+    ap.add_argument("--combine", nargs="+", metavar="OUT", default=None,
+                    help="with --stats-only: also sum these runs' "
+                         "stats/by_type.csv into --out/stats_combined/")
     args = ap.parse_args()
 
     if os.path.realpath(args.out).startswith(
@@ -350,6 +435,10 @@ def main():
     setup_logging(args.out, args.name)
     if args.stats_only:
         print(json.dumps(stats(args.out), indent=1))
+        if args.combine:
+            to = os.path.join(args.out, "stats_combined")
+            combine(args.combine, to)
+            print("combined by type -> " + os.path.join(to, "by_type.csv"))
         return 0
 
     cfg = argparse.Namespace(unpacked=args.unpacked, out=args.out,
@@ -387,11 +476,13 @@ def main():
                      human(rec["bytes"]),
                      (" - " + rec["error"]) if rec.get("error") else "")
     s = stats(args.out)
-    log.info("done in %.0f min: repos %s, paths %d, files written %d, "
-             "lines kept %d of %d, %s; status %s; left out %s",
-             (time.time() - t0) / 60, s["repos"], s["paths"],
+    log.info("done in %.0f min: repos %s, scope files %d -> paths %d, "
+             "left out %s -> merged %d -> files written %d, "
+             "lines kept %d of %d, %s; status %s",
+             (time.time() - t0) / 60, s["repos"], s["scope_files"],
+             s["scope_paths"], s["left_out"], s["paths"],
              s["files_written"], s["lines_kept"], s["lines_added"],
-             human(s["bytes"]), s["status"], s["left_out"])
+             human(s["bytes"]), s["status"])
     return 1 if failed else 0
 
 
