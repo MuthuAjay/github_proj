@@ -7,7 +7,8 @@
 #   nohup ./run_group4_2_text.sh > /data/workarea/group4_2_text.out 2>&1 &
 #   tail -f /data/workarea/group4_2_text.out
 #
-# Progress per repo is in <run>/group1_text/_logs/$NAME.log. Run it again
+# Progress per repo shows in the .out and in <run>/group1_text/_logs/$NAME.log.
+# Run it again
 # after a stop and it carries on (repos already done are skipped).
 #
 # Settings (put them in front, e.g. WORKERS=12 ./run_group4_2_text.sh):
@@ -50,7 +51,7 @@ run_one() {
     say "[$g] $un -> $out (log: $out/_logs/$NAME.log)"
     # shellcheck disable=SC2086
     "$PYTHON" "$HERE/group4_2_text.py" --unpacked "$un" --out "$out" \
-        --workers "$WORKERS" --name "$NAME" $EXTRA 2>/dev/null
+        --workers "$WORKERS" --name "$NAME" $EXTRA
     local rc=$?
     say "[$g] finished, exit $rc$([ $rc -ne 0 ] && echo ' - some repos failed, see the log')"
     [ -f "$out/stats/summary.json" ] && { cat "$out/stats/summary.json"; echo; }
