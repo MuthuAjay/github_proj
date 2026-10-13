@@ -114,6 +114,16 @@ test batch M4T = first 20).
   copy script must leave out paths under `__MACOSX/`, names starting `._`,
   and `.DS_Store`** (listed in tracking, like vendored).
 
+- `group4_2_and_R_not_in_ext_groups.xlsx` now has **proposed_action + reason**
+  (sheets types, by_action, by_reason): Send as text 2 types (**icf =
+  Citibank BAI2 bank files, HIGH**; cl2 COBOL sample), Sample first 33 (**oxps
+  engagement migration reports**, emb Spotfire, creds/secret/key names, parq,
+  ADF/SSAS definitions, 7 small unknowns), Exclude 1,813 (DocFX cache 1,132
+  random-name types, `_` types 556, cgroup 56, Java services, plugin/build
+  files), Review 1,399 (long tail, 3,610 distinct, not looked at). Also: a GPO
+  backup of `anz.ey.net` Default Domain Policy sits in a 4.2 repo (security
+  finding). Script: scratchpad actions42.py (not kept).
+
 ### ovf and vsto (out of 4.2_R)
 - **ovf** = not VM files: Kùzu graph-db hash-index overflow files
   (`*/kg/n-*.hindex.ovf`) in `ey-org/conversational-account-insights-collector`
