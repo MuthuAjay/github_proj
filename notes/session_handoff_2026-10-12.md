@@ -5,11 +5,15 @@ Covers 8-12 Oct. Previous handoff: `notes/session_handoff_2026-10-07.md`
 anything not repeated here. Server: `ganeshk@USSPNXT1778009520LVM20`,
 scripts in `/data/workarea/scripts`, Python 3.10.
 
-**Next up:** copy the new archive_unpack.py and redo the billing repo
-(below); sample the 40 "Sample first" types from
-`group4_2_and_R_not_in_ext_groups.xlsx` (via `sample_stored`, see the 4.2
-mapping section); decide routing of the 4.2/4.2_R inner types, write the
-4.2 copy script (leave out macOS metadata), copy + mail; ovf when the user asks.
+**Next up:** group 1 text inside 4.2/4.2_R is DONE on the server (section
+below): look at sizes per type (`cut -d, -f1,11,18-21
+/data/workarea/group4_2/group1_text/stats_combined/by_type.csv`; 4.2_R
+13.9 GB for 19.4 M lines = long minified lines), maybe check what the
+vendored rule took (build/dist/packages/target), then a copy script for the
+two group1_text folders (name checks, tracking out of the data) + mail.
+Also: redo the billing repo with the new archive_unpack.py; sample the 40
+"Sample first" types (via `sample_stored`); route the other inner groups
+(2, 3, 4.x); ovf when the user asks.
 
 ## How we work (additions)
 
@@ -151,6 +155,43 @@ test batch M4T = first 20).
   `<run root>/_state/*/*/manifest.csv`.
 - **Next for these:** sample the 40 Sample-first types this way (not started).
 
+### Group 1 text inside 4.2 + 4.2_R archives (DONE 13 Oct)
+User's choice: like group 1, lines merged per path, deduped across
+versions, **no delta** (archives = containers, today's never scanned);
+leave out macOS metadata, DocFX cache, vendored paths (listed only).
+- `group4_2_text.py` (reads only `<run>/unpacked`: _state manifests +
+  files/, no git, no repos) -> `/data/workarea/<run>/group1_text/`:
+  `<org>/<repo>/<archive path>/<path inside>.txt`, `_state/<org>/<repo>/`
+  {manifest.csv, left_out.csv, done.json}, `stats/` {by_type.csv,
+  by_type_legend.csv, summary.json}. Types = the 32 group 1 types
+  (`repo_extension_summary.EXTENSIONS` = ext_groups "group 1"), matched on the
+  manifest's `ext` column. One worker per repo (ProcessPoolExecutor).
+  Runner `run_group4_2_text.sh` (4.2 then 4.2_R, disk check).
+  `--stats-only [--combine OUT1 OUT2]` rebuilds stats in seconds; combined:
+  `/data/workarea/group4_2/group1_text/stats_combined/by_type.csv`.
+- by_type columns go scope -> output: scope_files (every version) ->
+  scope_paths (repo + archive path + inner path) -> left_* -> merged_paths ->
+  files_written (+ status_no_text/binary/not_stored) -> lines, bytes.
+- **Result** (4.2 in 5 min, 4.2_R in 2 min, all repos ok):
+
+| | 4.2 | 4.2_R | total |
+|---|---|---|---|
+| scope files (all versions) | 2,151,155 | 384,570 | 2,535,725 |
+| paths | 1,307,247 | 291,738 | 1,598,985 |
+| left out vendored / macos / docfx | 587,674 / 3,567 / 5 | 179,109 / 32 / 0 | 766,783 / 3,599 / 5 |
+| merged paths (versions) | 716,001 (1,393,769) | 112,597 (155,707) | 828,598 |
+| **.txt written** | **712,949** | **112,375** | **825,324** |
+| no_text / binary / not_stored | 2,517 / 325 / 210 | 203 / 7 / 12 | |
+| lines kept of added | 219.1 M of 416.2 M | 19.4 M of 197.5 M | |
+| size | 19.1 GB | 13.9 GB | 33 GB |
+
+- Ties to ext_groups "group 1" row (2,151,205 / 384,570 files): 4.2 is 50
+  lower = 49 `README.md~` + 1 `.js~` editor backups, all inside node_modules
+  (unpack stats strip `~` from the type, this script does not); would be
+  vendored anyway, no change. 4.2_R matches exactly.
+- js/ts/md mostly vendored (js 476 K of 547 K paths); xml = most .txt
+  (268 K, 865 K versions); jks = binary, no .txt.
+
 ### ovf and vsto (out of 4.2_R)
 - **ovf** = not VM files: Kùzu graph-db hash-index overflow files
   (`*/kg/n-*.hindex.ovf`) in `ey-org/conversational-account-insights-collector`
@@ -174,6 +215,8 @@ test batch M4T = first 20).
 | 5ae9401 | bad .br = file error not repo error; vhd 511-byte footer |
 | 7384fd6 | `extension_versions.py --match-in-python`; on in run_group4_2.sh |
 | ad3958c | archive_unpack: archive with no readable file inside = damaged/encrypted, not ok |
+| 2e68972, 51fd452 | `group4_2_text.py` (+ `test_group4_2_text.py`): group 1 text inside archives, lines merged per path; per-type stats scope -> output, `--combine` |
+| 04a413b, 8e95434 | `run_group4_2_text.sh`: both runs, disk check |
 
 Tests: `test_group4_2.py` 21 OK (7z and pdf tests skip without the tools;
 brotli test needs `pip install brotli`), `test_extension_versions.py` 36 OK.
