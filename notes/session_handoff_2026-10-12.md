@@ -123,6 +123,14 @@ test batch M4T = first 20).
   files), Review 1,399 (long tail, 3,610 distinct, not looked at). Also: a GPO
   backup of `anz.ey.net` Default Domain Policy sits in a 4.2 repo (security
   finding). Script: scratchpad actions42.py (not kept).
+- Review resolved with a server scan of every manifest row
+  (`group4_2_type_location.csv` in the repo folder: per type docfx_cache /
+  macos / vendored_path / elsewhere + sample paths; script in the 13 Oct
+  conversation). **Final: Send as text 12 types (60 files: icf, cl2,
+  canton logs, Dockerfile/agents.md variants, csn, dfm), Sample first 40
+  (517: emb, oxps, GPO cmt/ins, firewall backup wfw, Figma, Webex wrf, Neo4j
+  store, secret/creds/key names, configs, ADF/SSAS), Exclude 3,195 (8,942;
+  DocFX cache 2,446 types).** Columns with locations added to the xlsx.
 
 ### ovf and vsto (out of 4.2_R)
 - **ovf** = not VM files: Kùzu graph-db hash-index overflow files
