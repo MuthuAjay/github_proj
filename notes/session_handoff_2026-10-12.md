@@ -6,8 +6,10 @@ anything not repeated here. Server: `ganeshk@USSPNXT1778009520LVM20`,
 scripts in `/data/workarea/scripts`, Python 3.10.
 
 **Next up:** copy the new archive_unpack.py and redo the billing repo
-(below); then look at the Group 4.2_R results (stats) and decide routing,
-copy + mail; ovf when the user asks.
+(below); sample the 40 "Sample first" types from
+`group4_2_and_R_not_in_ext_groups.xlsx` (via `sample_stored`, see the 4.2
+mapping section); decide routing of the 4.2/4.2_R inner types, write the
+4.2 copy script (leave out macOS metadata), copy + mail; ovf when the user asks.
 
 ## How we work (additions)
 
@@ -131,6 +133,23 @@ test batch M4T = first 20).
   (517: emb, oxps, GPO cmt/ins, firewall backup wfw, Figma, Webex wrf, Neo4j
   store, secret/creds/key names, configs, ADF/SSAS), Exclude 3,195 (8,942;
   DocFX cache 2,446 types).** Columns with locations added to the xlsx.
+- Location columns (scan rule, first match wins): `docfx_cache` = path has
+  `obj/.cache/build/`; `macos` = name starts `._` or path has `__MACOSX/`;
+  `vendored_path` = node_modules/, bower_components/, /vendor/, /packages/,
+  /dist/, /build/, /bin/, /obj/, /target/, site-packages/, __pycache__/;
+  else `elsewhere`. `written_rows` = elsewhere rows with action written.
+- **`sample_elsewhere`** = the original name of the first `elsewhere` file
+  of the type: archive path in the repo + `/` + path inside the archive
+  (last 200 chars; no org/repo). Says what the file is and where it came from.
+- **`sample_stored`** = the first `elsewhere` file that was *written*: the
+  real file on the server, `<run root>/files/<type>/<org>/<repo>/<sha256>.<type>`
+  (content stored once per repo, named by hash). Open this one to look at
+  the content. Empty when every such file was deduped (same content already
+  stored under another name) or not stored. May be a different file than
+  sample_elsewhere. To look: `f=<sample_stored>; file -b "$f"; head -c 500 "$f" | cat -v`;
+  original name of a stored file: grep its sha256 in
+  `<run root>/_state/*/*/manifest.csv`.
+- **Next for these:** sample the 40 Sample-first types this way (not started).
 
 ### ovf and vsto (out of 4.2_R)
 - **ovf** = not VM files: Kùzu graph-db hash-index overflow files
