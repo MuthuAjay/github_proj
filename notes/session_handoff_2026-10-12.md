@@ -96,6 +96,24 @@ test batch M4T = first 20).
 - Next: look at by_type.csv routes (as for 4.2), decide how inner files go
   (group 1/2/3 methods), copy + mail.
 
+### 4.2 + 4.2_R types mapped to ext_groups (13 Oct)
+- `group4_2_and_R_by_type.csv` (both runs' by_type side by side) ->
+  `group4_2_and_R_by_type.xlsx` (+ sub_group from the user's
+  `ext_groups.xlsx`), `group4_2_and_R_by_type_mapped.xlsx/.csv` (by_sub_group
+  summary, match, also_listed_as), `group4_2_and_R_not_in_ext_groups.xlsx`
+  (3,247 types only found inside archives, 0.6% of distinct files). Built in
+  the scratchpad (map42.py), not kept. Duplicate sheet rows resolved by
+  priority group 1 > 2 > 3 > 4.1 > 4.2 > ... > 4.4_R > 5; Excel stored
+  001/002/003 as 1/2/3 in ext_groups.xlsx.
+- By group (distinct): group 1 65%, Group 4.4 16% (mostly `class` from 4.2_R
+  plugins), 4.5_R 6%, 4.5 5.6%, group 2 2.4%, Group 5 (_noext) 2.4% / 13 GB.
+- **`_xxx` types (577, not `_noext`) = macOS AppleDouble files** (`._name`,
+  mostly under `__MACOSX/`, 210 or 0 bytes, Mac metadata, no content).
+  Across all types: 4.2 11,956 occurrences / 668 written, 4.2_R 228 / 4.
+  `ds_store` = Finder metadata too. Decision: not re-unpacked; **the 4.2
+  copy script must leave out paths under `__MACOSX/`, names starting `._`,
+  and `.DS_Store`** (listed in tracking, like vendored).
+
 ### ovf and vsto (out of 4.2_R)
 - **ovf** = not VM files: Kùzu graph-db hash-index overflow files
   (`*/kg/n-*.hindex.ovf`) in `ey-org/conversational-account-insights-collector`
