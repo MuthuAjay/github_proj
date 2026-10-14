@@ -15,7 +15,7 @@ We have now taken the files found inside the group 4.2 (archives) and 4.2_R (pac
 |---|---|---|---|---|---|---|---|---|---|
 | Group 1 – Text (32 types) | One .txt per path, lines merged, each line written once | 2,151,155 | 712,949 .txt | 219 M lines | 19.1 GB | 384,570 | 112,375 .txt | 19.4 M lines | 13.9 GB |
 | Group 4.5_R – Text, reclassified from 4.3/4.6 (890 types) | Same | 157,574 | 39,285 .txt | 2.7 M lines | 1.0 GB | 35,852 | 10,489 .txt | 7.9 M lines | 0.8 GB |
-| Group 4.5 – Text, other types (756 types) | Same | 181,571 | 95,110 .txt | 24.6 M lines | 2.3 GB | 24,755 | TBD | TBD | TBD |
+| Group 4.5 – Text, other types (756 types) | Same | 181,571 | 95,110 .txt | 24.6 M lines | 2.3 GB | 24,755 | 10,972 .txt | 1.0 M lines | 56 MB |
 | Group 2 – Text (9 types) | Same | 65,121 | 9,732 .txt | 0.27 M lines | 15 MB | 49 | 0 (all in vendored folders) | – | – |
 | Group 2 – Binary (18 types: Office, images, MSG, PFX, etc.) | One copy of each distinct file content per repo | 71,969 | 18,256 files | – | 3.9 GB | 34,207 | 3,525 files | – | 0.13 GB |
 | Group 3 – PKL | Strings extracted as text; files never unpickled | 89 | 62 .txt | 1.9 M lines | – | 0 | – | – | – |
@@ -27,7 +27,8 @@ We have now taken the files found inside the group 4.2 (archives) and 4.2_R (pac
 - 4.2 Archives: 1,291 repositories processed successfully.
 - 4.2_R Packages: 242 repositories processed successfully.
 - The output is on the server and has not yet been copied to the share.
-- Scope counts match the archive-unpack counts per type for groups 1, 2, 4.5_R, PKL and 4.5 (4.2). Still to confirm: 4.5 (4.2_R) and PDF (4.2).
+- In total 1,015,594 files written (about 41 GB, PDF and PKL sizes not counted).
+- Scope counts match the archive-unpack counts per type for groups 1, 2, 4.5_R, 4.5 and PKL. Still to confirm: PDF (4.2).
 
 **Notes**
 - Most of the group 2 binary files inside packages are repeats. Power Platform canvas apps carry the same template images about 1,700 times each, in `ey-assurance-di-power-platform` and `-test`, which look like copies of each other. These were written once per repo, and the repeats are listed.
