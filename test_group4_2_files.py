@@ -4,12 +4,13 @@ test_group4_2_files.py - group4_2_files.py on a small made-up archive_unpack.py
 output: one file per distinct content (.v1/.v2 when a path has several), a
 content already written under another path, empty and not stored versions,
 macOS / vendored paths left out, other types ignored, resume and stats; and
-run_group4_2_inner.sh over two made-up runs.
+run_group4_2_inner.sh over two made-up runs (3_pdf only with pypdf).
 
     python3 test_group4_2_files.py
 """
 
 import json
+import pickle
 import os
 import shutil
 import subprocess
@@ -21,6 +22,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from test_group4_2_text import Fake, ORG, REPO, read_csv       # noqa: E402
+
+try:
+    import pypdf                                                # noqa: F401
+    import pypdfium2                                            # noqa: F401
+    HAVE_PDF = True
+except ImportError:
+    HAVE_PDF = False
 
 
 def build(root):
@@ -38,6 +46,8 @@ def build(root):
     f.add(a, "web/node_modules/x/icon.png", b"\x89PNG\0icon", "2024-01-01")
     f.add(a, "app.json", b"{}\n", "2024-01-01")              # not group 2
     f.add(a, "notes.rst", b"Title\n=====\n", "2024-01-01")   # group 2 text
+    f.add(a, "model.pkl", pickle.dumps({"owner": "jane@example.com"}),
+          "2024-01-01")                                      # group 3
     f.save()
 
 
@@ -114,8 +124,9 @@ class Runner(unittest.TestCase):
         try:
             for g in ("group4_2", "group4_2_R"):
                 build(os.path.join(tmp, g, "unpacked"))
+            steps = "2_text 2_bin 3_pkl" + (" 3_pdf" if HAVE_PDF else "")
             env = dict(os.environ, WORK=tmp, MIN_FREE_GB="0", WORKERS="2",
-                       STEPS="2_text 2_bin", PYTHON=sys.executable)
+                       STEPS=steps, PYTHON=sys.executable)
             p = subprocess.run(["bash", os.path.join(HERE,
                                                      "run_group4_2_inner.sh")],
                                env=env, capture_output=True, text=True)
@@ -128,6 +139,16 @@ class Runner(unittest.TestCase):
                 b = os.path.join(tmp, g, "group2_binary", ORG, REPO, "docs",
                                  "pack.zip", "logo.png")
                 self.assertTrue(os.path.isfile(b))
+                k = os.path.join(tmp, g, "group3_pkl_text", ORG, REPO, "docs",
+                                 "pack.zip", "model.pkl.txt")
+                with open(k, encoding="utf-8") as fh:
+                    self.assertIn("jane@example.com", fh.read())
+                if HAVE_PDF:      # no pdf in the made-up archive: 0 paths
+                    self.assertTrue(os.path.isfile(os.path.join(
+                        tmp, g, "group3_pdf_merged", "summary.csv")))
+            self.assertIn("[3_pkl group4_2_R] finished, exit 0", p.stdout)
+            self.assertFalse(os.path.exists(os.path.join(
+                tmp, "group4_2", "group3_pkl_text", "stats_combined")))
             cb = {r["type"]: r for r in read_csv(os.path.join(
                 tmp, "group4_2", "group2_binary", "stats_combined",
                 "by_type.csv"))}

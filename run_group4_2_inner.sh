@@ -8,11 +8,16 @@
 #   4.5     group4_5_extensions.txt (756)         group4_2_text.py    <run>/group4_5_text
 #   2_text  group 2 text (9, TEXT_EXTS)           group4_2_text.py    <run>/group2_text
 #   2_bin   group 2 binary (18, BINARY_EXTS)      group4_2_files.py   <run>/group2_binary
+#   3_pkl   group 3 pkl                           pkl_to_text.py      <run>/group3_pkl_text
+#   3_pdf   group 3 pdf                           pdf_page_merge.py   <run>/group3_pdf_merged
 #
 # Text steps: one .txt per path, every line of every version once (as
 # group 1 inside the archives). 2_bin: each distinct content once, the
-# file itself. All steps: no delta; vendored, macOS metadata and DocFX
-# cache paths left out and listed. Group 1 is done already (group1_text).
+# file itself. 3_pkl / 3_pdf: the group 3 scripts with --archive-inner
+# (one .txt of strings per .pkl path; one PDF of every distinct page per
+# .pdf path, no OCR). All steps: no delta; vendored, macOS metadata and
+# DocFX cache paths left out and listed. Group 1 is done already
+# (group1_text).
 #
 #   cd /data/workarea/scripts
 #   nohup ./run_group4_2_inner.sh > /data/workarea/group4_2_inner.out 2>&1 &
@@ -21,29 +26,36 @@
 # Runs one step at a time, 4.2 then 4.2_R inside each step. Run it again
 # after a stop and it carries on (repos already done are skipped). When
 # both runs are in RUNS, each step's stats of the two runs are summed into
-# /data/workarea/group4_2/<step folder>/stats_combined/by_type.csv.
+# /data/workarea/group4_2/<step folder>/stats_combined/by_type.csv (not for
+# 3_pkl / 3_pdf: they write summary.csv per run). 3_pkl / 3_pdf skip every
+# repo that has a done.json, failed ones too: redo those with
+# EXTRA="--redo --repo ORG/REPO".
 #
 # Settings (put them in front, e.g. STEPS="4.5_R" ./run_group4_2_inner.sh):
-#   STEPS      steps, space separated (default "4.5_R 4.5 2_text 2_bin")
+#   STEPS      steps, space separated (default "4.5_R 4.5 2_text 2_bin
+#              3_pkl 3_pdf")
 #   RUNS       runs (default "group4_2 group4_2_R")
 #   WORKERS    processes per run, one repo each (default 8)
 #   MIN_FREE_GB     stop before a step if less is free (default 50)
 #   NAME       log name (default full)
 #   EXTRA      more options for the scripts (e.g. "--redo", "--limit 1"
-#              = the biggest repo only, to time a step)
+#              = the biggest repo only, to time a step; --limit is not
+#              in the group 3 scripts: use "--repo ORG/REPO" there)
+#   PDF_PYTHON python with pypdfium2 + pypdf for 3_pdf (default $PYTHON)
 # Exit code: 0 = all ok, 1 = a step had failed repos or did not start.
 
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${WORK:-/data/workarea}"
-STEPS="${STEPS:-4.5_R 4.5 2_text 2_bin}"
+STEPS="${STEPS:-4.5_R 4.5 2_text 2_bin 3_pkl 3_pdf}"
 RUNS="${RUNS:-group4_2 group4_2_R}"
 WORKERS="${WORKERS:-8}"
 MIN_FREE_GB="${MIN_FREE_GB:-50}"
 NAME="${NAME:-full}"
 EXTRA="${EXTRA:-}"
 PYTHON="${PYTHON:-python3}"
+PDF_PYTHON="${PDF_PYTHON:-$PYTHON}"
 
 say() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
@@ -59,6 +71,8 @@ step_def() {
         4.5)    echo "group4_2_text.py group4_5_text $HERE/group4_5_extensions.txt" ;;
         2_text) echo "group4_2_text.py group2_text $(py_list TEXT_EXTS)" ;;
         2_bin)  echo "group4_2_files.py group2_binary $(py_list BINARY_EXTS)" ;;
+        3_pkl)  echo "pkl_to_text.py group3_pkl_text pkl" ;;
+        3_pdf)  echo "pdf_page_merge.py group3_pdf_merged pdf" ;;
         *)      return 1 ;;
     esac
 }
@@ -81,10 +95,23 @@ run_one() {     # step run script outdir exts
         return 1
     fi
     say "[$s $g] $un -> $out (log: $out/_logs/$NAME.log)"
+    local rc
+    case "$s" in
+    3_*)    # group 3 scripts: --in, type fixed, summary.csv
+        local py="$PYTHON"
+        [ "$s" = 3_pdf ] && py="$PDF_PYTHON"
+        # shellcheck disable=SC2086
+        "$py" "$HERE/$script" --in "$un" --out "$out" --archive-inner \
+            --workers "$WORKERS" --name "$NAME" $EXTRA
+        rc=$?
+        say "[$s $g] finished, exit $rc$([ $rc -ne 0 ] && echo ' - some repos failed, see the log')"
+        [ -f "$out/summary.csv" ] && grep -m1 '^total' "$out/summary.csv"
+        return $rc ;;
+    esac
     # shellcheck disable=SC2086
     "$PYTHON" "$HERE/$script" --unpacked "$un" --out "$out" \
         --extensions "$exts" --workers "$WORKERS" --name "$NAME" $EXTRA
-    local rc=$?
+    rc=$?
     say "[$s $g] finished, exit $rc$([ $rc -ne 0 ] && echo ' - some repos failed, see the log')"
     [ -f "$out/stats/summary.json" ] && { cat "$out/stats/summary.json"; echo; }
     return $rc
@@ -107,7 +134,7 @@ for s in $STEPS; do
         run_one "$s" "$g" "$script" "$dir" "$exts" || { fail=1; failed_dirs+=("$WORK/$g/$dir"); }
         outs+=("$WORK/$g/$dir")
     done
-    if [ "${#outs[@]}" -gt 1 ]; then
+    if [ "${#outs[@]}" -gt 1 ] && [ "${s#3_}" = "$s" ]; then
         first="${outs[0]}"
         "$PYTHON" "$HERE/$script" --unpacked "$WORK/${RUNS%% *}/unpacked" \
             --out "$first" --name "$NAME" --stats-only --combine "${outs[@]}" \
