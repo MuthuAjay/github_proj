@@ -32,6 +32,12 @@ it is copied whole next to the merged file as <path>.<blob 12>.pdf and
 listed (action unreadable). PDFs that are only restricted (no printing...)
 open normally.
 
+--archive-inner: --in is an archive_unpack.py output (the files inside the
+group 4.2 / 4.2_R archives): only rows of files inside an archive are
+read, and vendored, macOS metadata (__MACOSX/, "._" names) and DocFX cache
+paths are left out, listed in _state/<org>/<repo>/left_out.csv (as
+group4_2_text.py). A ".." in a path is written as "_.." in every mode.
+
 --active-root + --drop-active-pages: also render today's file at the same
 path and drop the pages identical to one of its pages (already processed,
 like the text delta). Off by default: a page of today's PDF that is a scan
@@ -73,7 +79,7 @@ from types import SimpleNamespace
 
 from extension_versions import read_batch, read_json, read_rows
 from file_delta import csv_text, write_atomic
-from repo_extension_summary import ext_key
+from group4_2_text import LEFT_OUT_HEADER, clean_path, rows_by_path
 
 STATE, LOGS = "_state", "_logs"
 STORED = ("written", "deduped")
@@ -132,7 +138,7 @@ def open_reader(fp):
 
 
 def out_path(out, org, repo, path):
-    return os.path.join(out, org, repo, *path.split("/"))
+    return os.path.join(out, org, repo, *clean_path(path))
 
 
 # --------------------------------------------------------------------------
@@ -226,14 +232,13 @@ def run_repo(cfg, org, repo):
            "finished": datetime.datetime.now().isoformat(timespec="seconds"),
            "seconds": 0, "paths": 0, "pages_seen": 0, "pages_kept": 0,
            "pages_duplicate": 0, "pages_in_today": 0, "pages_ocr_needed": 0,
-           "versions_unreadable": 0, "files_written": 0, "error": ""}
+           "versions_unreadable": 0, "files_written": 0, "left_out_paths": 0,
+           "error": ""}
     done_in = read_json(os.path.join(sd_in, "done.json"))
     if not done_in or done_in.get("status") != "ok":
         return rec
-    by_path = {}
-    for r in read_rows(os.path.join(sd_in, "manifest.csv")):
-        if ext_key(r["path"]) == "pdf":
-            by_path.setdefault(r["path"], []).append(r)
+    by_path, left = rows_by_path(os.path.join(sd_in, "manifest.csv"), org,
+                                 repo, "pdf", cfg.inner)
     shutil.rmtree(os.path.join(cfg.out, org, repo), ignore_errors=True)
     shutil.rmtree(sd, ignore_errors=True)
     rows, pages_rows, status, error = [], [], "ok", ""
@@ -246,6 +251,10 @@ def run_repo(cfg, org, repo):
     os.makedirs(sd, exist_ok=True)
     write_atomic(os.path.join(sd, "manifest.csv"), csv_text([MANIFEST_HEADER] + rows))
     write_atomic(os.path.join(sd, "pages.csv"), csv_text([PAGES_HEADER] + pages_rows))
+    if cfg.inner:
+        write_atomic(os.path.join(sd, "left_out.csv"),
+                     csv_text([LEFT_OUT_HEADER] + left))
+        rec["left_out_paths"] = len(left)
     ix = {c: i for i, c in enumerate(MANIFEST_HEADER)}
     rec.update(status=status, seconds=round(time.time() - t0, 1), paths=len(rows),
                error=error, files_written=sum(len([o for o in r[ix["output"]].split(";")
@@ -262,7 +271,8 @@ def run_repo(cfg, org, repo):
 # --------------------------------------------------------------------------
 
 COUNTS = ["paths", "files_written", "pages_seen", "pages_kept", "pages_duplicate",
-          "pages_in_today", "pages_ocr_needed", "versions_unreadable"]
+          "pages_in_today", "pages_ocr_needed", "versions_unreadable",
+          "left_out_paths"]
 
 
 def combine(out):
@@ -275,10 +285,10 @@ def combine(out):
                 continue
             repos += 1
             tot["repos_" + d["status"]] += 1
-            if d["status"] != "ok" or not d["paths"]:
+            if d["status"] != "ok" or not (d["paths"] or d.get("left_out_paths")):
                 continue
-            tot.update({c: d[c] for c in COUNTS})
-            per_repo.append([org, repo] + [d[c] for c in COUNTS])
+            tot.update({c: d.get(c, 0) for c in COUNTS})
+            per_repo.append([org, repo] + [d.get(c, 0) for c in COUNTS])
     with open(os.path.join(out, "summary.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["org", "repo"] + COUNTS)
@@ -298,7 +308,9 @@ def combine(out):
             ("pages_ocr_needed", "kept pages with (almost) no text: scans/images, "
              "a scanner without OCR cannot read them"),
             ("versions_unreadable", "versions that could not be opened (password, "
-             "damaged): copied whole, not merged")])
+             "damaged): copied whole, not merged"),
+            ("left_out_paths", "--archive-inner: vendored / macOS / DocFX cache "
+             "paths left out (left_out.csv per repo)")])
     return repos, tot
 
 
@@ -323,6 +335,9 @@ def main():
     ap.add_argument("--max-bytes", type=int, default=0,
                     help="treat stored PDFs bigger than this as unreadable "
                          "(copied whole; default 0 = no limit)")
+    ap.add_argument("--archive-inner", action="store_true",
+                    help="--in is archive_unpack.py output: leave out vendored, "
+                         "macOS and DocFX cache paths")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--redo", action="store_true")
     ap.add_argument("--combine-only", action="store_true")
@@ -377,7 +392,7 @@ def main():
     cfg = SimpleNamespace(src=args.src, out=args.out, active_root=args.active_root,
                           drop_active=args.drop_active_pages, scale=args.scale,
                           max_px=args.max_px, min_text_chars=args.min_text_chars,
-                          max_bytes=args.max_bytes)
+                          max_bytes=args.max_bytes, inner=args.archive_inner)
     log.info("START %s repos=%d workers=%d settings=%s", name, len(todo),
              args.workers, settings)
     print("%d repo(s) to do" % len(todo), flush=True)

@@ -96,6 +96,30 @@ def left_out_reason(path):
     return ""
 
 
+def rows_by_path(manifest, org, repo, ext, inner):
+    """For the group 3 scripts (pdf_page_merge.py, pkl_to_text.py): a
+    manifest's rows of type `ext` -> ({path: [rows]}, left_out rows). inner
+    (an archive_unpack.py manifest): files inside an archive only, and the
+    left-out paths apart with their reason and versions."""
+    csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
+    by_path, left = {}, {}
+    with open(manifest, newline="", encoding="utf-8",
+              errors="surrogateescape") as fh:
+        for r in csv.DictReader(fh):
+            if ext_key(r["path"]) != ext:
+                continue
+            if inner:
+                if not r.get("inner_path"):
+                    continue
+                why = left_out_reason(r["path"])
+                if why:
+                    left.setdefault(r["path"],
+                                    [org, repo, r["path"], ext, why, 0])[5] += 1
+                    continue
+            by_path.setdefault(r["path"], []).append(r)
+    return by_path, list(left.values())
+
+
 def clean_path(path):
     """A path from inside an archive -> safe relative parts ('..' and empty
     parts can not climb out of the output folder)."""

@@ -24,6 +24,12 @@ Per repo, per .pkl path, oldest version first (first_date):
   * strings are split into lines, trimmed, blanks dropped, and a line
     already written for this path is not written again (as file_added_lines.py)
 
+--archive-inner: --in is an archive_unpack.py output (the files inside the
+group 4.2 / 4.2_R archives): only rows of files inside an archive are
+read, and vendored, macOS metadata and DocFX cache paths are left out,
+listed in _state/<org>/<repo>/left_out.csv. Use it without --active-root.
+A ".." in a path is written as "_.." in every mode.
+
 --active-root: the extraction leaves out versions identical to today's file
 (already processed). A scanner cannot read a pickle, so today's .pkl was not
 really scanned: with --active-root today's file at the same path is read
@@ -65,7 +71,7 @@ from types import SimpleNamespace
 
 from extension_versions import read_batch, read_json, read_rows
 from file_delta import csv_text, write_atomic
-from repo_extension_summary import ext_key
+from group4_2_text import LEFT_OUT_HEADER, clean_path, rows_by_path
 
 STATE, LOGS = "_state", "_logs"
 STORED = ("written", "deduped")
@@ -183,7 +189,7 @@ def lines_of(strings):
 # --------------------------------------------------------------------------
 
 def out_txt(out, org, repo, path):
-    return os.path.join(out, org, repo, *path.split("/")) + ".txt"
+    return os.path.join(out, org, repo, *clean_path(path)) + ".txt"
 
 
 def run_repo(cfg, org, repo):
@@ -193,14 +199,12 @@ def run_repo(cfg, org, repo):
     rec = {"org": org, "repo": repo, "status": "no_extraction",
            "finished": datetime.datetime.now().isoformat(timespec="seconds"),
            "seconds": 0, "paths": 0, "files_written": 0, "lines": 0,
-           "read_as": {}, "error": ""}
+           "read_as": {}, "left_out_paths": 0, "error": ""}
     done_in = read_json(os.path.join(sd_in, "done.json"))
     if not done_in or done_in.get("status") != "ok":
         return rec                                   # nothing written: later
-    by_path = {}
-    for r in read_rows(os.path.join(sd_in, "manifest.csv")):
-        if ext_key(r["path"]) == "pkl":
-            by_path.setdefault(r["path"], []).append(r)
+    by_path, left = rows_by_path(os.path.join(sd_in, "manifest.csv"), org,
+                                 repo, "pkl", cfg.inner)
     shutil.rmtree(os.path.join(cfg.out, org, repo), ignore_errors=True)
     shutil.rmtree(sd, ignore_errors=True)
     rows, read_as, status, error = [], Counter(), "ok", ""
@@ -254,6 +258,10 @@ def run_repo(cfg, org, repo):
     os.makedirs(sd, exist_ok=True)
     write_atomic(os.path.join(sd, "manifest.csv"),
                  csv_text([MANIFEST_HEADER] + rows))
+    if cfg.inner:
+        write_atomic(os.path.join(sd, "left_out.csv"),
+                     csv_text([LEFT_OUT_HEADER] + left))
+        rec["left_out_paths"] = len(left)
     rec.update(status=status, seconds=round(time.time() - t0, 1),
                paths=len(rows), files_written=sum(1 for r in rows if r[5]),
                lines=sum(r[5] for r in rows), read_as=dict(read_as), error=error)
@@ -279,19 +287,21 @@ def combine(out):
             if d["status"] != "ok":
                 continue
             reads.update(d["read_as"])
-            for k in ("paths", "files_written", "lines"):
-                tot[k] += d[k]
+            for k in ("paths", "files_written", "lines", "left_out_paths"):
+                tot[k] += d.get(k, 0)
             per_repo.append([org, repo, d["paths"], d["files_written"], d["lines"],
-                             ";".join("%s:%d" % kv for kv in sorted(d["read_as"].items()))])
+                             ";".join("%s:%d" % kv for kv in sorted(d["read_as"].items())),
+                             d.get("left_out_paths", 0)])
     with open(os.path.join(out, "summary.csv"), "w", newline="",
               encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["org", "repo", "pkl_paths", "txt_files_written", "lines",
-                    "read_as"])
+                    "read_as", "left_out_paths"])
         w.writerows(per_repo)
         w.writerow([])
         w.writerow(["total", "", tot["paths"], tot["files_written"], tot["lines"],
-                    ";".join("%s:%d" % kv for kv in sorted(reads.items()))])
+                    ";".join("%s:%d" % kv for kv in sorted(reads.items())),
+                    tot["left_out_paths"]])
         w.writerow([])
         w.writerow(["column", "meaning"])
         w.writerows([
@@ -302,7 +312,9 @@ def combine(out):
              "walked; +raw_scan = the rest of the bytes scanned like "
              "`strings`; gzip/bz2/xz/zlib/joblib_zlib = unpacked first; "
              "lz4_raw_scan / not_pickle_raw_scan / unpack_failed_raw_scan "
-             "= bytes scanned only")])
+             "= bytes scanned only"),
+            ("left_out_paths", "--archive-inner: vendored / macOS / DocFX "
+             "cache paths left out (left_out.csv per repo)")])
     return repos, tot
 
 
@@ -317,6 +329,9 @@ def main():
     ap.add_argument("--active-root", help="include today's .pkl from here")
     ap.add_argument("--max-bytes", type=int, default=2_000_000_000,
                     help="skip stored files bigger than this (default 2 GB)")
+    ap.add_argument("--archive-inner", action="store_true",
+                    help="--in is archive_unpack.py output: leave out vendored, "
+                         "macOS and DocFX cache paths")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--redo", action="store_true",
                     help="redo repos already done")
@@ -354,7 +369,7 @@ def main():
     log.addHandler(fh)
 
     cfg = SimpleNamespace(src=args.src, out=args.out, active_root=args.active_root,
-                          max_bytes=args.max_bytes)
+                          max_bytes=args.max_bytes, inner=args.archive_inner)
     log.info("START %s repos=%d workers=%d in=%s active=%s", name, len(todo),
              args.workers, args.src, args.active_root or "-")
     print("%d repo(s) to do" % len(todo), flush=True)

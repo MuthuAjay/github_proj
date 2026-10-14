@@ -373,5 +373,78 @@ class PdfMerge(unittest.TestCase):
                           tot["versions_unreadable"]), ("7", "2", "2"))
 
 
+# --------------------------------------------------------------------------
+# --archive-inner: pdf / pkl found inside the 4.2 / 4.2_R archives
+# --------------------------------------------------------------------------
+
+class ArchiveInner(unittest.TestCase):
+    """pkl_to_text.py / pdf_page_merge.py --archive-inner on a made-up
+    archive_unpack.py output: files inside archives read, macOS and vendored
+    paths left out and listed, '..' kept inside the output folder."""
+
+    def setUp(self):
+        from test_group4_2_text import Fake
+        self.tmp = tempfile.mkdtemp(prefix="g3inner_")
+        self.un = os.path.join(self.tmp, "unpacked")
+        f = Fake(self.un)
+        a = "docs/pack.zip"
+        f.add(a, "m.pkl", V1, "2024-01-01")
+        f.add(a, "m.pkl", V2, "2024-02-01")
+        f.add(a, "__MACOSX/._m.pkl", b"\0\x05\x16\x07", "2024-01-01")
+        f.add(a, "lib/node_modules/x/n.pkl", V1, "2024-01-01")
+        if HAVE_PDF:
+            f.add(a, "report.pdf", make_pdf(["Hello Jane"]), "2024-01-01")
+            f.add(a, "report.pdf", make_pdf(["Hello Jane", "Page two"]),
+                  "2024-02-01")
+            f.add(a, "__MACOSX/._report.pdf", b"\0\x05\x16\x07", "2024-01-01")
+            f.add(a, "../../esc.pdf", make_pdf(["Escaped"]), "2024-01-01")
+        for r in f.rows:                       # blob = sha256, as unpack writes
+            r["blob"] = os.path.splitext(os.path.basename(r["stored_as"]))[0]
+        f.save()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def left(self, out):
+        return {r["path"].split("/", 2)[2]: r["reason"] for r in read_csv(
+            os.path.join(out, "_state", "ey-org", "demo", "left_out.csv"))}
+
+    def test_pkl(self):
+        out = os.path.join(self.tmp, "pkl")
+        p = run("pkl_to_text.py", "--in", self.un, "--out", out,
+                "--archive-inner", "--workers", "2")
+        self.assertIn("END", p.stdout)
+        base = os.path.join(out, "ey-org", "demo", "docs", "pack.zip")
+        with open(os.path.join(base, "m.pkl.txt"), encoding="utf-8") as fh:
+            got = fh.read().splitlines()
+        self.assertEqual(got.count("jane@example.com"), 1)
+        self.assertIn("tom@example.com", got)
+        written = [n for _, _, ns in os.walk(os.path.join(out, "ey-org"))
+                   for n in ns]
+        self.assertEqual(written, ["m.pkl.txt"])
+        self.assertEqual(self.left(out), {"__MACOSX/._m.pkl": "macos",
+                                          "lib/node_modules/x/n.pkl": "vendored"})
+        with open(os.path.join(out, "summary.csv"), encoding="utf-8") as fh:
+            tot = [r for r in fh.read().splitlines() if r.startswith("total")][0]
+        self.assertTrue(tot.endswith(",2"), tot)       # left_out_paths
+
+    @unittest.skipUnless(HAVE_PDF, "pip install pypdfium2 pypdf")
+    def test_pdf(self):
+        out = os.path.join(self.tmp, "pdf")
+        p = run("pdf_page_merge.py", "--in", self.un, "--out", out,
+                "--archive-inner", "--workers", "2")
+        self.assertIn("END", p.stdout)
+        base = os.path.join(out, "ey-org", "demo", "docs", "pack.zip")
+        self.assertEqual(pdf_texts(os.path.join(base, "report.pdf")),
+                         ["Hello Jane", "Page two"])
+        self.assertTrue(os.path.isfile(os.path.join(base, "_..", "_..",
+                                                    "esc.pdf")))
+        self.assertFalse(os.path.exists(os.path.join(base, "__MACOSX")))
+        self.assertEqual(self.left(out), {"__MACOSX/._report.pdf": "macos"})
+        rows = read_csv(os.path.join(out, "summary.csv"))
+        self.assertEqual(rows[0]["left_out_paths"], "1")
+        self.assertEqual(rows[0]["paths"], "2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
