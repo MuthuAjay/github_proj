@@ -82,13 +82,17 @@ class Nested(unittest.TestCase):
         self.assertEqual({r["action"] for r in new if r["path"] == DEEP},
                          {"opened_nested"})
         self.assertIn(DEEP + "/x.json", {r["path"] for r in new})
+        bt = {r["type"]: r for r in read_csv(os.path.join(
+            self.nd, "compare_by_extension.csv"))}
+        self.assertEqual((bt["json"]["before_occurrences"],
+                          bt["json"]["after_occurrences"],
+                          bt["json"]["new_distinct"]), ("0", "3", "1"))
+        self.assertEqual(bt["zip"]["route"], "archive")
         c = read_csv(os.path.join(self.nd, "compare.csv"))[0]
         self.assertEqual((c["status"], c["before_max_depth"], c["after_max_depth"],
                           c["before_still_closed"], c["after_still_closed"]),
                          ("done", "2", "3", "3", "0"))
-        self.assertFalse(os.path.exists(os.path.join(
-            self.work, "group4_2", "group2_text", "_state", "org1", "repoA",
-            "done.json")))
+        self.assertIn("reset: 1 done.json removed", self.p.stdout)
 
     def test_delta(self):
         # the step runs again for the repo: clears it, writes it anew
@@ -111,6 +115,18 @@ class Nested(unittest.TestCase):
         with open(os.path.join(self.nd, "before_out", "group2_text", "org1",
                                "repoA", "grows.txt")) as fh:
             self.assertEqual(fh.read(), "b\n")        # the snapshot kept the old
+
+    def test_inner_gets_its_own_steps(self):
+        # our STEPS (snapshot reset inner ...) must not reach the inner runner
+        p = subprocess.run(
+            ["bash", os.path.join(HERE, "run_group4_2_nested.sh")],
+            env=dict(self.env, STEPS="inner", INNER_STEPS="2_text", MIN_FREE_GB="0"),
+            capture_output=True, text=True)
+        self.assertNotIn("unknown step", p.stdout + p.stderr)
+        self.assertIn("=== step 2_text", p.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.work, "group4_2", "group2_text", "_state", "org1", "repoA",
+            "done.json")), p.stdout)
 
     def test_empty_todo_skipped(self):
         todo = os.path.join(self.nd, "todo.csv")

@@ -36,7 +36,8 @@
 #   STEPS="snapshot reset inner lists delta" nohup ./run_group4_2_nested.sh > /data/workarea/group4_2_nested_inner.out 2>&1 &
 #
 # Settings: RUNS ("group4_2 group4_2_R"), STEPS, MAX_DEPTH (20), WORKERS (8),
-# MIN_DISK_GB (20), LIMIT, FORCE_FIND, NAME (nested), PYTHON, PDF_PYTHON.
+# MIN_DISK_GB (20), LIMIT, FORCE_FIND, NAME (nested), PYTHON, PDF_PYTHON,
+# INNER_STEPS (run_group4_2_inner.sh's steps, default all six).
 # Exit codes: 0 done; 1 some repos failed; 3 stopped (disk low or the active
 # copy not answering) - fix it and run the same command again.
 
@@ -54,6 +55,7 @@ MIN_DISK_GB="${MIN_DISK_GB:-20}"
 LIMIT="${LIMIT:-0}"
 FORCE_FIND="${FORCE_FIND:-0}"
 NAME="${NAME:-nested}"
+INNER_STEPS="${INNER_STEPS:-4.5_R 4.5 2_text 2_bin 3_pkl 3_pdf}"
 PYTHON="${PYTHON:-python3}"
 export PDF_PYTHON="${PDF_PYTHON:-$PYTHON}"
 
@@ -184,7 +186,9 @@ for step in $STEPS; do
   inner)
     say "=== inner: group 1 text, then 4.5_R 4.5 2_text 2_bin 3_pkl 3_pdf"
     RUNS="$RUNS" NAME="$NAME" WORKERS="$WORKERS" bash "$HERE/run_group4_2_text.sh" || fail=1
-    RUNS="$RUNS" NAME="$NAME" WORKERS="$WORKERS" PYTHON="$PYTHON" bash "$HERE/run_group4_2_inner.sh" || fail=1
+    # STEPS set here: ours (snapshot reset ...) must not reach that runner
+    STEPS="$INNER_STEPS" RUNS="$RUNS" NAME="$NAME" WORKERS="$WORKERS" PYTHON="$PYTHON" \
+        bash "$HERE/run_group4_2_inner.sh" || fail=1
     ;;
   lists)
     say "=== lists: 4.1 and 4.1_R inside the archives"

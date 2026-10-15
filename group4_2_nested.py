@@ -16,7 +16,11 @@ the 4.2 / 4.2_R archives, and what a recursive redo changed.
             the new ones: files inside, stored, written, opened nested,
             deepest level, still closed (same test: before at --old-depth,
             after at --new-depth = the redo's --max-depth), archives too
-            deep -> --out/compare.csv + totals
+            deep -> --out/compare.csv + totals; and per type of file inside,
+            in archive_unpack.py's by_type.csv terms (occurrences, distinct,
+            GB), before / after / added, plus new_distinct = contents the
+            repo did not have before -> --out/compare_by_extension.csv. Only
+            these repos changed, so "added" is the change for the whole run
   delta     after the steps ran again for the todo repos: each step's output
             (--run-dir/<step>/<org>/<repo>/...) against the hard-link
             snapshot taken before (--before-out/<step>/<org>/<repo>/...):
@@ -48,7 +52,7 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from archive_unpack import ARCHIVE_EXTS, STATE, STORED          # noqa: E402
+from archive_unpack import ARCHIVE_EXTS, STATE, STORED, safe_type  # noqa: E402
 from group4_2_text import list_repos                            # noqa: E402
 from repo_extension_summary import load_extensions              # noqa: E402
 
@@ -145,11 +149,67 @@ COLS = ["files_inside", "stored", "written", "opened_nested", "max_depth",
         "still_closed", "too_deep"]
 
 
+def type_counts(m, by_type, side, shas=None):
+    """Add one manifest's files inside to by_type[type][side_*], as
+    archive_unpack.py's by_type.csv counts them; -> {sha: (type, bytes)} of
+    the contents written."""
+    written = {}
+    if not os.path.isfile(m):
+        return written
+    for r in read_manifest(m):
+        if not r.get("inner_path"):
+            continue
+        c = by_type.setdefault(safe_type(r["ext"]), Counter())
+        c["route:" + r.get("route", "")] = 1
+        if r["action"] == "opened_nested":
+            c[side + "_opened_nested"] += 1
+            continue
+        c[side + "_occurrences"] += 1
+        if r["action"] == "written":
+            c[side + "_distinct"] += 1
+            c[side + "_bytes"] += to_int(r["bytes"])
+            written[r["blob"]] = (safe_type(r["ext"]), to_int(r["bytes"]))
+        elif r["action"] != "deduped":
+            c[side + "_not_stored"] += 1
+    return written
+
+
+def write_by_type(path, by_type):
+    cols = ["occurrences", "distinct", "not_stored", "opened_nested"]
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["type", "route"] + ["before_" + c for c in cols]
+                   + ["after_" + c for c in cols]
+                   + ["added_occurrences", "added_distinct", "new_distinct",
+                      "new_gb"])
+        tot = Counter()
+        for t in sorted(by_type, key=lambda t: (-(by_type[t]["after_occurrences"]
+                                                  - by_type[t]["before_occurrences"]), t)):
+            c = by_type[t]
+            route = next((k[6:] for k in c if k.startswith("route:")), "")
+            row = ([c["before_" + k] for k in cols] + [c["after_" + k] for k in cols]
+                   + [c["after_occurrences"] - c["before_occurrences"],
+                      c["after_distinct"] - c["before_distinct"],
+                      c["new_distinct"], round(c["new_bytes"] / 1e9, 3)])
+            w.writerow([t, route] + row)
+            for k in cols:
+                tot["b" + k] += c["before_" + k]
+                tot["a" + k] += c["after_" + k]
+            tot["new_distinct"] += c["new_distinct"]
+            tot["new_bytes"] += c["new_bytes"]
+        w.writerow(["total", ""] + [tot["b" + k] for k in cols]
+                   + [tot["a" + k] for k in cols]
+                   + [tot["aoccurrences"] - tot["boccurrences"],
+                      tot["adistinct"] - tot["bdistinct"], tot["new_distinct"],
+                      round(tot["new_bytes"] / 1e9, 3)])
+    return tot
+
+
 def compare(args, nested):
     todo = os.path.join(args.out, "todo.csv")
     with open(todo, newline="", encoding="utf-8") as fh:
         repos = [(r["org"], r["repo"]) for r in csv.DictReader(fh)]
-    tot_b, tot_a, missing = Counter(), Counter(), []
+    tot_b, tot_a, missing, by_type = Counter(), Counter(), [], {}
     with open(os.path.join(args.out, "compare.csv"), "w", newline="",
               encoding="utf-8") as fh:
         w = csv.writer(fh)
@@ -164,6 +224,14 @@ def compare(args, nested):
             if a is None:
                 missing.append("%s/%s" % (org, repo))
                 a = Counter()
+            else:
+                old = type_counts(os.path.join(args.before, org, repo,
+                                               "manifest.csv"), by_type, "before")
+                new = type_counts(os.path.join(sd, "manifest.csv"), by_type, "after")
+                for sha, (t, n) in new.items():
+                    if sha not in old:
+                        by_type[t]["new_distinct"] += 1
+                        by_type[t]["new_bytes"] += n
             for t, c in ((tot_b, b), (tot_a, a)):
                 for k in COLS:
                     t[k] = max(t[k], c[k]) if k == "max_depth" else t[k] + c[k]
@@ -174,7 +242,12 @@ def compare(args, nested):
     print("  %-14s %12s %12s" % ("", "before", "after"))
     for k in COLS:
         print("  %-14s %12s %12s" % (k, f"{tot_b[k]:,}", f"{tot_a[k]:,}"))
+    tt = write_by_type(os.path.join(args.out, "compare_by_extension.csv"), by_type)
     print("  -> %s/compare.csv" % args.out)
+    print("  per type: %s more files inside, %s new contents (%.2f GB) -> "
+          "%s/compare_by_extension.csv" % (
+              f"{tt['aoccurrences'] - tt['boccurrences']:,}",
+              f"{tt['new_distinct']:,}", tt["new_bytes"] / 1e9, args.out))
     return 1 if missing else 0
 
 
