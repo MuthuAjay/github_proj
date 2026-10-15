@@ -34,7 +34,10 @@ Per repo, archive versions oldest first (today's last):
     (action deduped). Names inside an archive are never used to write
   * an archive inside an archive (by type: zip, tar, gz, 7z, ...) is opened
     the same way, up to --max-depth levels. Office files (docx, xlsx...)
-    are zips too but are files, never opened
+    are zips too but are files, never opened. --nested-extensions adds
+    types opened when found inside (e.g. the 4.2_R packages msapp, sppkg,
+    vsix...: opened by their bytes; one that is not an archive is kept as
+    a file)
   * not opened, listed with the reason: password-protected, damaged, no
     tool for the format, links / devices, over the limits (one file
     > --max-member-bytes; one archive unpacking to > --max-archive-bytes
@@ -595,16 +598,22 @@ class Repo:
                 budget["left"] -= n
                 cnt["bytes"] += n
                 e = ext_key(inner)
-                nested = e in ARCHIVE_EXTS or (kind == "single" and detect(tmp) == "tar")
+                nested = e in getattr(cfg, "nested", ARCHIVE_EXTS) \
+                    or (kind == "single" and detect(tmp) == "tar")
                 if nested and depth < cfg.max_depth:
                     if kind == "single":              # a.tar.gz: one level
                         fmt2, st2, c2 = self.unpack(av, tmp, prefix, depth, budget)
                     else:
                         fmt2, st2, c2 = self.unpack(av, tmp, path + "/", depth + 1,
                                                     budget)
-                    if st2 == "ok":
+                    # opened, fully or in part (too deep, limits, damaged
+                    # half-way): its files are rows already, so it is not
+                    # kept whole as well; the first problem goes up
+                    if st2 == "ok" or c2["written"] or c2["deduped"]:
                         os.remove(tmp)
                         cnt.update(c2)
+                        if st2 != "ok" and status == "ok":
+                            status = st2
                         if kind != "single":
                             self.row(av, path, inner, depth, "opened_nested",
                                      sha, n)
@@ -938,7 +947,11 @@ def main():
                     help="archive types to open (default: the 15 of category A)")
     ap.add_argument("--include-vendored", action="store_true",
                     help="also open today's vendored archives (default: listed)")
-    ap.add_argument("--max-depth", type=int, default=3)
+    ap.add_argument("--nested-extensions",
+                    help="types opened when found INSIDE an archive (default: "
+                         "the archive types); comma list or a file")
+    ap.add_argument("--max-depth", type=int, default=3,
+                    help="levels opened, the archive itself = 1 (default 3)")
     ap.add_argument("--max-member-bytes", type=int, default=2_000_000_000)
     ap.add_argument("--max-archive-bytes", type=int, default=5_000_000_000,
                     help="stop an archive (and what is nested in it) after this "
@@ -999,6 +1012,8 @@ def main():
     cfg = SimpleNamespace(
         src=args.src, out=args.out, counts=args.counts, active_root=args.active_root,
         exts=set(load_extensions(args.extensions)), skip_vendored=not args.include_vendored,
+        nested=(set(load_extensions(args.nested_extensions))
+                if args.nested_extensions else set(ARCHIVE_EXTS)),
         max_depth=args.max_depth, max_member_bytes=args.max_member_bytes,
         max_archive_bytes=args.max_archive_bytes, max_ratio=args.max_ratio,
         ratio_floor=args.ratio_floor, max_members=args.max_members,

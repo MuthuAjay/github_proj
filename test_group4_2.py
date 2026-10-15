@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -447,6 +448,48 @@ class Formats(unittest.TestCase):
                     au.open_archive(fp, cfg)
                 self.assertEqual(str(cm.exception), kind)
             self.assertEqual(au.route_of("bundle"), "package_or_asset")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_nested_extensions_and_depth(self):
+        """A package inside an archive (app.msapp = a zip) is a file by
+        default, opened with --nested-extensions; --max-depth bounds it."""
+        lvl3 = zbytes([("Src/App.fx.yaml", b"Owner: amy@example.com")])
+        msapp = zbytes([("Assets/x.png", b"PNG"), ("deeper.zip", lvl3)])
+        outer = zbytes([("solution/app.msapp", msapp),
+                        ("fake.msapp", b"not a zip at all")])
+        tmp = tempfile.mkdtemp(prefix="g42n_")
+        try:
+            fp = os.path.join(tmp, "outer.zip")
+            with open(fp, "wb") as fh:
+                fh.write(outer)
+            av = {"path": "a/outer.zip", "blob": "b", "source": "history",
+                  "why": "", "vendored": "", "first_commit": "",
+                  "first_date": "", "last_commit": "", "last_date": ""}
+
+            def unpack(nested, depth):
+                cfg = SimpleNamespace(out=tmp, min_free_gb=0, sevenzip=None,
+                                      max_member_bytes=10 ** 9, max_members=1000,
+                                      max_depth=depth, nested=nested)
+                R = au.Repo(cfg, "o", "r")
+                try:
+                    st = R.unpack(av, fp, "a/outer.zip/", 1, {"left": 10 ** 9})[1]
+                finally:
+                    R.close()
+                return st, {r[2]: (r[6], r[18]) for r in R.rows}
+
+            st, rows = unpack(set(au.ARCHIVE_EXTS), 3)
+            self.assertEqual(rows["a/outer.zip/solution/app.msapp"][0], "written")
+            st, rows = unpack(set(au.ARCHIVE_EXTS) | {"msapp"}, 3)
+            self.assertEqual(st, "ok")
+            self.assertEqual(rows["a/outer.zip/solution/app.msapp"][0], "opened_nested")
+            self.assertEqual(rows["a/outer.zip/solution/app.msapp/deeper.zip/"
+                                  "Src/App.fx.yaml"], ("written", 3))
+            self.assertEqual(rows["a/outer.zip/fake.msapp"][0], "written")
+            st, rows = unpack(set(au.ARCHIVE_EXTS) | {"msapp"}, 2)
+            self.assertEqual(st, "too_deep")
+            self.assertEqual(rows["a/outer.zip/solution/app.msapp/deeper.zip"][0],
+                             "written")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
