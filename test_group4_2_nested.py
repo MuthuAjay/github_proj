@@ -3,7 +3,8 @@
 test_group4_2_nested.py - run_group4_2_nested.sh on the throwaway repo of
 test_group4_2.py, first unpacked only 2 levels deep: find lists the closed
 deep.zip, backup saves the old _state, unpack opens it, compare shows it,
-reset clears the steps' done.json, a second run changes nothing.
+snapshot hard-links the steps' old output, reset clears their done.json,
+delta lists only what is new or changed, a second run changes nothing.
 
     python3 test_group4_2_nested.py
 """
@@ -39,9 +40,17 @@ class Nested(unittest.TestCase):
         os.makedirs(done)
         with open(os.path.join(done, "done.json"), "w") as fh:
             fh.write('{"status": "ok"}')
+        cls.step = os.path.join(g, "group2_text", "org1", "repoA")
+        os.makedirs(cls.step)
+        for name, text in (("same.txt", "a\n"), ("grows.txt", "b\n"),
+                           ("old.txt", "c\n")):
+            with open(os.path.join(cls.step, name), "w") as fh:
+                fh.write(text)
         cls.env = dict(os.environ, WORK=cls.work, ACTIVE=act, RUNS="group4_2",
                        OLD_DEPTH="2", WORKERS="1", MIN_DISK_GB="0")
-        cls.p = cls.runner("find backup unpack compare reset")
+        p = cls.runner("find backup unpack compare reset")
+        assert p.returncode == 1 and "no snapshot" in p.stdout, p.stdout
+        cls.p = cls.runner("snapshot reset")
         cls.nd = os.path.join(g, "nested")
 
     @classmethod
@@ -81,6 +90,28 @@ class Nested(unittest.TestCase):
             self.work, "group4_2", "group2_text", "_state", "org1", "repoA",
             "done.json")))
 
+    def test_delta(self):
+        # the step runs again for the repo: clears it, writes it anew
+        shutil.rmtree(self.step)
+        os.makedirs(self.step)
+        for name, text in (("same.txt", "a\n"), ("grows.txt", "b\nb2\n"),
+                           ("new.txt", "d\n")):
+            with open(os.path.join(self.step, name), "w") as fh:
+                fh.write(text)
+        p = self.runner("delta")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = read_csv(os.path.join(self.nd, "delta", "group2_text.csv"))
+        self.assertEqual(sorted((r["file"], r["status"]) for r in rows),
+                         [("grows.txt", "changed"), ("new.txt", "new"),
+                          ("old.txt", "gone")])
+        s = {r["step"]: r for r in read_csv(os.path.join(self.nd, "delta",
+                                                          "summary.csv"))}
+        self.assertEqual((s["group2_text"]["unchanged"], s["group2_text"]["new"]),
+                         ("1", "1"))
+        with open(os.path.join(self.nd, "before_out", "group2_text", "org1",
+                               "repoA", "grows.txt")) as fh:
+            self.assertEqual(fh.read(), "b\n")        # the snapshot kept the old
+
     def test_empty_todo_skipped(self):
         todo = os.path.join(self.nd, "todo.csv")
         with open(todo) as fh:
@@ -88,18 +119,19 @@ class Nested(unittest.TestCase):
         try:
             with open(todo, "w") as fh:
                 fh.write(keep.splitlines()[0] + "\n")
-            p = self.runner("backup unpack compare reset")
+            p = self.runner("backup unpack compare snapshot reset delta")
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-            self.assertEqual(p.stdout.count("nothing to redo"), 4)
+            self.assertEqual(p.stdout.count("nothing to redo"), 6)
             self.assertNotIn("repo(s) to do", p.stdout)
         finally:
             with open(todo, "w") as fh:
                 fh.write(keep)
 
     def test_rerun_keeps_todo_and_backup(self):
-        p = self.runner("find backup unpack")
+        p = self.runner("find backup unpack snapshot")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("find: kept", p.stdout)
+        self.assertIn("snapshot: kept", p.stdout)
         self.assertIn("backup: 0 repo(s)", p.stdout)
         self.assertIn("0 repo(s) to do", p.stdout)
 

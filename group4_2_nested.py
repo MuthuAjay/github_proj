@@ -17,6 +17,17 @@ the 4.2 / 4.2_R archives, and what a recursive redo changed.
             deepest level, still closed (same test: before at --old-depth,
             after at --new-depth = the redo's --max-depth), archives too
             deep -> --out/compare.csv + totals
+  delta     after the steps ran again for the todo repos: each step's output
+            (--run-dir/<step>/<org>/<repo>/...) against the hard-link
+            snapshot taken before (--before-out/<step>/<org>/<repo>/...):
+            files new, changed (other content) or gone -> --out/delta/
+            <step>.csv (step, org, repo, file, status, bytes) and
+            delta/summary.csv; unchanged files are not listed
+
+Usage (delta):
+    python3 group4_2_nested.py delta --run-dir /data/workarea/group4_2 \
+        --before-out /data/workarea/group4_2/nested/before_out \
+        --steps group1_text,group2_binary,... --out /data/workarea/group4_2/nested
 
 Usage:
     python3 group4_2_nested.py find --unpacked /data/workarea/group4_2/unpacked \\
@@ -29,6 +40,7 @@ Usage:
 
 import argparse
 import csv
+import hashlib
 import os
 import sys
 from collections import Counter
@@ -166,20 +178,94 @@ def compare(args, nested):
     return 1 if missing else 0
 
 
+def md5(fp):
+    h = hashlib.md5()
+    with open(fp, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def tree(root):
+    """-> {relative path: size} of the files under root."""
+    out = {}
+    for d, _, files in os.walk(root):
+        for f in files:
+            fp = os.path.join(d, f)
+            out[os.path.relpath(fp, root)] = os.path.getsize(fp)
+    return out
+
+
+def delta(args):
+    with open(os.path.join(args.out, "todo.csv"), newline="", encoding="utf-8") as fh:
+        repos = [(r["org"], r["repo"]) for r in csv.DictReader(fh)]
+    dd = os.path.join(args.out, "delta")
+    os.makedirs(dd, exist_ok=True)
+    summ = []
+    for step in args.steps.split(","):
+        if not os.path.isdir(os.path.join(args.run_dir, step)):
+            continue
+        c = Counter()
+        with open(os.path.join(dd, step + ".csv"), "w", newline="",
+                  encoding="utf-8", errors="surrogateescape") as fh:
+            w = csv.writer(fh)
+            w.writerow(["step", "org", "repo", "file", "status", "bytes"])
+            for org, repo in repos:
+                old_root = os.path.join(args.before_out, step, org, repo)
+                new_root = os.path.join(args.run_dir, step, org, repo)
+                old, new = tree(old_root), tree(new_root)
+                for f in sorted(set(old) | set(new)):
+                    if f not in old:
+                        st = "new"
+                    elif f not in new:
+                        st = "gone"
+                    elif old[f] != new[f] or md5(os.path.join(old_root, f)) \
+                            != md5(os.path.join(new_root, f)):
+                        st = "changed"
+                    else:
+                        c["unchanged"] += 1
+                        continue
+                    c[st] += 1
+                    c[st + "_bytes"] += new.get(f, old.get(f, 0))
+                    w.writerow([step, org, repo, f, st, new.get(f, old.get(f))])
+        summ.append([step, c["unchanged"], c["new"], c["changed"], c["gone"],
+                     round((c["new_bytes"] + c["changed_bytes"]) / 1e9, 3)])
+    with open(os.path.join(dd, "summary.csv"), "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["step", "unchanged", "new", "changed", "gone", "gb_to_send"])
+        w.writerows(summ)
+    print("delta of %d repo(s) -> %s" % (len(repos), dd))
+    print("  %-18s %10s %8s %8s %6s %10s" % ("step", "unchanged", "new",
+                                              "changed", "gone", "GB"))
+    for r in summ:
+        print("  %-18s %10s %8s %8s %6s %10s" % tuple(r))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=["find", "compare"])
-    ap.add_argument("--unpacked", required=True, help="archive_unpack.py --out")
-    ap.add_argument("--nested-extensions", required=True,
+    ap.add_argument("action", choices=["find", "compare", "delta"])
+    ap.add_argument("--unpacked", help="archive_unpack.py --out")
+    ap.add_argument("--nested-extensions",
                     help="types opened inside: comma list or a file")
     ap.add_argument("--old-depth", type=int, default=3,
                     help="archives at this depth or deeper count as closed")
     ap.add_argument("--new-depth", type=int, default=20,
                     help="compare: the redo's --max-depth")
     ap.add_argument("--before", help="compare: the saved _state copies")
+    ap.add_argument("--run-dir", help="delta: the run folder, e.g. "
+                                      "/data/workarea/group4_2")
+    ap.add_argument("--before-out", help="delta: the snapshot folder")
+    ap.add_argument("--steps", help="delta: step folders, comma list")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.action == "delta":
+        if not (args.run_dir and args.before_out and args.steps):
+            ap.error("delta needs --run-dir, --before-out and --steps")
+        return delta(args)
+    if not (args.unpacked and args.nested_extensions):
+        ap.error("find / compare need --unpacked and --nested-extensions")
     nested = set(load_extensions(args.nested_extensions))
     if args.action == "find":
         return find(args, nested)

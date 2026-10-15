@@ -17,17 +17,23 @@
 #   compare  group4_2_nested.py compare: before / after per repo
 #            -> <run>/nested/compare.csv
 #   --- after checking compare (not in the default STEPS):
+#   snapshot the todo repos' current outputs in the step folders (below),
+#            as hard links (no extra space) -> <run>/nested/before_out/<step>
+#            /<org>/<repo>; once (marker before_out/.done). Needed by reset
 #   reset    removes those repos' done.json in the steps' folders (group1_text,
 #            group4_5_R_text, group4_5_text, group2_text, group2_binary,
 #            group3_pkl_text, group3_pdf_merged): the next run does them again
 #   inner    run_group4_2_text.sh then run_group4_2_inner.sh (only the reset
 #            repos are done; stats rebuilt over all repos)
 #   lists    4.1 and 4.1_R path lists inside the archives again
+#   delta    group4_2_nested.py delta: per step, the files new / changed /
+#            gone against the snapshot -> <run>/nested/delta/<step>.csv +
+#            summary.csv = what is left to send (unchanged files are not)
 #
 #   cd /data/workarea/scripts
 #   STEPS="find backup unpack" LIMIT=1 ./run_group4_2_nested.sh   time test
 #   nohup ./run_group4_2_nested.sh > /data/workarea/group4_2_nested.out 2>&1 &
-#   STEPS="reset inner lists" nohup ./run_group4_2_nested.sh > /data/workarea/group4_2_nested_inner.out 2>&1 &
+#   STEPS="snapshot reset inner lists delta" nohup ./run_group4_2_nested.sh > /data/workarea/group4_2_nested_inner.out 2>&1 &
 #
 # Settings: RUNS ("group4_2 group4_2_R"), STEPS, MAX_DEPTH (20), WORKERS (8),
 # MIN_DISK_GB (20), LIMIT, FORCE_FIND, NAME (nested), PYTHON, PDF_PYTHON.
@@ -67,7 +73,7 @@ say "start: steps [$STEPS], runs [$RUNS], max depth $MAX_DEPTH, nested types $NE
 
 for step in $STEPS; do
   case "$step" in
-  find|backup|unpack|compare|reset)
+  find|backup|unpack|compare|snapshot|reset|delta)
     for g in $RUNS; do
         un="$WORK/$g/unpacked" nd="$WORK/$g/nested"
         todo="$nd/todo.csv"
@@ -130,7 +136,36 @@ for step in $STEPS; do
                 --before "$nd/before" --nested-extensions "$NESTED" \
                 --old-depth "$OLD_DEPTH" --new-depth "$MAX_DEPTH" --out "$nd" || fail=1
             ;;
+        snapshot)
+            snap="$nd/before_out"
+            if [ -f "$snap/.done" ]; then
+                say "[$g] snapshot: kept $snap ($(cat "$snap/.done"))"; continue
+            fi
+            n=0
+            while IFS= read -r k; do
+                [ -n "$k" ] || continue
+                for d in $STEP_DIRS; do
+                    dst="$snap/$d/$k"
+                    rm -rf "$dst"; mkdir -p "$dst"
+                    if [ -d "$WORK/$g/$d/$k" ]; then
+                        cp -al "$WORK/$g/$d/$k/." "$dst/" || exit 1
+                        n=$((n + 1))
+                    fi
+                done
+            done < <(repos_of "$todo")
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $n repo folder(s)" > "$snap/.done"
+            say "[$g] snapshot: $n repo folder(s) hard-linked to $snap"
+            ;;
+        delta)
+            say "[$g] === delta"
+            "$PYTHON" "$HERE/group4_2_nested.py" delta --run-dir "$WORK/$g" \
+                --before-out "$nd/before_out" --steps "$(echo $STEP_DIRS | tr ' ' ,)" \
+                --out "$nd" || fail=1
+            ;;
         reset)
+            if [ ! -f "$nd/before_out/.done" ]; then
+                say "[$g] ERROR: no snapshot - run the snapshot step before reset"; exit 1
+            fi
             n=0
             while IFS= read -r k; do
                 [ -n "$k" ] || continue
@@ -159,7 +194,7 @@ for step in $STEPS; do
         --out "$WORK/group4_2/group4_1_paths/group4_1_inner_paths.csv" || fail=1
     STEPS=inner bash "$HERE/run_group4_1_R.sh" || fail=1
     ;;
-  *) say "unknown step '$step' (find backup unpack compare reset inner lists)"; exit 2 ;;
+  *) say "unknown step '$step' (find backup unpack compare snapshot reset inner lists delta)"; exit 2 ;;
   esac
 done
 
