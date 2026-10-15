@@ -75,6 +75,9 @@ for step in $STEPS; do
         if [ "$step" != find ] && [ ! -f "$todo" ]; then
             say "[$g] ERROR: $todo not found - run the find step first"; exit 1
         fi
+        if [ "$step" != find ] && [ "$(wc -l < "$todo")" -le 1 ]; then
+            say "[$g] $step: nothing to redo"; continue
+        fi
         case "$step" in
         find)
             if [ -f "$todo" ] && [ "$FORCE_FIND" != 1 ]; then

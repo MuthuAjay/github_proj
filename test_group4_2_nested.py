@@ -81,6 +81,21 @@ class Nested(unittest.TestCase):
             self.work, "group4_2", "group2_text", "_state", "org1", "repoA",
             "done.json")))
 
+    def test_empty_todo_skipped(self):
+        todo = os.path.join(self.nd, "todo.csv")
+        with open(todo) as fh:
+            keep = fh.read()
+        try:
+            with open(todo, "w") as fh:
+                fh.write(keep.splitlines()[0] + "\n")
+            p = self.runner("backup unpack compare reset")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertEqual(p.stdout.count("nothing to redo"), 4)
+            self.assertNotIn("repo(s) to do", p.stdout)
+        finally:
+            with open(todo, "w") as fh:
+                fh.write(keep)
+
     def test_rerun_keeps_todo_and_backup(self):
         p = self.runner("find backup unpack")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
