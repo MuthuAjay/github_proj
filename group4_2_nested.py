@@ -27,6 +27,17 @@ the 4.2 / 4.2_R archives, and what a recursive redo changed.
             files new, changed (other content) or gone -> --out/delta/
             <step>.csv (step, org, repo, file, status, bytes) and
             delta/summary.csv; unchanged files are not listed
+  report    one row per file type and step, for the todo repos, from the
+            archives to the files on disk -> --out/by_extension_report.csv:
+              inside_*    files inside the archives (as compare_by_extension)
+              out_before  output files of the type in the snapshot
+              out_after   output files of the type on disk now
+              manifest    outputs the step's manifest says it wrote
+              delta_new / delta_gone   from delta/<step>.csv
+              check       ok when out_after = manifest and out_after -
+                          out_before = delta_new - delta_gone
+            The type of an output file is taken from its name (a .txt of a
+            text step: the name before .txt)
 
 Usage (delta):
     python3 group4_2_nested.py delta --run-dir /data/workarea/group4_2 \
@@ -47,12 +58,13 @@ import csv
 import hashlib
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from archive_unpack import ARCHIVE_EXTS, STATE, STORED, safe_type  # noqa: E402
+from repo_extension_summary import ext_key                      # noqa: E402
 from group4_2_text import list_repos                            # noqa: E402
 from repo_extension_summary import load_extensions              # noqa: E402
 
@@ -315,10 +327,117 @@ def delta(args):
     return 0
 
 
+TXT_STEPS = {"group1_text", "group4_5_R_text", "group4_5_text", "group2_text",
+             "group3_pkl_text"}
+
+
+def out_type(step, rel):
+    """The source type of an output file, from its name."""
+    name = os.path.basename(rel)
+    if step in TXT_STEPS and name.endswith(".txt"):
+        name = name[:-4]
+    return safe_type(ext_key(name))
+
+
+def report(args):
+    with open(os.path.join(args.out, "todo.csv"), newline="", encoding="utf-8") as fh:
+        repos = [(r["org"], r["repo"]) for r in csv.DictReader(fh)]
+    inside = {}
+    for org, repo in repos:
+        old = type_counts(os.path.join(args.before, org, repo, "manifest.csv"),
+                          inside, "before")
+        new = type_counts(os.path.join(args.run_dir, "unpacked", STATE, org, repo,
+                                       "manifest.csv"), inside, "after")
+        for sha, (t, n) in new.items():
+            if sha not in old:
+                inside[t]["new_distinct"] += 1
+    out = {}                                  # (type, step) -> Counter
+    for step in args.steps.split(","):
+        sdir = os.path.join(args.run_dir, step)
+        if not os.path.isdir(sdir):
+            continue
+        for org, repo in repos:
+            for side, root in (("out_before", os.path.join(args.before_out, step)),
+                               ("out_after", sdir)):
+                for rel in tree(os.path.join(root, org, repo)):
+                    out.setdefault((out_type(step, rel), step), Counter())[side] += 1
+            for f in ("left_out.csv",):                # handled, not written
+                lo = os.path.join(sdir, STATE, org, repo, f)
+                if os.path.isfile(lo):
+                    for r in read_manifest(lo):
+                        if r.get("ext") is not None:
+                            out.setdefault((safe_type(r["ext"]), step), Counter())
+            m = os.path.join(sdir, STATE, org, repo, "manifest.csv")
+            if os.path.isfile(m):
+                seen = set()
+                for r in read_manifest(m):
+                    if r.get("ext") is not None:
+                        out.setdefault((safe_type(r["ext"]), step), Counter())
+                    if "output" not in r:              # pkl_to_text: no column
+                        out.setdefault((out_type(step, r["path"] + ".txt"), step),
+                                       Counter())["no_manifest"] = 1
+                        continue
+                    for o in (r["output"] or "").split(";"):   # pdf: a; b
+                        if o and o not in seen:
+                            seen.add(o)
+                            out.setdefault((out_type(step, o), step),
+                                           Counter())["manifest"] += 1
+        d = os.path.join(args.out, "delta", step + ".csv")
+        if os.path.isfile(d):
+            for r in read_manifest(d):
+                out.setdefault((out_type(step, r["file"]), step),
+                               Counter())["delta_" + r["status"]] += 1
+    rows = []
+    for (t, step), c in out.items():
+        rows.append((t, step, c))
+    stepped = {t for t, _ in out}
+    for t in inside:
+        if t not in stepped:
+            rows.append((t, "", Counter()))
+    cols = ["out_before", "out_after", "manifest", "delta_new", "delta_gone"]
+    tot = defaultdict(Counter)
+    bad = 0
+    path = os.path.join(args.out, "by_extension_report.csv")
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["type", "route", "step", "inside_before", "inside_after",
+                    "inside_added", "inside_new_distinct"] + cols + ["check"])
+        for t, step, c in sorted(rows, key=lambda x: (
+                -(inside.get(x[0], Counter())["after_occurrences"]
+                  - inside.get(x[0], Counter())["before_occurrences"]), x[0], x[1])):
+            i = inside.get(t, Counter())
+            route = next((k[6:] for k in i if k.startswith("route:")), "")
+            if step:
+                ok = ((c["no_manifest"] or c["out_after"] == c["manifest"])
+                      and c["out_after"] - c["out_before"]
+                      == c["delta_new"] - c["delta_gone"])
+                check = "ok" if ok else "CHECK"
+                bad += not ok
+            else:
+                check = "not processed"
+            w.writerow([t, route, step, i["before_occurrences"], i["after_occurrences"],
+                        i["after_occurrences"] - i["before_occurrences"], i["new_distinct"]]
+                       + [c[k] for k in cols[:2]]
+                       + ["" if c["no_manifest"] else c["manifest"]]
+                       + [c[k] for k in cols[3:]] + [check])
+            for k in cols:
+                tot[step or "not processed"][k] += c[k]
+            tot[step or "not processed"]["added"] += \
+                i["after_occurrences"] - i["before_occurrences"]
+    print("%d repo(s) -> %s, %d type/step row(s) to CHECK" % (len(repos), path, bad))
+    print("  %-18s %8s %10s %10s %9s %9s %6s" % ("step", "added in", "out_before",
+                                                "out_after", "manifest", "new", "gone"))
+    for step, c in sorted(tot.items()):
+        print("  %-18s %8s %10s %10s %9s %9s %6s" % (
+            step, c["added"], c["out_before"], c["out_after"], c["manifest"],
+            c["delta_new"], c["delta_gone"]))
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=["find", "compare", "delta"])
+    ap.add_argument("action", choices=["find", "compare", "delta", "report"])
     ap.add_argument("--unpacked", help="archive_unpack.py --out")
     ap.add_argument("--nested-extensions",
                     help="types opened inside: comma list or a file")
@@ -333,10 +452,12 @@ def main():
     ap.add_argument("--steps", help="delta: step folders, comma list")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    if args.action == "delta":
+    if args.action in ("delta", "report"):
         if not (args.run_dir and args.before_out and args.steps):
-            ap.error("delta needs --run-dir, --before-out and --steps")
-        return delta(args)
+            ap.error("%s needs --run-dir, --before-out and --steps" % args.action)
+        if args.action == "report" and not args.before:
+            ap.error("report needs --before")
+        return delta(args) if args.action == "delta" else report(args)
     if not (args.unpacked and args.nested_extensions):
         ap.error("find / compare need --unpacked and --nested-extensions")
     nested = set(load_extensions(args.nested_extensions))

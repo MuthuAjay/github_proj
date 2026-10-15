@@ -29,6 +29,10 @@
 #   delta    group4_2_nested.py delta: per step, the files new / changed /
 #            gone against the snapshot -> <run>/nested/delta/<step>.csv +
 #            summary.csv = what is left to send (unchanged files are not)
+#   report   group4_2_nested.py report: per file type and step, files inside
+#            before / after, output files before / after on disk, the step's
+#            manifest, delta new / gone, check -> <run>/nested/
+#            by_extension_report.csv
 #
 #   cd /data/workarea/scripts
 #   STEPS="find backup unpack" LIMIT=1 ./run_group4_2_nested.sh   time test
@@ -75,7 +79,7 @@ say "start: steps [$STEPS], runs [$RUNS], max depth $MAX_DEPTH, nested types $NE
 
 for step in $STEPS; do
   case "$step" in
-  find|backup|unpack|compare|snapshot|reset|delta)
+  find|backup|unpack|compare|snapshot|reset|delta|report)
     for g in $RUNS; do
         un="$WORK/$g/unpacked" nd="$WORK/$g/nested"
         todo="$nd/todo.csv"
@@ -164,6 +168,12 @@ for step in $STEPS; do
                 --before-out "$nd/before_out" --steps "$(echo $STEP_DIRS | tr ' ' ,)" \
                 --out "$nd" || fail=1
             ;;
+        report)
+            say "[$g] === report"
+            "$PYTHON" "$HERE/group4_2_nested.py" report --run-dir "$WORK/$g" \
+                --before "$nd/before" --before-out "$nd/before_out" \
+                --steps "$(echo $STEP_DIRS | tr ' ' ,)" --out "$nd" || fail=1
+            ;;
         reset)
             if [ ! -f "$nd/before_out/.done" ]; then
                 say "[$g] ERROR: no snapshot - run the snapshot step before reset"; exit 1
@@ -198,7 +208,7 @@ for step in $STEPS; do
         --out "$WORK/group4_2/group4_1_paths/group4_1_inner_paths.csv" || fail=1
     STEPS=inner bash "$HERE/run_group4_1_R.sh" || fail=1
     ;;
-  *) say "unknown step '$step' (find backup unpack compare snapshot reset inner lists delta)"; exit 2 ;;
+  *) say "unknown step '$step' (find backup unpack compare snapshot reset inner lists delta report)"; exit 2 ;;
   esac
 done
 

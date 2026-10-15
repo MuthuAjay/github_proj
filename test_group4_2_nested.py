@@ -115,6 +115,18 @@ class Nested(unittest.TestCase):
         with open(os.path.join(self.nd, "before_out", "group2_text", "org1",
                                "repoA", "grows.txt")) as fh:
             self.assertEqual(fh.read(), "b\n")        # the snapshot kept the old
+        # report: the fake outputs have no manifest rows -> CHECK; a real
+        # step run (2_text) for the repo is checked in test_inner...
+        p = self.runner("report")
+        self.assertIn("type/step row(s) to CHECK", p.stdout)
+        rep = read_csv(os.path.join(self.nd, "by_extension_report.csv"))
+        r = {(x["type"], x["step"]): x for x in rep}
+        self.assertEqual((r[("_noext", "group2_text")]["out_before"],
+                          r[("_noext", "group2_text")]["out_after"],
+                          r[("_noext", "group2_text")]["delta_new"],
+                          r[("_noext", "group2_text")]["delta_gone"]), ("3", "3", "1", "1"))
+        self.assertEqual(r[("json", "")]["check"], "not processed")
+        self.assertEqual(r[("json", "")]["inside_added"], "3")
 
     def test_inner_gets_its_own_steps(self):
         # our STEPS (snapshot reset inner ...) must not reach the inner runner
@@ -127,6 +139,13 @@ class Nested(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.work, "group4_2", "group2_text", "_state", "org1", "repoA",
             "done.json")), p.stdout)
+        # after a real step run, report checks manifest = disk for it
+        p = self.runner("report")
+        rep = read_csv(os.path.join(self.nd, "by_extension_report.csv"))
+        mine = [x for x in rep if x["step"] == "group2_text"]
+        self.assertTrue(mine)
+        for x in mine:
+            self.assertEqual(x["out_after"], x["manifest"], x)
 
     def test_empty_todo_skipped(self):
         todo = os.path.join(self.nd, "todo.csv")
