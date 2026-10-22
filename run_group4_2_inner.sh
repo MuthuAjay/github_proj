@@ -10,6 +10,11 @@
 #   2_bin   group 2 binary (18, BINARY_EXTS)      group4_2_files.py   <run>/group2_binary
 #   3_pkl   group 3 pkl                           pkl_to_text.py      <run>/group3_pkl_text
 #   3_pdf   group 3 pdf                           pdf_page_merge.py   <run>/group3_pdf_merged
+#   479_text  group 4.7+4.9 text ($LIST_479_TEXT)   group4_2_text.py    <run>/group4_7_9_text
+#   479_bin   group 4.7+4.9 whole ($LIST_479_BIN)   group4_2_files.py   <run>/group4_7_9_binary
+#
+# The 479 steps are not in the default STEPS: run_group4_7_9_inner.sh runs
+# them, with the type lists resolved to the manifests' full type names.
 #
 # Text steps: one .txt per path, every line of every version once (as
 # group 1 inside the archives). 2_bin: each distinct content once, the
@@ -73,6 +78,8 @@ step_def() {
         2_bin)  echo "group4_2_files.py group2_binary $(py_list BINARY_EXTS)" ;;
         3_pkl)  echo "pkl_to_text.py group3_pkl_text pkl" ;;
         3_pdf)  echo "pdf_page_merge.py group3_pdf_merged pdf" ;;
+        479_text) echo "group4_2_text.py group4_7_9_text ${LIST_479_TEXT:-$HERE/group4_7_9_inner_text_extensions.txt}" ;;
+        479_bin)  echo "group4_2_files.py group4_7_9_binary ${LIST_479_BIN:-$HERE/group4_7_9_inner_binary_extensions.txt}" ;;
         *)      return 1 ;;
     esac
 }
