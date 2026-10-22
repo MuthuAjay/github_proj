@@ -40,6 +40,7 @@
 #   ONLY=verify ...    only the checks (after a finished copy)
 #   PARALLEL=16 ...    rsync processes at once, one per <org>/<repo> folder
 #                      (default 16)
+#   BINARY=0 ...       text only: no binary files, no binary tracking or checks
 #   VERIFY=0 ...       no hashing of the binary files
 #   CHECKSUM=1 ...     compare contents, not size + date (repairs too)
 #
@@ -56,6 +57,7 @@ DST_ROOT="${DST_ROOT:-/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1}"
 EXTS_FILE="${EXTS_FILE:-$HERE/group4_7_9_group1_extensions.txt}"
 CHECKS="${CHECKS:-$G1/copy_checks}"
 PARALLEL="${PARALLEL:-16}"
+BINARY="${BINARY:-1}"
 VERIFY="${VERIFY:-1}"
 CHECKSUM="${CHECKSUM:-0}"
 ONLY="${ONLY:-}"
@@ -77,12 +79,13 @@ case "$SEND" in
     *)     say "ERROR: set SEND=all (every line, today's included) or SEND=delta (minus today's lines)"; exit 1 ;;
 esac
 [ -d "$SRC/_state" ] || { say "ERROR: $SRC has no _state folder - is the run finished?"; exit 1; }
+[ "$BINARY" = 1 ] || { STORES=""; VERIFY=0; }
 for s in $STORES; do
-    [ -d "$NT/$s/files" ] || { say "ERROR: $NT/$s/files not found"; exit 1; }
+    [ -d "$NT/$s/files" ] || { say "ERROR: $NT/$s/files not found (BINARY=0 for text only)"; exit 1; }
 done
 [ -d "$(dirname "$DST_ROOT")" ] || { say "ERROR: $(dirname "$DST_ROOT") not found - is the share mounted? set DST_ROOT=..."; exit 1; }
 mkdir -p "$CHECKS/repo_lists"
-say "start: SEND=$SEND, $SRC -> $DST_TEXT; $NT/{${STORES// /,}}/files -> $DST_BIN/files (tracking -> $TRACK)"
+say "start: SEND=$SEND, $SRC -> $DST_TEXT; $([ "$BINARY" = 1 ] && echo "$NT/{binary,active}/files -> $DST_BIN/files" || echo "binary: not sent (BINARY=0)") (tracking -> $TRACK)"
 
 # ---------------------------------------------------------- name checks
 # the .txt files: <org>/<repo>/... only - not _state/, _logs/ or the run's
@@ -148,7 +151,8 @@ print("  %d .txt files in %d repo folders; %d renamed for case (case_renamed.csv
 PY
 
 if [ "$ONLY" != verify ]; then
-    mkdir -p "$DST_TEXT" "$DST_BIN/files" "$TRACK/group1_text" "$TRACK/group1_binary" \
+    mkdir -p "$DST_TEXT" "$TRACK/group1_text" \
+        $([ "$BINARY" = 1 ] && echo "$DST_BIN/files $TRACK/group1_binary") \
         || { say "ERROR: cannot create the folders under $DST_ROOT"; exit 1; }
     say "free on the share: $(df -h "$DST_TEXT" | awk 'NR==2 {print $4}')"
 
@@ -212,7 +216,7 @@ PY
         done
     done
     # the active manifest's stored_as -> files/... (relative to the share folder)
-    "$PYTHON" - "$TRACK/group1_binary/active/manifest.csv" <<'PY' || fail=1
+    [ "$BINARY" = 1 ] && { "$PYTHON" - "$TRACK/group1_binary/active/manifest.csv" <<'PY' || fail=1; }
 import csv, os, sys
 p = sys.argv[1]
 rows = list(csv.reader(open(p, newline="", encoding="utf-8")))
@@ -232,15 +236,18 @@ t_src=$(wc -l < "$CHECKS/data_files.txt")
 t_dst=$(find "$DST_TEXT" -type f ! -name '*.tmp.*' | wc -l)
 say "  .txt files    $t_src -> $t_dst  $([ "$t_src" = "$t_dst" ] && echo OK || echo DIFFERENT)"
 [ "$t_src" = "$t_dst" ] || fail=1
+if [ "$BINARY" = 1 ]; then
 b_src=$(cat <(cd "$NT/binary/files" && find . -type f ! -name '*.tmp.*') \
             <(cd "$NT/active/files" && find . -type f ! -name '*.tmp.*') | LC_ALL=C sort -u | wc -l)
 b_dst=$(find "$DST_BIN/files" -type f ! -name '*.tmp.*' | wc -l)
 say "  binary files  $b_src -> $b_dst  $([ "$b_src" = "$b_dst" ] && echo OK || echo DIFFERENT)"
 [ "$b_src" = "$b_dst" ] || fail=1
+fi
 # data is only <org>/<repo>/... in the text folder and files/ in the binary one
 stray=$(find "$DST_TEXT" -mindepth 1 -maxdepth 2 -type f | wc -l)
 for d in _state _logs; do [ -e "$DST_TEXT/$d" ] && stray=$((stray + 1)); done
-other=$(find "$DST_BIN" -type f ! -path "$DST_BIN/files/*" | wc -l)
+other=0
+[ -d "$DST_BIN" ] && other=$(find "$DST_BIN" -type f ! -path "$DST_BIN/files/*" | wc -l)
 say "  tracking files among the data: $((stray + other)) $([ $((stray + other)) = 0 ] && echo OK || echo PROBLEM)"
 [ $((stray + other)) = 0 ] || fail=1
 if [ "$CHECKSUM" = 1 ]; then
@@ -275,7 +282,7 @@ PY
 fi
 
 if [ "$fail" = 0 ]; then
-    say "ALL DONE - scan: $DST_TEXT and $DST_BIN   (not $TRACK)"
+    say "ALL DONE - scan: $DST_TEXT$([ "$BINARY" = 1 ] && echo " and $DST_BIN")   (not $TRACK)"
 else
     say "FINISHED WITH PROBLEMS - see the lines above. Run the same command again"
     say "  to retry; for BAD or differing files add CHECKSUM=1"
