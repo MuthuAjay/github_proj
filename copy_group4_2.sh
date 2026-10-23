@@ -46,10 +46,22 @@
 #   CHECKSUM=1 ...     compare contents too, not only size + date
 #
 # Settings: WORK (/data/workarea), DST_ROOT (the share's p1 folder), CHECKS
-# ($WORK/group4_2/copy_checks), CHECKS_DST (where name_problems.csv and
-# steps.txt go on the share, default $DST_ROOT/group4_2_tracking/copy_checks:
-# give another copy - e.g. other STEP_DIRS - its own, so it does not
-# overwrite the first copy's), PYTHON.
+# ($WORK/group4_2/copy_checks), TRACK_ROOT (where <run>_tracking goes,
+# default $DST_ROOT; set it when DST_ROOT is a folder the scanner reads as a
+# whole), CHECKS_DST (where name_problems.csv and steps.txt go on the share,
+# default $TRACK_ROOT/group4_2_tracking/copy_checks: give another copy - e.g.
+# other STEP_DIRS - its own, so it does not overwrite the first copy's),
+# EXTRAS (1 = also the 4.2 runs' nested/ files and the 4.1 path lists; 0 for
+# a copy of other steps), PYTHON.
+#
+# Group 4.7+4.9 inside the archives (run_group4_7_9_inner.sh), under
+# p1/group4_7_9 with its tracking in p1/group4_7_9_tracking:
+#
+#   sudo bash -c 'cd /data/workarea/scripts && P1=/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1 && \
+#       STEP_DIRS="group4_7_9_text group4_7_9_binary" EXTRAS=0 \
+#       DST_ROOT=$P1/group4_7_9 TRACK_ROOT=$P1/group4_7_9_tracking \
+#       CHECKS=/data/workarea/group4_7_9/inner/copy_checks \
+#       nohup ./copy_group4_2.sh > /data/workarea/group4_7_9/inner/copy.out 2>&1 &'
 # Exit code: 0 = copied and checked, 1 = a copy or check failed (see log).
 
 set -u
@@ -59,7 +71,9 @@ DST_ROOT="${DST_ROOT:-/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1}"
 RUNS="${RUNS:-group4_2 group4_2_R}"
 STEP_DIRS="${STEP_DIRS:-group1_text group4_5_R_text group4_5_text group2_text group2_binary group3_pkl_text group3_pdf_merged}"
 CHECKS="${CHECKS:-$WORK/group4_2/copy_checks}"
-CHECKS_DST="${CHECKS_DST:-$DST_ROOT/group4_2_tracking/copy_checks}"
+TRACK_ROOT="${TRACK_ROOT:-$DST_ROOT}"
+CHECKS_DST="${CHECKS_DST:-$TRACK_ROOT/group4_2_tracking/copy_checks}"
+EXTRAS="${EXTRAS:-1}"
 CHECKSUM="${CHECKSUM:-0}"
 ONLY="${ONLY:-}"
 PARALLEL="${PARALLEL:-16}"
@@ -80,7 +94,7 @@ data_files() {   # step folder -> its data files, relative, one per line
 
 [ -d "$(dirname "$DST_ROOT")" ] || { say "ERROR: $(dirname "$DST_ROOT") not found - is the share mounted? set DST_ROOT=..."; exit 1; }
 mkdir -p "$CHECKS"
-say "start: runs [$RUNS], steps [$STEP_DIRS] -> $DST_ROOT/<run>/<step>  (tracking -> $DST_ROOT/<run>_tracking)"
+say "start: runs [$RUNS], steps [$STEP_DIRS] -> $DST_ROOT/<run>/<step>  (tracking -> $TRACK_ROOT/<run>_tracking)"
 
 # ------------------------------------------------------ what there is to send
 # all data files as <run>/<step>/<org>/<repo>/..., relative to $WORK and to
@@ -163,7 +177,7 @@ if [ "$ONLY" != verify ]; then
 
     # -------------------------------------------------------------- tracking
     for g in $RUNS; do
-        trk="$DST_ROOT/${g}_tracking"
+        trk="$TRACK_ROOT/${g}_tracking"
         say "=== tracking $g -> $trk (not for scanning)"
         for d in $STEP_DIRS; do
             src="$WORK/$g/$d"
@@ -176,15 +190,15 @@ if [ "$ONLY" != verify ]; then
                 -exec cp -p {} "$trk/$d/" \; || fail=1
         done
         nd="$WORK/$g/nested"
-        if [ -d "$nd" ]; then
+        if [ "$EXTRAS" = 1 ] && [ -d "$nd" ]; then
             mkdir -p "$trk/nested"
             find "$nd" -mindepth 1 -maxdepth 1 -type f -exec cp -p {} "$trk/nested/" \; || fail=1
             [ -d "$nd/delta" ] && { rsync "${OPTS[@]}" "$nd/delta/" "$trk/nested/delta/" || fail=1; }
         fi
     done
     lists="$WORK/group4_2/group4_1_paths"
-    if [ -d "$lists" ]; then
-        rsync "${OPTS[@]}" --exclude "*.tmp.*" "$lists/" "$DST_ROOT/group4_2_tracking/group4_1_paths/" || fail=1
+    if [ "$EXTRAS" = 1 ] && [ -d "$lists" ]; then
+        rsync "${OPTS[@]}" --exclude "*.tmp.*" "$lists/" "$TRACK_ROOT/group4_2_tracking/group4_1_paths/" || fail=1
     fi
 fi
 
@@ -206,13 +220,13 @@ if [ "$CHECKSUM" = 1 ]; then
     say "  content check: $diff file(s) differ"
     [ "$diff" = 0 ] || fail=1
 fi
-if [ "$ONLY" != verify ] && [ -d "$DST_ROOT/group4_2_tracking" ]; then
+if [ "$ONLY" != verify ] && [ -d "$TRACK_ROOT" ]; then
     mkdir -p "$CHECKS_DST"
     cp -p "$CHECKS/name_problems.csv" "$CHECKS/steps.txt" "$CHECKS_DST/" || fail=1
 fi
 
 if [ "$fail" = 0 ]; then
-    say "ALL DONE - data: $DST_ROOT/<run>/<step>, tracking: $DST_ROOT/<run>_tracking"
+    say "ALL DONE - data: $DST_ROOT/<run>/<step>, tracking: $TRACK_ROOT/<run>_tracking"
 else
     say "FINISHED WITH PROBLEMS - see above. If the counts differ, check"
     say "  $CHECKS/name_problems.csv (names the share cannot keep apart)"
