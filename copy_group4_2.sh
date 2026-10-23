@@ -46,7 +46,10 @@
 #   CHECKSUM=1 ...     compare contents too, not only size + date
 #
 # Settings: WORK (/data/workarea), DST_ROOT (the share's p1 folder), CHECKS
-# ($WORK/group4_2/copy_checks), PYTHON.
+# ($WORK/group4_2/copy_checks), CHECKS_DST (where name_problems.csv and
+# steps.txt go on the share, default $DST_ROOT/group4_2_tracking/copy_checks:
+# give another copy - e.g. other STEP_DIRS - its own, so it does not
+# overwrite the first copy's), PYTHON.
 # Exit code: 0 = copied and checked, 1 = a copy or check failed (see log).
 
 set -u
@@ -56,6 +59,7 @@ DST_ROOT="${DST_ROOT:-/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1}"
 RUNS="${RUNS:-group4_2 group4_2_R}"
 STEP_DIRS="${STEP_DIRS:-group1_text group4_5_R_text group4_5_text group2_text group2_binary group3_pkl_text group3_pdf_merged}"
 CHECKS="${CHECKS:-$WORK/group4_2/copy_checks}"
+CHECKS_DST="${CHECKS_DST:-$DST_ROOT/group4_2_tracking/copy_checks}"
 CHECKSUM="${CHECKSUM:-0}"
 ONLY="${ONLY:-}"
 PARALLEL="${PARALLEL:-16}"
@@ -203,8 +207,8 @@ if [ "$CHECKSUM" = 1 ]; then
     [ "$diff" = 0 ] || fail=1
 fi
 if [ "$ONLY" != verify ] && [ -d "$DST_ROOT/group4_2_tracking" ]; then
-    mkdir -p "$DST_ROOT/group4_2_tracking/copy_checks"
-    cp -p "$CHECKS/name_problems.csv" "$CHECKS/steps.txt" "$DST_ROOT/group4_2_tracking/copy_checks/" || fail=1
+    mkdir -p "$CHECKS_DST"
+    cp -p "$CHECKS/name_problems.csv" "$CHECKS/steps.txt" "$CHECKS_DST/" || fail=1
 fi
 
 if [ "$fail" = 0 ]; then
