@@ -15,8 +15,9 @@
 #   group3_pdf_merged  group 3 PDFs, distinct pages, one PDF per path
 #
 #   data      $WORK/<run>/<step>/<org>/<repo>/...  -> $DST_ROOT/<run>/<step>/
-#             (nothing from _state/, _logs/, stats/, stats_combined/ or the
-#             step folder's own files: summary.csv, settings.json)
+#             (nothing from _state/, _logs/, stats/, stats_combined/, _tmp/,
+#             _removed_duplicates/ or the step folder's own files:
+#             summary.csv, settings.json)
 #   tracking  each step's _state/ (manifest.csv, left_out.csv = vendored /
 #             macOS / DocFX paths left out, done.json), stats/,
 #             stats_combined/, summary.csv; <run>/nested/ (todo, compare,
@@ -62,6 +63,9 @@
 #       DST_ROOT=$P1/group4_7_9 TRACK_ROOT=$P1/group4_7_9_tracking \
 #       CHECKS=/data/workarea/group4_7_9/inner/copy_checks \
 #       nohup ./copy_group4_2.sh > /data/workarea/group4_7_9/inner/copy.out 2>&1 &'
+#   and the group 3 / tabular / container types inside the archives:
+#       STEP_DIRS="group4_7_9_group3_text group4_7_9_tabular_binary group4_7_9_bi_data"
+#       with CHECKS and CHECKS_DST of their own (see copy_group4_7_9_rest.sh)
 # Exit code: 0 = copied and checked, 1 = a copy or check failed (see log).
 
 set -u
@@ -87,7 +91,8 @@ fail=0
 
 data_files() {   # step folder -> its data files, relative, one per line
     ( cd "$1" && find . -mindepth 1 -maxdepth 1 -type d \
-        ! -name _state ! -name _logs ! -name stats ! -name stats_combined -print0 \
+        ! -name _state ! -name _logs ! -name stats ! -name stats_combined \
+        ! -name _tmp ! -name _removed_duplicates -print0 \
         | xargs -0 -r -I{} find {} -type f ! -name '*.tmp.*' -print \
         | sed 's#^\./##' )
 }

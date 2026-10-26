@@ -653,6 +653,7 @@ def run_repo(cfg, org, repo):
 def combine(out):
     state = os.path.join(out, STATE)
     tot, notes, repos, types, per_repo = Counter(), Counter(), 0, {}, []
+    with_types = 0                      # repos that had one of the types
     for org in sorted(os.listdir(state)) if os.path.isdir(state) else []:
         for repo in sorted(os.listdir(os.path.join(state, org))):
             d = read_json(os.path.join(state, org, repo, "done.json"))
@@ -663,6 +664,7 @@ def combine(out):
             if d["status"] != "ok":
                 continue
             notes.update(d["notes"])
+            with_types += d.get("paths", 0) > 0
             for k in ("paths", "data_written", "lines", "images", "data_files",
                       "left_out_paths"):
                 tot[k] += d.get(k, 0)
@@ -707,7 +709,7 @@ def combine(out):
                     "data_files", "bytes_read"])
         for e, t in sorted(types.items(), key=lambda kv: -kv[1][0]):
             w.writerow([e, t[6]] + t[:6])
-        w.writerow(["total", repos, tot["paths"], tot["data_written"], tot["lines"],
+        w.writerow(["total", with_types, tot["paths"], tot["data_written"], tot["lines"],
                     tot["images"], tot["data_files"], sum(t[5] for t in types.values())])
     return repos, tot
 
