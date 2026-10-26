@@ -37,8 +37,16 @@ name only breaks ties); read_as in the manifest says which way was taken:
 
 A format whose library is not installed, or a file the library can not
 read, gets the raw strings scan and says so (e.g. parquet_no_pyarrow_raw_scan,
-parquet_error_raw_scan): nothing readable is dropped, and after installing
-the library run again with --redo. --check-libs shows what is installed.
+parquet_error_raw_scan); after installing the library run again with
+--redo. --check-libs shows what is installed.
+
+--strict-raw: the raw strings scan keeps only runs that look like text -
+6+ characters with a word, or a number with separators (5+ digits) - as
+number buffers in pickles / models give millions of random 4-character
+lines (pkl_to_text.raw_keep). Text read from the format itself (opcode
+strings, table values, R strings, numpy text) is never filtered. Off by
+default: the 26 Oct group 4.7+4.9 output was made without it (user: kept
+as it is).
 
 --active-root (repo level): today's file at a path that has stored versions
 is read too. With --state (the extension_versions.py output the extraction
@@ -90,6 +98,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from types import SimpleNamespace
 
+import pkl_to_text
 from extension_versions import read_batch, read_json, read_rows
 from file_delta import csv_text, write_atomic
 from group4_2_text import LEFT_OUT_HEADER, left_out_reason
@@ -613,6 +622,7 @@ def rows_by_path(manifest, org, repo, exts, inner):
 def run_repo(cfg, org, repo):
     global MAX_MEMBER
     MAX_MEMBER = cfg.max_bytes or MAX_MEMBER
+    pkl_to_text.RAW_KEEP = pkl_to_text.raw_keep if cfg.strict_raw else None
     t0 = time.time()
     sd_in = os.path.join(cfg.src, STATE, org, repo)
     sd = os.path.join(cfg.out, STATE, org, repo)
@@ -815,6 +825,8 @@ def main():
                     help="--in is archive_unpack.py output: files inside archives")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--redo", action="store_true", help="redo repos already done")
+    ap.add_argument("--strict-raw", action="store_true",
+                    help="keep only raw-scan runs that look like text")
     ap.add_argument("--combine-only", action="store_true")
     ap.add_argument("--check-libs", action="store_true",
                     help="show which optional libraries are installed")
@@ -864,11 +876,12 @@ def main():
 
     cfg = SimpleNamespace(src=args.src, out=args.out, active_root=args.active_root,
                           state=args.state, max_bytes=args.max_bytes,
-                          inner=args.archive_inner, exts=exts)
-    log.info("START %s repos=%d workers=%d in=%s active=%s state=%s types=%s libs=%s",
-             name, len(todo), args.workers, args.src, args.active_root or "-",
+                          inner=args.archive_inner, exts=exts, strict_raw=args.strict_raw)
+    log.info("START %s repos=%d workers=%d in=%s active=%s state=%s types=%s libs=%s "
+             "raw=%s", name, len(todo), args.workers, args.src, args.active_root or "-",
              args.state or "-", ",".join(sorted(exts)),
-             ",".join(m for m in OPTIONAL if lib(m)) or "none")
+             ",".join(m for m in OPTIONAL if lib(m)) or "none",
+             "text-like only" if args.strict_raw else "all")
     print("%d repo(s) to do" % len(todo), flush=True)
     t0, st = time.time(), Counter()
     rpath = os.path.join(args.out, LOGS, name + "_repos.csv")

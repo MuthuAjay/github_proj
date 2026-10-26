@@ -64,6 +64,7 @@ import re
 import shutil
 import sys
 import time
+import unicodedata
 import zlib
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -82,6 +83,15 @@ BYTES_OPS = {"SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8"}
 RAW_TEXT = re.compile(rb"(?:[\x20-\x7e]|[\xc2-\xf4][\x80-\xbf]{1,3}){4,}")
 UTF32 = re.compile(rb"(?:[\x20-\x7e]\x00\x00\x00){4,}")    # numpy '<U' text
 UTF16 = re.compile(rb"(?:[\x20-\x7e]\x00){4,}")
+# --strict-raw: what the raw scan finds is kept only when it looks like text
+# - random bytes (numpy number buffers) give endless 4-character runs. Text
+# from the opcodes is never filtered. Off by default (output as delivered).
+# a word: 4+ Latin letters in natural case (london London LONDON José), or
+# 3+ letters of one other script - random bytes mix case (hgO, LhSB) and
+# scripts (2-byte UTF-8 noise)
+LATIN_WORD = re.compile(r"[A-ZÀ-Þ]?[a-zß-ÿ]{3,}|[A-ZÀ-Þ]{4,}")
+NUMBERISH = re.compile(r"[\d \-/().+]{6,}")        # 123-45-6789, +1 555 0100
+RAW_KEEP = None                                    # set to raw_keep to filter
 MANIFEST_HEADER = ["path", "versions", "versions_read", "active_included",
                    "read_as", "lines", "bytes_read", "note"]
 log = logging.getLogger("pkl_to_text")
@@ -116,6 +126,31 @@ def unpack(data):
     return data, "pickle"
 
 
+def script_word(s):
+    script, n = None, 0                    # 3 letters in a row, one script
+    for c in s:
+        sc = (unicodedata.name(c, "?").split(" ")[0]
+              if c.isalpha() and ord(c) > 0x24f else None)
+        n = n + 1 if sc and sc == script else (1 if sc else 0)
+        script = sc
+        if n >= 3:
+            return True
+    return False
+
+
+def raw_keep(s):
+    """A raw-scan run worth keeping: 6+ characters, and a word with 60%+
+    letters / digits / spaces, or a number with separators (5+ digits).
+    Shorter runs only with 3 letters of one non-Latin script (CJK names)."""
+    if len(s) >= 6 and NUMBERISH.fullmatch(s) and sum(c.isdigit() for c in s) >= 5:
+        return True
+    if sum(c.isalnum() or c == " " for c in s) < 0.6 * len(s):
+        return False
+    if len(s) >= 6 and LATIN_WORD.search(s):
+        return True
+    return script_word(s)
+
+
 def scan_bytes(b):
     """Readable text in a block of bytes: ASCII/UTF-8 runs, plus UTF-32 and
     UTF-16 little-endian runs (numpy and Windows text)."""
@@ -123,7 +158,7 @@ def scan_bytes(b):
     out += [m.decode("utf-32-le", "replace") for m in UTF32.findall(b)]
     out += [m.decode("utf-16-le", "replace") for m in UTF16.findall(b)
             if not UTF32.fullmatch(m + b"\x00\x00")]
-    return out
+    return [s for s in out if RAW_KEEP(s)] if RAW_KEEP else out
 
 
 def pickle_text(data):
@@ -335,9 +370,14 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--redo", action="store_true",
                     help="redo repos already done")
+    ap.add_argument("--strict-raw", action="store_true",
+                    help="keep only raw-scan runs that look like text (6+ "
+                         "characters with a word, or a number with separators)")
     ap.add_argument("--combine-only", action="store_true")
     ap.add_argument("--name", help="log name (default: batch name or 'run')")
     args = ap.parse_args()
+    global RAW_KEEP
+    RAW_KEEP = raw_keep if args.strict_raw else None
 
     if args.combine_only:
         repos, tot = combine(args.out)
