@@ -114,12 +114,47 @@ def row_lines(rows):
             yield line
 
 
+def patch_pbixray():
+    """pbixray turns Date columns into datetimes; one far out-of-range day
+    count makes pandas raise (FloatingPointError: overflow) and the whole
+    table is lost. Such a column is converted here instead: dates in range
+    as text, the rest kept as the raw day number."""
+    try:
+        from pbixray import vertipaq_decoder as vd
+    except Exception:                                # noqa: BLE001
+        return
+    orig = vd.VertiPaqDecoder._handle_special_cases
+    if getattr(orig, "bi_patched", False):
+        return
+
+    def safe(self, column_data, semantic_type, column_name=None):
+        try:
+            return orig(self, column_data, semantic_type, column_name)
+        except (FloatingPointError, OverflowError, ValueError):
+            if semantic_type != "Date":
+                raise
+            import pandas as pd
+            origin, out = datetime.datetime(1899, 12, 30), []
+            for d in pd.to_numeric(column_data, errors="coerce").tolist():
+                if d != d:                           # NaN
+                    out.append(None)
+                    continue
+                try:
+                    out.append(str(origin + datetime.timedelta(days=float(d))))
+                except (OverflowError, ValueError):
+                    out.append(repr(d))
+            return pd.Series(out, index=column_data.index, dtype=object)
+    safe.bi_patched = True
+    vd.VertiPaqDecoder._handle_special_cases = safe
+
+
 def pbix_lines(fp, notes, tmp):
     """Every table of a pbix data model, or nothing (noted)."""
     pr = lib("pbixray")
     if not pr:
         notes["no_pbixray"] += 1
         return
+    patch_pbixray()
     try:
         model = pr.PBIXRay(fp, on_disk=True, temp_dir=tmp)
     except Exception as exc:                         # noqa: BLE001
