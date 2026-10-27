@@ -78,6 +78,37 @@ None of these types is inside the 4.2_R packages.
   - 27 Git LFS pointers.
 - **Open: 460 `.dbc` files** turned out to be plain notebook source code (Python / SQL), not Databricks archives. Most are in `building-blocks-ansible-playbooks/fabric-il-databricks-storage-control` (Mount_ADLS, Create_ADLSContainer…). They hold no data, but storage-mount notebooks often contain account names or keys. They are small (under 2 KB each). **Should we send them as text?**
 
+## 4. Mixed types → text where readable, whole file otherwise (7 types)
+
+*Types:* deploy, tmp, out, dump, db_backup, pbl-old, simflows.
+
+*Why these needed their own process:* for these types the file name doesn't say what is inside. The same type holds both text files and binary files:
+
+- `.deploy` is a ClickOnce publishing suffix added to any file. Of the 5,129 `.deploy` paths, 4,800+ are XML schemas, stylesheets, XML and config (text), and about 190 are programs (`.dll`, `.exe`).
+- `.dump`, `.out` and `.tmp` can be text logs, SQL / LDAP dumps or raw binary data, depending on the tool that wrote them.
+
+A single route per type would have handled part of each type badly. So **each file path was routed by its content**, not by its type.
+
+*How each path was routed:* every version of the path in the git history, plus today's file, was checked.
+
+1. **All versions are readable text → text route** (as in Group 1). One `.txt` per path holds every line from every version plus today's, each line once.
+   - **Why text:** the scanner reads the text directly. The same lines repeat across versions, so sending them once keeps the volume small. The `.txt` mirrors the repo path, so a finding points straight to the file.
+2. **Any version is binary → whole-file route** (as in Group 2). The file itself is sent, each distinct content once, named by its git blob id.
+   - **Why whole:** a binary file can't be cut into meaningful lines; taking the readable strings out would lose structure and mix in noise. Sent whole, the scanner can open it with its own readers. A path goes whole if *any* version is binary, so all of its versions travel the same way.
+3. **Left out:**
+   - **`.dll.deploy` / `.exe.deploy` (153 paths):** these are compiled application programs, not data, so per our decision they are not sent.
+   - **21 paths with no text in any version:** there is nothing to scan.
+
+| | repo level | inside 4.2 |
+|---|---:|---:|
+| Paths read as text → sent as `.txt` | 4,923 | 12 (dump 9, deploy 2, tmp 1) |
+| Binary paths → sent whole | 175 paths = 160 files, 4.1 GB | 6 files |
+| Left out: dll / exe programs | 153 paths | (included in the 17 not sent) |
+| Left out: no text | 21 | 2 |
+
+- Binary paths by type: deploy 90, dump 41, tmp 31, out 11, pbl-old 2. `db_backup` and `simflows` went entirely as text.
+- None of these types is inside the 4.2_R packages.
+
 ## Correction to the 23 Oct mail
 
 The 23 Oct mail listed files named `creds` and `cred-dontuse` among the files sent from inside the 4.2 archives. **They were not sent.** Their type names contain characters that our type lookup dropped, so they were missed. Since credentials are now out of scope, we propose to leave them out along with the other credential and key files.
@@ -89,7 +120,8 @@ The 23 Oct mail listed files named `creds` and `cred-dontuse` among the files se
 | Serialized data | `diff_analysis/p1/group4_7_9/group3_text/` | `diff_analysis/p1/group4_7_9_tracking/group3_text/` |
 | Table data | `diff_analysis/p1/group4_7_9/tabular_binary/files/` | `diff_analysis/p1/group4_7_9_tracking/tabular_{binary,active,counts}/` |
 | Containers | `diff_analysis/p1/group4_7_9/bi_data/data_text/` and `…/bi_data/files/` | `diff_analysis/p1/group4_7_9_tracking/bi_data/` |
-| Inside 4.2 archives | `diff_analysis/p1/group4_7_9/group4_2/group4_7_9_{group3_text,tabular_binary,bi_data}/` | `diff_analysis/p1/group4_7_9_tracking/group4_2_tracking/` |
+| Mixed types | `diff_analysis/p1/group4_7_9/mixed_text/` and `…/mixed_binary/files/` | `diff_analysis/p1/group4_7_9_tracking/mixed_{text,binary}/` |
+| Inside 4.2 archives | `diff_analysis/p1/group4_7_9/group4_2/group4_7_9_{group3_text,tabular_binary,bi_data,mixed_text,mixed_binary}/` | `diff_analysis/p1/group4_7_9_tracking/group4_2_tracking/` |
 
 The text folders mirror `<org>/<repo>/<path>.txt`. Whole files and images are named by their content hash, and the manifests in the tracking folders map each one back to its repo, path and versions.
 
@@ -97,9 +129,8 @@ The text folders mirror `<org>/<repo>/<path>.txt`. Whole files and images are na
 
 Numbers per type: `group4_7_9_delivery_stats_2026-10-27.xlsx` (attached).
 
-## Still open in 4.7+4.9 (17 types)
+## Still open in 4.7+4.9 (10 types)
 
-- **Sample first** (7): deploy, tmp, out, dump, db_backup, pbl-old, simflows. The ClickOnce `deploy` files (5,129) and the database / LDAP `dump` files matter most.
 - **Proposed exclude** (9): arff, xcuserstate, test-db, train, sublime-workspace, ftz, rsuser, 2ph, mmdb. Also **list paths only** for `jar1`. Please confirm.
 - **The plain-text `.dbc` notebooks** (above): send as text or not?
 
