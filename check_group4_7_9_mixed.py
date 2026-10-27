@@ -12,6 +12,11 @@ a.dll.v2.deploy -> dll, a.tmp -> -) and prints, at repo level and inside 4.2:
      dll / exe names whose content is not a program
 
     python3 check_group4_7_9_mixed.py [--g /data/workarea/group4_7_9/mixed]
+
+--move-programs (repo level): program files found by content (MZ / ELF) among
+the whole files to send are moved to <store>/_not_sent/files/ like the dll /
+exe.deploy ones, and their paths are added to not_text_left_out.csv. Run it
+before the copy.
 """
 import argparse
 import csv
@@ -81,6 +86,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--g", default="/data/workarea/group4_7_9/mixed")
     ap.add_argument("--inner", default="/data/workarea/group4_2")
+    ap.add_argument("--move-programs", action="store_true")
     a = ap.parse_args()
     g, warn = a.g, []
 
@@ -110,10 +116,46 @@ def main():
         for d, _, fs in os.walk(os.path.join(nt, store, "_not_sent", "files")):
             notsent += [os.path.join(d, f) for f in fs]
     c = sigs("repo level, whole files to send", sent)
-    if c["program (MZ)"] or c["elf program"]:
-        warn.append("%d program file(s) among the whole files to send"
+    if (c["program (MZ)"] or c["elf program"]) and not a.move_programs:
+        warn.append("%d program file(s) among the whole files to send (--move-programs moves them)"
                     % (c["program (MZ)"] + c["elf program"]))
     sigs("repo level, moved to _not_sent", notsent)
+
+    # whole files to send per type (a file counts for the type of its first path)
+    by_blob = defaultdict(list)
+    for store in ("binary", "active"):
+        m = os.path.join(nt, store, "manifest.csv")
+        for r in csv.DictReader(open(m, **KW)) if os.path.isfile(m) else []:
+            if r.get("stored_as"):
+                by_blob[os.path.basename(r["stored_as"])].append(r)
+    per = Counter(split(by_blob[os.path.basename(p)][0]["path"])[0] if by_blob.get(os.path.basename(p)) else "?"
+                  for p in sent)
+    print("\n## repo level, whole files to send per type")
+    for t, n in per.most_common():
+        print("  %-10s %d" % (t, n))
+
+    progs = [p for p in sent if sig(p) in ("program (MZ)", "elf program")]
+    if progs:
+        print("\n## repo level, programs among the whole files to send%s"
+              % (" -> moved to _not_sent" if a.move_programs else " (--move-programs moves them)"))
+        rows = []
+        for p in progs:
+            store = "active" if os.sep + "active" + os.sep + "files" + os.sep in p else "binary"
+            rel = os.path.relpath(p, os.path.join(nt, store, "files"))
+            paths = sorted({(r["org"], r["repo"], r["path"]) for r in by_blob.get(os.path.basename(p), [])})
+            for o, rp, pa in paths or [("?", "?", "?")]:
+                print("  %-12s %-14s %s/%s %s" % (sig(p), os.path.basename(p)[:14], o, rp, pa))
+                rows.append([o, rp, pa, split(pa)[0], "binary", "", "program binary (%s, by content: %s), not sent" % (sig(p), rel)])
+            if a.move_programs:
+                dest = os.path.join(nt, store, "_not_sent", "files", rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                os.replace(p, dest)
+        if a.move_programs:
+            lo = os.path.join(g, "not_text_left_out.csv")
+            with open(lo, "a", **KW) as fh:
+                csv.writer(fh).writerows(rows)
+            sent = [p for p in sent if p not in progs]
+            print("  moved %d file(s); %d whole files left to send; paths added to %s" % (len(progs), len(sent), lo))
 
     # left-out dll / exe paths: is every stored version really a program?
     left_sig = Counter()
