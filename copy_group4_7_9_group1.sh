@@ -44,14 +44,19 @@
 #   VERIFY=0 ...       no hashing of the binary files
 #   CHECKSUM=1 ...     compare contents, not size + date (repairs too)
 #
-# Settings: G1 (/data/workarea/group4_7_9/group1), DST_ROOT (the share's p1
-# folder), EXTS_FILE, CHECKS ($G1/copy_checks), PYTHON.
+# Settings: G1 (/data/workarea/group4_7_9/group1), NAME (group1: the share
+# folders <NAME>_text, <NAME>_binary and their tracking), DST_ROOT (the
+# share's p1 folder), EXTS_FILE, CHECKS ($G1/copy_checks), PYTHON.
+# The mixed types (run_group4_7_9_mixed.sh) use the same script:
+#   G1=/data/workarea/group4_7_9/mixed NAME=mixed SEND=all
+#   EXTS_FILE=/data/workarea/group4_7_9/mixed/extensions.txt
 # Exit code: 0 = copied and checked, 1 = a copy or check failed (see log).
 
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 G1="${G1:-/data/workarea/group4_7_9/group1}"
+NAME="${NAME:-group1}"            # share folders <NAME>_text, <NAME>_binary
 SEND="${SEND:-}"
 DST_ROOT="${DST_ROOT:-/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1}"
 EXTS_FILE="${EXTS_FILE:-$HERE/group4_7_9_group1_extensions.txt}"
@@ -64,8 +69,8 @@ ONLY="${ONLY:-}"
 PYTHON="${PYTHON:-python3}"
 NT="$G1/not_text"
 STORES="binary active"
-DST_TEXT="$DST_ROOT/group4_7_9/group1_text"
-DST_BIN="$DST_ROOT/group4_7_9/group1_binary"
+DST_TEXT="$DST_ROOT/group4_7_9/${NAME}_text"
+DST_BIN="$DST_ROOT/group4_7_9/${NAME}_binary"
 TRACK="$DST_ROOT/group4_7_9_tracking"
 OPTS=(-rt --no-perms --no-owner --no-group --partial)
 [ "$CHECKSUM" = 1 ] && OPTS+=(--checksum)
@@ -151,8 +156,8 @@ print("  %d .txt files in %d repo folders; %d renamed for case (case_renamed.csv
 PY
 
 if [ "$ONLY" != verify ]; then
-    mkdir -p "$DST_TEXT" "$TRACK/group1_text" \
-        $([ "$BINARY" = 1 ] && echo "$DST_BIN/files $TRACK/group1_binary") \
+    mkdir -p "$DST_TEXT" "$TRACK/${NAME}_text" \
+        $([ "$BINARY" = 1 ] && echo "$DST_BIN/files $TRACK/${NAME}_binary") \
         || { say "ERROR: cannot create the folders under $DST_ROOT"; exit 1; }
     say "free on the share: $(df -h "$DST_TEXT" | awk 'NR==2 {print $4}')"
 
@@ -202,21 +207,22 @@ PY
 
     # ----------------------------------------------------------- tracking
     say "=== tracking -> $TRACK (not for scanning)"
-    rsync "${OPTS[@]}" "$SRC/_state/" "$TRACK/group1_text/_state/" || fail=1
+    rsync "${OPTS[@]}" "$SRC/_state/" "$TRACK/${NAME}_text/_state/" || fail=1
     for f in "$G1/text/skipped_vendored_all.csv" "$EXTS_FILE" "$G1/not_text_paths.csv" \
+             "$G1/not_text_left_out.csv" \
              "$CHECKS/case_renamed.csv" "$CHECKS/name_problems.csv"; do
-        if [ -f "$f" ]; then cp "$f" "$TRACK/group1_text/" || fail=1
+        if [ -f "$f" ]; then cp "$f" "$TRACK/${NAME}_text/" || fail=1
         else say "  (not found, skipped: $f)"; fi
     done
-    echo "SEND=$SEND: $SRC" > "$TRACK/group1_text/sent_from.txt"
+    echo "SEND=$SEND: $SRC" > "$TRACK/${NAME}_text/sent_from.txt"
     for s in $STORES; do
-        mkdir -p "$TRACK/group1_binary/$s"
+        mkdir -p "$TRACK/${NAME}_binary/$s"
         for f in manifest.csv by_extension.csv summary.md; do
-            [ -f "$NT/$s/$f" ] && { cp "$NT/$s/$f" "$TRACK/group1_binary/$s/" || fail=1; }
+            [ -f "$NT/$s/$f" ] && { cp "$NT/$s/$f" "$TRACK/${NAME}_binary/$s/" || fail=1; }
         done
     done
     # the active manifest's stored_as -> files/... (relative to the share folder)
-    [ "$BINARY" = 1 ] && { "$PYTHON" - "$TRACK/group1_binary/active/manifest.csv" <<'PY' || fail=1; }
+    [ "$BINARY" = 1 ] && { "$PYTHON" - "$TRACK/${NAME}_binary/active/manifest.csv" <<'PY' || fail=1; }
 import csv, os, sys
 p = sys.argv[1]
 rows = list(csv.reader(open(p, newline="", encoding="utf-8")))

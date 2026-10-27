@@ -16,7 +16,7 @@
 #
 #   data      $WORK/<run>/<step>/<org>/<repo>/...  -> $DST_ROOT/<run>/<step>/
 #             (nothing from _state/, _logs/, stats/, stats_combined/, _tmp/,
-#             _removed_duplicates/ or the step folder's own files:
+#             _removed_duplicates/, _not_sent/ or the step folder's own files:
 #             summary.csv, settings.json)
 #   tracking  each step's _state/ (manifest.csv, left_out.csv = vendored /
 #             macOS / DocFX paths left out, done.json), stats/,
@@ -92,7 +92,7 @@ fail=0
 data_files() {   # step folder -> its data files, relative, one per line
     ( cd "$1" && find . -mindepth 1 -maxdepth 1 -type d \
         ! -name _state ! -name _logs ! -name stats ! -name stats_combined \
-        ! -name _tmp ! -name _removed_duplicates -print0 \
+        ! -name _tmp ! -name _removed_duplicates ! -name _not_sent -print0 \
         | xargs -0 -r -I{} find {} -type f ! -name '*.tmp.*' -print \
         | sed 's#^\./##' )
 }
