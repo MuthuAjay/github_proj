@@ -209,45 +209,26 @@ if [ "$ONLY" != verify ]; then
     say "free on the share: $(df -h "$DATA" | awk 'NR==2 {print $4}')"
 fi
 
-for p in $PARTS; do
-    case "$p" in
-    # --------------------------------------------------------- group3_text
-    group3_text)
-        say "=== group3_text: $G3/text -> $DATA/group3_text"
-        copy_tree group3_text "$G3/text" "$DATA/group3_text"
-        if [ "$ONLY" != verify ]; then
-            mkdir -p "$TRACK/group3_text"
-            rsync "${OPTS[@]}" "$G3/text/_state/" "$TRACK/group3_text/_state/" || fail=1
-            top_files "$G3/text" "$TRACK/group3_text"
-            cp -p "$CHECKS/group3_text/name_problems.csv" "$TRACK/group3_text/" || fail=1
-        fi
-        say "=== check group3_text"
-        count_check ".txt files" "$(wc -l < "$CHECKS/group3_text/data_files.txt")" "$DATA/group3_text"
-        stray_check "$DATA/group3_text"
-        ;;
-    # ------------------------------------------------------ tabular_binary
-    tabular_binary)
-        say "=== tabular_binary: $TAB/{tabular_binary,tabular_active}/files -> $DATA/tabular_binary/files"
-        both=$(LC_ALL=C comm -12 \
-            <(cd "$TAB/tabular_binary/files" && find . -type f ! -name '*.tmp.*' | LC_ALL=C sort) \
-            <(cd "$TAB/tabular_active/files" && find . -type f ! -name '*.tmp.*' | LC_ALL=C sort) | wc -l)
-        say "  names in both stores: $both $([ "$both" = 0 ] && echo OK || echo '(same content, copied once)')"
-        if [ "$ONLY" != verify ]; then
-            mkdir -p "$DATA/tabular_binary/files" "$TRACK/tabular_binary" "$TRACK/tabular_active" "$TRACK/tabular_counts" || fail=1
-            for s in tabular_binary tabular_active; do
-                say "  $s: $(find "$TAB/$s/files" -type f ! -name '*.tmp.*' | wc -l) file(s), $(du -sh "$TAB/$s/files" | cut -f1)"
-                rsync "${OPTS[@]}" "$TAB/$s/files/" "$DATA/tabular_binary/files/" || fail=1
-            done
-            for f in tabular_binary/manifest.csv tabular_binary/by_extension.csv tabular_binary/summary.md \
-                     tabular_active/by_extension.csv tabular_active/summary.md; do
-                if [ -f "$TAB/$f" ]; then cp -p "$TAB/$f" "$TRACK/$f" || fail=1
-                else say "  (not found, skipped: $TAB/$f)"; fi
-            done
-            for f in by_extension.csv summary.md; do
-                [ -f "$G3/counts/$f" ] && { cp -p "$G3/counts/$f" "$TRACK/tabular_counts/" || fail=1; }
-            done
-            # active manifest: stored_as -> files/... (relative to the share folder)
-            "$PYTHON" - "$TAB/tabular_active/manifest.csv" "$TRACK/tabular_active/manifest.csv" <<'PY' || fail=1
+part_group3_text() {
+    say "=== group3_text: $G3/text -> $DATA/group3_text"
+    copy_tree group3_text "$G3/text" "$DATA/group3_text"
+    if [ "$ONLY" != verify ]; then
+        mkdir -p "$TRACK/group3_text"
+        rsync "${OPTS[@]}" "$G3/text/_state/" "$TRACK/group3_text/_state/" || fail=1
+        top_files "$G3/text" "$TRACK/group3_text"
+        cp -p "$CHECKS/group3_text/name_problems.csv" "$TRACK/group3_text/" || fail=1
+    fi
+    say "=== check group3_text"
+    count_check ".txt files" "$(wc -l < "$CHECKS/group3_text/data_files.txt")" "$DATA/group3_text"
+    stray_check "$DATA/group3_text"
+}
+
+store_list() {   # tabular store -> its file names, relative, sorted
+    ( cd "$TAB/$1/files" && find . -type f ! -name '*.tmp.*' | LC_ALL=C sort )
+}
+
+active_manifest() {   # active manifest: stored_as -> files/... (relative to the share folder)
+    "$PYTHON" - "$1" "$2" <<'PY'
 import csv, os, sys
 src, dst = sys.argv[1:]
 with open(src, newline="", encoding="utf-8") as fi, \
@@ -263,58 +244,82 @@ with open(src, newline="", encoding="utf-8") as fi, \
 os.replace(dst + ".tmp", dst)
 print("  active manifest: %d stored_as made relative" % n)
 PY
-        fi
-        say "=== check tabular_binary"
-        n_src=$(cat <(cd "$TAB/tabular_binary/files" && find . -type f ! -name '*.tmp.*') \
-                    <(cd "$TAB/tabular_active/files" && find . -type f ! -name '*.tmp.*') | LC_ALL=C sort -u | wc -l)
-        count_check "files" "$n_src" "$DATA/tabular_binary/files"
-        other=$(find "$DATA/tabular_binary" -type f ! -path "$DATA/tabular_binary/files/*" | wc -l)
-        say "  files outside files/ (tracking among the data): $other $([ "$other" = 0 ] && echo OK || echo PROBLEM)"
-        [ "$other" = 0 ] || fail=1
-        if [ "$VERIFY" = 1 ]; then
-            say "  verify: hashing every tabular file on the share against its name"
-            verify_names "$DATA/tabular_binary/files" blob
-        fi
-        ;;
-    # ------------------------------------------------------------- bi_data
-    bi_data)
-        say "=== bi_data: $BI/data/{data_text,files} -> $DATA/bi_data"
-        copy_tree bi_data "$BI/data/data_text" "$DATA/bi_data/data_text"
-        if [ "$ONLY" != verify ]; then
-            if [ -d "$BI/data/files" ]; then
-                say "  files: $(find "$BI/data/files" -type f ! -name '*.tmp.*' | wc -l) image / data file(s), $(du -sh "$BI/data/files" | cut -f1)"
-                mkdir -p "$DATA/bi_data/files" && rsync "${OPTS[@]}" "$BI/data/files/" "$DATA/bi_data/files/" || fail=1
-            fi
-            mkdir -p "$TRACK/bi_data"
-            rsync "${OPTS[@]}" "$BI/data/_state/" "$TRACK/bi_data/_state/" || fail=1
-            top_files "$BI/data" "$TRACK/bi_data"
-            cp -p "$CHECKS/bi_data/name_problems.csv" "$TRACK/bi_data/" || fail=1
-        fi
-        say "=== check bi_data"
-        count_check "data .txt files" "$(wc -l < "$CHECKS/bi_data/data_files.txt")" "$DATA/bi_data/data_text"
+}
+
+part_tabular_binary() {
+    say "=== tabular_binary: $TAB/{tabular_binary,tabular_active}/files -> $DATA/tabular_binary/files"
+    store_list tabular_binary > "$CHECKS/tabular_binary/binary_names.txt"
+    store_list tabular_active > "$CHECKS/tabular_binary/active_names.txt"
+    both=$(LC_ALL=C comm -12 "$CHECKS/tabular_binary/binary_names.txt" "$CHECKS/tabular_binary/active_names.txt" | wc -l)
+    if [ "$both" = 0 ]; then say "  names in both stores: 0 OK"
+    else say "  names in both stores: $both - same content, copied once"; fi
+    if [ "$ONLY" != verify ]; then
+        mkdir -p "$DATA/tabular_binary/files" "$TRACK/tabular_binary" "$TRACK/tabular_active" "$TRACK/tabular_counts" || fail=1
+        for s in tabular_binary tabular_active; do
+            say "  $s: $(find "$TAB/$s/files" -type f ! -name '*.tmp.*' | wc -l) file(s), $(du -sh "$TAB/$s/files" | cut -f1)"
+            rsync "${OPTS[@]}" "$TAB/$s/files/" "$DATA/tabular_binary/files/" || fail=1
+        done
+        for f in tabular_binary/manifest.csv tabular_binary/by_extension.csv tabular_binary/summary.md \
+                 tabular_active/by_extension.csv tabular_active/summary.md; do
+            if [ -f "$TAB/$f" ]; then cp -p "$TAB/$f" "$TRACK/$f" || fail=1
+            else say "  (not found, skipped: $TAB/$f)"; fi
+        done
+        for f in by_extension.csv summary.md; do
+            [ -f "$G3/counts/$f" ] && { cp -p "$G3/counts/$f" "$TRACK/tabular_counts/" || fail=1; }
+        done
+        # active manifest: stored_as -> files/... (relative to the share folder)
+        active_manifest "$TAB/tabular_active/manifest.csv" "$TRACK/tabular_active/manifest.csv" || fail=1
+    fi
+    say "=== check tabular_binary"
+    n_src=$(LC_ALL=C sort -u "$CHECKS/tabular_binary/binary_names.txt" "$CHECKS/tabular_binary/active_names.txt" | wc -l)
+    count_check "files" "$n_src" "$DATA/tabular_binary/files"
+    other=$(find "$DATA/tabular_binary" -type f ! -path "$DATA/tabular_binary/files/*" | wc -l)
+    say "  files outside files/ (tracking among the data): $other $([ "$other" = 0 ] && echo OK || echo PROBLEM)"
+    [ "$other" = 0 ] || fail=1
+    if [ "$VERIFY" = 1 ]; then
+        say "  verify: hashing every tabular file on the share against its name"
+        verify_names "$DATA/tabular_binary/files" blob
+    fi
+}
+
+part_bi_data() {
+    say "=== bi_data: $BI/data/{data_text,files} -> $DATA/bi_data"
+    copy_tree bi_data "$BI/data/data_text" "$DATA/bi_data/data_text"
+    if [ "$ONLY" != verify ]; then
         if [ -d "$BI/data/files" ]; then
-            count_check "images / data files" "$(find "$BI/data/files" -type f ! -name '*.tmp.*' | wc -l)" "$DATA/bi_data/files"
+            say "  files: $(find "$BI/data/files" -type f ! -name '*.tmp.*' | wc -l) image / data file(s), $(du -sh "$BI/data/files" | cut -f1)"
+            mkdir -p "$DATA/bi_data/files" && rsync "${OPTS[@]}" "$BI/data/files/" "$DATA/bi_data/files/" || fail=1
         fi
-        other=$(find "$DATA/bi_data" -mindepth 1 -maxdepth 1 ! -name data_text ! -name files | wc -l)
-        say "  other entries next to data_text/ and files/: $other $([ "$other" = 0 ] && echo OK || echo PROBLEM)"
-        [ "$other" = 0 ] || fail=1
-        stray_check "$DATA/bi_data"
-        if [ "$VERIFY" = 1 ] && [ -d "$DATA/bi_data/files" ]; then
-            say "  verify: hashing every image / data file on the share against its name"
-            verify_names "$DATA/bi_data/files" sha256
-        fi
-        ;;
-    esac
+        mkdir -p "$TRACK/bi_data"
+        rsync "${OPTS[@]}" "$BI/data/_state/" "$TRACK/bi_data/_state/" || fail=1
+        top_files "$BI/data" "$TRACK/bi_data"
+        cp -p "$CHECKS/bi_data/name_problems.csv" "$TRACK/bi_data/" || fail=1
+    fi
+    say "=== check bi_data"
+    count_check "data .txt files" "$(wc -l < "$CHECKS/bi_data/data_files.txt")" "$DATA/bi_data/data_text"
+    if [ -d "$BI/data/files" ]; then
+        count_check "images / data files" "$(find "$BI/data/files" -type f ! -name '*.tmp.*' | wc -l)" "$DATA/bi_data/files"
+    fi
+    other=$(find "$DATA/bi_data" -mindepth 1 -maxdepth 1 ! -name data_text ! -name files | wc -l)
+    say "  other entries next to data_text/ and files/: $other $([ "$other" = 0 ] && echo OK || echo PROBLEM)"
+    [ "$other" = 0 ] || fail=1
+    stray_check "$DATA/bi_data"
+    if [ "$VERIFY" = 1 ] && [ -d "$DATA/bi_data/files" ]; then
+        say "  verify: hashing every image / data file on the share against its name"
+        verify_names "$DATA/bi_data/files" sha256
+    fi
+}
+
+for p in $PARTS; do
+    "part_$p"
 done
 
 if [ "$CHECKSUM" = 1 ]; then
     say "=== content check (.txt)"
     for p in $PARTS; do
-        case "$p" in
-            group3_text) s="$G3/text" d="$DATA/group3_text" ;;
-            bi_data)     s="$BI/data/data_text" d="$DATA/bi_data/data_text" ;;
-            *) continue ;;
-        esac
+        if [ "$p" = group3_text ]; then s="$G3/text" d="$DATA/group3_text"
+        elif [ "$p" = bi_data ]; then s="$BI/data/data_text" d="$DATA/bi_data/data_text"
+        else continue; fi
         diff=$(rsync -rcn --out-format='%n' --files-from="$CHECKS/$p/data_files.txt" "$s/" "$d/" | grep -vc '/$')
         say "  $p: $diff file(s) differ"
         [ "$diff" = 0 ] || fail=1
