@@ -3,43 +3,55 @@
 named by its content (git blob id), so the scanner team can look files up.
 
 Whole files from extract_versions / active_files stores sit at
-files/<ext>/<ab>/<blob>.<ext> (ab = first 2 characters of the name), once per
-content across all repos - the repo is not in their path. Their manifest.csv
-(stored_as column) maps each one to every org / repo / path / commit.
-Whole files whose share path already holds the repo (inside-archive
-<org>/<repo>/<path>, container images files/<type>/<org>/<repo>/<sha256>)
-are counted but not indexed.
+files/<ext>/<ab>/<blob>.<ext>, once per content across all repos - the repo
+is not in their path. Each store's manifest.csv (stored_as column) maps every
+stored file to all org / repo / path / commits.
 
-One walk of the share (skipping _state, _logs, _not_sent,
-_removed_duplicates): content-named files outside *_tracking, and every
-manifest.csv with a stored_as column. Read only on the share.
+Read from the LOCAL stores on this server (the sources of the share copies),
+not by walking the share: each store's manifest.csv, and a file counts as sent
+when it is in the store's files/ (what was moved to _not_sent is not). Its
+share path = the store's share folder + files/<ext>/<ab>/<name>.
 
     nohup python3 build_whole_file_index.py --out /data/workarea/whole_file_index > /data/workarea/whole_file_index.log 2>&1 &
+
+  --store LOCAL=SHARE   add a store (share folder relative to p1); repeatable
+  --check-share         also check every indexed file is on the share (slow on CIFS)
+
+Whole files whose share path already holds org/repo (inside-archive
+<org>/<repo>/<path>, container images files/<type>/<org>/<repo>/<sha256>)
+are not indexed - the repo is in their path.
 
 Writes to --out (CRLF):
   whole_file_index.csv  share_file, file, org, repo, path, action,
                         first_commit, first_date, last_commit, last_date,
-                        manifest - one row per file x repo path
-                        (a content in 3 repos = 3 rows)
-  not_in_manifest.csv   content-named files no manifest names (should be empty)
-  summary.csv           per delivery folder: files, indexed, repo paths,
-                        not in manifest; files with the repo in their path
+                        store - one row per file x repo path
+  summary.csv           per store: manifest rows, files indexed, repo paths
   README.txt            how to use the index
 """
 import argparse
 import csv
 import os
-import re
 import sys
 import time
 from collections import Counter, defaultdict
 
 P1 = "/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1"
-SKIP_DIRS = {"_state", "_logs", "_not_sent", "_removed_duplicates", "_tmp"}
-HASHNAME = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})\.[^/]+$")
+W = "/data/workarea"
+# local store -> share folder (relative to p1) whose files/ it was copied to
+STORES = [
+    (W + "/binary_versions", "group2/binary"),
+    (W + "/group4_7_9/group1/not_text/binary", "group4_7_9/group1_binary"),
+    (W + "/group4_7_9/group1/not_text/active", "group4_7_9/group1_binary"),
+    (W + "/group4_7_9/group2_binary", "group4_7_9/group2_binary"),
+    (W + "/group4_7_9/group2_active", "group4_7_9/group2_binary"),
+    (W + "/group4_7_9/tabular/tabular_binary", "group4_7_9/tabular_binary"),
+    (W + "/group4_7_9/tabular/tabular_active", "group4_7_9/tabular_binary"),
+    (W + "/group4_7_9/mixed/not_text/binary", "group4_7_9/mixed_binary"),
+    (W + "/group4_7_9/mixed/not_text/active", "group4_7_9/mixed_binary"),
+]
 STORED = ("written", "deduped", "in_stored")
 COLS = ["share_file", "file", "org", "repo", "path", "action", "first_commit",
-        "first_date", "last_commit", "last_date", "manifest"]
+        "first_date", "last_commit", "last_date", "store"]
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 KW = dict(newline="", encoding="utf-8", errors="surrogateescape")
 
@@ -48,114 +60,98 @@ def say(msg):
     print(time.strftime("%F %T ") + msg, flush=True)
 
 
-def delivery(rel):
-    """p1-relative path -> its delivery folder (first 2 levels, or 3 under group4_2)."""
-    parts = rel.split("/")
-    n = 3 if len(parts) > 3 and parts[1] in ("group4_2", "group4_2_R") else 2
-    return "/".join(parts[:n])
-
-
-def walk(p1):
-    files = defaultdict(list)            # name -> [p1-relative share paths]
-    in_path = Counter()                  # delivery -> content-named files with the repo in their path
-    manifests = []
-    seen = 0
-    for d, dirs, fs in os.walk(p1):
-        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
-        rel_d = os.path.relpath(d, p1).replace(os.sep, "/")
-        tracking = rel_d.split("/")[0].endswith("_tracking")
-        for f in fs:
-            seen += 1
-            if seen % 200000 == 0:
-                say("  walked %d files, %d content-named, %d manifests" % (seen, len(files), len(manifests)))
-            if f == "manifest.csv":
-                manifests.append(os.path.join(d, f))
-            elif not tracking and HASHNAME.match(f):
-                rel = rel_d + "/" + f
-                if os.path.basename(d) == f[:2]:
-                    files[f].append(rel)
-                else:
-                    in_path[delivery(rel)] += 1
-    say("walk done: %d files, %d content-named (store layout), %d manifests" % (seen, len(files), len(manifests)))
-    return files, in_path, manifests
+def under_files(stored):
+    """stored_as (relative files/... or an absolute path) -> the part after files/."""
+    s = stored.replace("\\", "/")
+    if s.startswith("files/"):
+        return s[6:]
+    return s.split("/files/", 1)[1] if "/files/" in s else ""
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--p1", default=P1)
-    ap.add_argument("--out", default="/data/workarea/whole_file_index")
+    ap.add_argument("--out", default=W + "/whole_file_index")
+    ap.add_argument("--store", action="append", default=[], help="LOCAL=SHARE (share folder relative to p1)")
+    ap.add_argument("--check-share", action="store_true")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    stores = STORES + [tuple(x.split("=", 1)) for x in a.store]
 
-    say("walking %s" % a.p1)
-    files, in_path, manifests = walk(a.p1)
+    rows_by_file = defaultdict(set)      # share_file -> {(org, repo, path, action, fc, fd, lc, ld, store)}
+    summ = []
+    for local, share in stores:
+        man = os.path.join(local, "manifest.csv")
+        if not os.path.isfile(man):
+            say("  (no manifest, skipped: %s)" % man)
+            summ.append([local, share, "no manifest", 0, 0, 0])
+            continue
+        n_rows = n_kept = 0
+        files = set()
+        with open(man, **KW) as fh:
+            for r in csv.DictReader(fh):
+                if r.get("action") not in STORED or not r.get("stored_as"):
+                    continue
+                n_rows += 1
+                rel = under_files(r["stored_as"])
+                st = r["stored_as"].replace("\\", "/")
+                src = st if os.path.isabs(st) else os.path.join(local, st)
+                if not rel or not os.path.isfile(src):
+                    continue                     # moved to _not_sent / not stored
+                if os.path.isabs(st) and not st.startswith(local.rstrip("/") + "/"):
+                    # in_stored: the file sits in another store; find its share folder
+                    owner = [sh for lo, sh in stores if st.startswith(lo.rstrip("/") + "/")]
+                    sh = owner[0] if owner else share
+                else:
+                    sh = share
+                sf = "%s/files/%s" % (sh, rel)
+                files.add(sf)
+                n_kept += 1
+                rows_by_file[sf].add((r.get("org", ""), r.get("repo", ""), r.get("path", ""), r["action"],
+                                      r.get("first_commit", ""), r.get("first_date", ""),
+                                      r.get("last_commit", ""), r.get("last_date", ""), local))
+        say("  %-50s -> %-28s %8d stored rows, %8d kept, %7d files" % (local, share, n_rows, n_kept, len(files)))
+        summ.append([local, share, "ok", n_rows, len(files), n_kept])
 
-    hits = defaultdict(set)              # name -> {(org, repo, path, action, fc, fd, lc, ld, manifest)}
-    used = 0
-    for m in sorted(manifests):
-        with open(m, **KW) as fh:
-            r = csv.DictReader(fh)
-            if not r.fieldnames or "stored_as" not in r.fieldnames:
-                continue
-            n = 0
-            for row in r:
-                if row.get("action") not in STORED:
-                    continue
-                name = os.path.basename((row.get("stored_as") or "").replace("\\", "/"))
-                if name not in files:
-                    continue
-                hits[name].add((row.get("org", ""), row.get("repo", ""), row.get("path", ""), row["action"],
-                                row.get("first_commit", ""), row.get("first_date", ""),
-                                row.get("last_commit", ""), row.get("last_date", ""),
-                                os.path.relpath(m, a.p1).replace(os.sep, "/")))
-                n += 1
-        if n:
-            used += 1
-            say("  %8d row(s)  %s" % (n, os.path.relpath(m, a.p1)))
-    say("manifests with matches: %d" % used)
+    missing = []
+    if a.check_share:
+        say("checking %d files on the share" % len(rows_by_file))
+        missing = [f for f in rows_by_file if not os.path.isfile(os.path.join(a.p1, f))]
+        say("  not on the share: %d" % len(missing))
 
-    per = defaultdict(Counter)
-    with open(os.path.join(a.out, "whole_file_index.csv"), "w", **KW) as fi, \
-            open(os.path.join(a.out, "not_in_manifest.csv"), "w", **KW) as fn:
-        wi, wn = csv.writer(fi, lineterminator="\r\n"), csv.writer(fn, lineterminator="\r\n")
-        wi.writerow(COLS)
-        wn.writerow(["share_file", "file"])
-        for name in sorted(files):
-            rows = sorted(hits.get(name, ()))
-            for rel in sorted(files[name]):
-                c = per[delivery(rel)]
-                c["files"] += 1
-                if not rows:
-                    c["not_in_manifest"] += 1
-                    wn.writerow([rel, name])
-                    continue
-                c["indexed"] += 1
-                c["repo_paths"] += len(rows)
-                for x in rows:
-                    wi.writerow([rel, name] + list(x))
+    n_rows = 0
+    with open(os.path.join(a.out, "whole_file_index.csv"), "w", **KW) as fh:
+        w = csv.writer(fh, lineterminator="\r\n")
+        w.writerow(COLS)
+        for sf in sorted(rows_by_file):
+            for x in sorted(rows_by_file[sf]):
+                w.writerow([sf, os.path.basename(sf)] + list(x))
+                n_rows += 1
+    if missing:
+        with open(os.path.join(a.out, "not_on_share.csv"), "w", **KW) as fh:
+            w = csv.writer(fh, lineterminator="\r\n")
+            w.writerow(["share_file"])
+            w.writerows([m] for m in sorted(missing))
 
     with open(os.path.join(a.out, "summary.csv"), "w", **KW) as fh:
         w = csv.writer(fh, lineterminator="\r\n")
-        w.writerow(["delivery", "content_named_files", "indexed", "repo_path_rows", "not_in_manifest",
-                    "files_with_repo_in_their_path"])
-        tot = Counter()
-        for dlv in sorted(set(per) | set(in_path)):
-            c = per[dlv]
-            row = [c["files"], c["indexed"], c["repo_paths"], c["not_in_manifest"], in_path[dlv]]
-            w.writerow([dlv] + row)
-            for k, v in zip(("f", "i", "r", "n", "p"), row):
-                tot[k] += v
-        w.writerow(["total", tot["f"], tot["i"], tot["r"], tot["n"], tot["p"]])
-    say("index: %d files, %d indexed, %d repo path rows, %d not in a manifest; %d files have the repo in their path"
-        % (tot["f"], tot["i"], tot["r"], tot["n"], tot["p"]))
+        w.writerow(["local_store", "share_folder", "status", "stored_rows", "files_indexed", "repo_path_rows"])
+        w.writerows(summ)
+        w.writerow(["total", "", "", sum(x[3] for x in summ), len(rows_by_file), n_rows])
+    say("index: %d files, %d repo path rows%s -> %s" % (len(rows_by_file), n_rows,
+        (", %d not on the share" % len(missing)) if a.check_share else "", a.out))
 
     with open(os.path.join(a.out, "README.txt"), "w", newline="\r\n") as fh:
-        fh.write("""Whole files named by their content - which repo and path they came from
+        fh.write(README)
+    say("done -> %s" % a.out)
+
+
+README = """Whole files named by their content - which repo and path they came from
 =========================================================================
 
-Whole files (Group 2, 4.7+4.9 group 2, tabular, mixed, ...) are stored once per
-distinct content across all repos and named by their git blob id:
-    files/<ext>/<first 2 characters>/<blob id>.<ext>
+Whole files (Group 2, 4.7+4.9 group 1 / group 2 binaries, tabular, mixed) are
+stored once per distinct content across all repos and named by their git blob
+id:   files/<ext>/<first 2 characters>/<blob id>.<ext>
 so the repo is not in their path. whole_file_index.csv gives, for each such
 file on the share, every repo and path it was found in and the commits:
 
@@ -167,16 +163,15 @@ file on the share, every repo and path it was found in and the commits:
                 deduped / in_stored = the same content in another path / repo
   first_commit, first_date, last_commit, last_date
                 the commits where this content of the path first / last appears
-  manifest      the delivery manifest the row comes from
+  store         the run that produced it
 
 A file found in 3 repos has 3 rows. Look up: search the 'file' column for the
 name, e.g.  grep 0314f25299898dbd1c931f2da3305df65ce26d46 whole_file_index.csv
 
 Whole files whose share path already holds org/repo (inside-archive folders,
 container images) are not listed - the repo is in their path.
-summary.csv: counts per delivery folder.
-""")
-    say("done -> %s" % a.out)
+summary.csv: counts per store.
+"""
 
 
 if __name__ == "__main__":
