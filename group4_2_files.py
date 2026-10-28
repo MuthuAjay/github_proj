@@ -49,7 +49,8 @@ Usage:
     python3 group4_2_files.py --unpacked /data/workarea/group4_2/unpacked \\
         --out /data/workarea/group4_2/group2_binary --workers 8
     --extensions LIST|FILE  types to take (default: the 18 group 2 binary
-                            types, extension_versions.BINARY_EXTS)
+                            types, extension_versions.BINARY_EXTS);
+                            _noext = files without an extension (group 5)
     --repo ORG/REPO (repeatable) only these; --limit N the first N repos
     --redo  do repos again that are already done
 """
@@ -75,6 +76,8 @@ from group4_2_text import (STATE, LOGS, STORED, clean_path,     # noqa: E402
                            clear_repo, left_out_reason, list_repos, read_done)
 from repo_extension_summary import ext_key, load_extensions     # noqa: E402
 
+NOEXT = "_noext"     # --extensions name for files without an extension (archive_unpack.py's)
+
 MANIFEST_HEADER = ["org", "repo", "path", "ext", "output", "status",
                    "sha256", "versions", "bytes", "same_as", "not_stored",
                    "first_date", "last_date"]
@@ -91,7 +94,7 @@ def read_manifest(path, exts):
     with open(path, newline="", encoding="utf-8",
               errors="surrogateescape") as fh:
         for r in csv.DictReader(fh):
-            if not r.get("inner_path") or r["ext"] not in exts:
+            if not r.get("inner_path") or (r["ext"] or NOEXT) not in exts:
                 continue
             stored = r["stored_as"]
             sha = r.get("blob") or os.path.splitext(os.path.basename(stored))[0]
@@ -125,7 +128,7 @@ def process_repo(cfg, org, repo):
     seen = {}                                   # sha256 -> output written
     rows, left = [], []
     for path, versions in by_path.items():
-        e = ext_key(path)
+        e = ext_key(path) or NOEXT
         why = left_out_reason(path)
         if why:
             left.append([org, repo, path, e, why, len(versions)])

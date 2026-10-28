@@ -116,6 +116,27 @@ class GroupFiles(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertTrue(os.path.isfile(os.path.join(base, "plan.v2.xlsx")))
 
+    def test_noext_and_other_types(self):
+        f = Fake(self.un)
+        a = "data/drop.zip"
+        f.add(a, "Dockerfile", b"FROM python\n", "2024-01-01")       # no extension
+        f.add(a, "export/customers", b"\0\1binary", "2024-01-01")    # no extension
+        f.add(a, ".gitignore", b"*.pyc\n", "2024-01-01")             # type gitignore
+        f.add(a, "app.db", b"SQLite format 3\0", "2024-01-01")        # group 4.1
+        f.add(a, "intro.mp4", b"\0\0\0 ftypmp4", "2024-01-01")       # group 4.8
+        f.save()
+        p = self.run_it("--extensions", "_noext,db,mp4", "--redo")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        base = os.path.join(self.out, ORG, REPO, "data", "drop.zip")
+        got = sorted(os.path.relpath(os.path.join(d, n), base)
+                     for d, _, ns in os.walk(base) for n in ns)
+        self.assertEqual(got, ["Dockerfile", "app.db", "export/customers", "intro.mp4"])
+        bt = {r["type"]: r for r in read_csv(
+            os.path.join(self.out, "stats", "by_type.csv"))}
+        self.assertEqual(bt["_noext"]["files_written"], "2")
+        self.assertNotIn("gitignore", bt)
+        self.assertNotIn("xlsx", bt)
+
 
 class Runner(unittest.TestCase):
 
