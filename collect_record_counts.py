@@ -13,12 +13,17 @@ counts, sizes, CSV headers and total rows.
 
 Walking group 1 (6.8 M files) takes a few minutes; --no-lines skips line
 counting (the slow part) for the big text folders.
+
+The '.tmp.' column counts DATA files with ".tmp." in their name (not our
+tools' temp files <name>.tmp.<pid>): copy scripts that exclude "*.tmp.*"
+would have left those out.
 """
 import argparse
 import csv
 import glob
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -80,11 +85,11 @@ WORKERS = 16
 def walk(root, kind, lines):
     """(files, bytes, .txt, lines) under root, one task per repo folder
     (root/<org>/<repo>) on WORKERS processes."""
-    tasks, top = [], [0, 0, 0, 0]
+    tasks, top = [], [0, 0, 0, 0, 0]
     try:
         level1 = sorted(os.scandir(root), key=lambda e: e.name)
     except OSError:
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0
     for e in level1:
         if e.is_dir(follow_symlinks=False):
             if e.name in SKIP:
@@ -92,13 +97,12 @@ def walk(root, kind, lines):
             try:
                 for e2 in os.scandir(e.path):
                     if e2.is_dir(follow_symlinks=False):
-                        if e2.name not in SKIP:
-                            tasks.append(e2.path)
-                    else:
+                        tasks.append(e2.path)
+                    elif e2.name not in ("done.json", "manifest.csv"):
                         _count_file(e2.path, e2.name, lines, top)
             except OSError:
                 pass
-        else:
+        elif e.name not in ("done.json", "manifest.csv"):
             _count_file(e.path, e.name, lines, top)
     if WORKERS > 1 and len(tasks) > 1:
         with ProcessPoolExecutor(WORKERS) as ex:
@@ -106,13 +110,20 @@ def walk(root, kind, lines):
     else:
         parts = [_walk_one(t, lines) for t in tasks]
     for x in parts:
-        for i in range(4):
+        for i in range(5):
             top[i] += x[i]
     return tuple(top)
 
 
+TMP = re.compile(r"\.tmp\.(\d+(\.\d+)?|copy)$")    # temp files of our tools: <name>.tmp.<pid>[.<thread>], .tmp.copy
+
+
+def is_temp(f):
+    return f.startswith(".tmp.") or bool(TMP.search(f))
+
+
 def _count_file(p, f, lines, acc):
-    if f.startswith(".tmp.") or ".tmp." in f or f in ("done.json", "manifest.csv"):
+    if is_temp(f):
         return
     try:
         acc[1] += os.path.getsize(p)
@@ -131,11 +142,14 @@ def _count_file(p, f, lines, acc):
 
 
 def _walk_one(root, lines):
-    acc = [0, 0, 0, 0]
+    """everything under a repo folder: tracking folders only exist at the top
+    of a delivery folder, so nothing is skipped below it."""
+    acc = [0, 0, 0, 0, 0]
     for d, dirs, fs in os.walk(root):
-        dirs[:] = [x for x in dirs if x not in SKIP]
         for f in fs:
             _count_file(os.path.join(d, f), f, lines, acc)
+            if ".tmp." in f and not is_temp(f):
+                acc[4] += 1
     return acc
 
 
@@ -264,15 +278,15 @@ def main():
 
     # ---------------------------------------------------------- C. deliveries
     say("\n## C. Deliveries: data files the copies send (local source)")
-    say("  %-34s %10s %16s %10s %14s  folder" % ("delivery", "files", "bytes", ".txt", "lines"))
+    say("  %-34s %10s %16s %10s %14s %9s  folder" % ("delivery", "files", "bytes", ".txt", "lines", "'.tmp.'"))
     for label, folder, kind in DELIVERIES:
         if not os.path.isdir(folder):
             say("  %-34s %s" % (label, "(not found: %s)" % folder))
             continue
         log("walking " + folder)
         big = folder.endswith(("full_extract_delta_2", "data_text"))
-        n, b, txt, ln = walk(folder, kind, lines=(kind == "txt" and not (a.no_lines and big)))
-        say("  %-34s %10d %16d %10d %14s  %s" % (label, n, b, txt, ln if kind == "txt" and not (a.no_lines and big) else "-", folder))
+        n, b, txt, ln, tn = walk(folder, kind, lines=(kind == "txt" and not (a.no_lines and big)))
+        say("  %-34s %10d %16d %10d %14s %9d  %s" % (label, n, b, txt, ln if kind == "txt" and not (a.no_lines and big) else "-", tn, folder))
     say("\n  run summaries:")
     for label, folder, kind in DELIVERIES:
         if not os.path.isdir(folder):
@@ -296,8 +310,8 @@ def main():
             if not os.path.isdir(f):
                 continue
             log("walking " + f)
-            n, b, txt, ln = walk(f, "txt", lines=True)
-            say("  %-12s %-28s files %8d  bytes %14d  .txt %8d  lines %12d" % (os.path.basename(run), step, n, b, txt, ln))
+            n, b, txt, ln, tn = walk(f, "txt", lines=True)
+            say("  %-12s %-28s files %8d  bytes %14d  .txt %8d  lines %12d  '.tmp.' names %d" % (os.path.basename(run), step, n, b, txt, ln, tn))
             show_stats(f, indent="      ")
         un = os.path.join(run, "unpacked")
         if os.path.isdir(un):
