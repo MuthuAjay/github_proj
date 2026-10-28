@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 
 W = os.environ.get("RECORD_W", "/data/workarea")
 P1 = os.environ.get("RECORD_P1", "/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1")
@@ -73,26 +74,69 @@ def log(msg):
     sys.stderr.flush()
 
 
+WORKERS = 16
+
+
 def walk(root, kind, lines):
-    n = b = txt = ln = 0
+    """(files, bytes, .txt, lines) under root, one task per repo folder
+    (root/<org>/<repo>) on WORKERS processes."""
+    tasks, top = [], [0, 0, 0, 0]
+    try:
+        level1 = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return 0, 0, 0, 0
+    for e in level1:
+        if e.is_dir(follow_symlinks=False):
+            if e.name in SKIP:
+                continue
+            try:
+                for e2 in os.scandir(e.path):
+                    if e2.is_dir(follow_symlinks=False):
+                        if e2.name not in SKIP:
+                            tasks.append(e2.path)
+                    else:
+                        _count_file(e2.path, e2.name, lines, top)
+            except OSError:
+                pass
+        else:
+            _count_file(e.path, e.name, lines, top)
+    if WORKERS > 1 and len(tasks) > 1:
+        with ProcessPoolExecutor(WORKERS) as ex:
+            parts = list(ex.map(_walk_one, tasks, [lines] * len(tasks), chunksize=8))
+    else:
+        parts = [_walk_one(t, lines) for t in tasks]
+    for x in parts:
+        for i in range(4):
+            top[i] += x[i]
+    return tuple(top)
+
+
+def _count_file(p, f, lines, acc):
+    if f.startswith(".tmp.") or ".tmp." in f or f in ("done.json", "manifest.csv"):
+        return
+    try:
+        acc[1] += os.path.getsize(p)
+    except OSError:
+        return
+    acc[0] += 1
+    if f.endswith(".txt"):
+        acc[2] += 1
+        if lines:
+            try:
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        acc[3] += chunk.count(b"\n")
+            except OSError:
+                pass
+
+
+def _walk_one(root, lines):
+    acc = [0, 0, 0, 0]
     for d, dirs, fs in os.walk(root):
         dirs[:] = [x for x in dirs if x not in SKIP]
         for f in fs:
-            if f.startswith(".tmp.") or ".tmp." in f or f in ("done.json", "manifest.csv"):
-                continue
-            p = os.path.join(d, f)
-            try:
-                b += os.path.getsize(p)
-            except OSError:
-                continue
-            n += 1
-            if f.endswith(".txt"):
-                txt += 1
-                if lines:
-                    with open(p, "rb") as fh:
-                        for chunk in iter(lambda: fh.read(1 << 20), b""):
-                            ln += chunk.count(b"\n")
-    return n, b, txt, ln
+            _count_file(os.path.join(d, f), f, lines, acc)
+    return acc
 
 
 def total_row(path):
@@ -137,30 +181,43 @@ def has_stats(folder):
                                       or bool(glob.glob(os.path.join(folder, "_state", "*", "*", "manifest.csv"))))
 
 
+def _one_manifest(m):
+    c = Counter()
+    try:
+        with open(m, **KW) as fh:
+            r = csv.DictReader(fh)
+            col = "status" if "status" in (r.fieldnames or []) else ("action" if "action" in (r.fieldnames or []) else None)
+            if col:
+                for row in r:
+                    c[row.get(col, "")] += 1
+    except OSError:
+        pass
+    return c
+
+
 def manifest_status(folder):
-    """status / action counts over <folder>/_state/*/*/manifest.csv (or manifest.csv)."""
-    c, files = Counter(), 0
+    """status / action counts over <folder>/_state/*/*/manifest.csv (or manifest.csv), on WORKERS processes."""
+    c = Counter()
     paths = glob.glob(os.path.join(folder, "_state", "*", "*", "manifest.csv"))
     if not paths and os.path.isfile(os.path.join(folder, "manifest.csv")):
         paths = [os.path.join(folder, "manifest.csv")]
-    for m in paths:
-        files += 1
-        try:
-            r = csv.DictReader(open(m, **KW))
-            col = "status" if "status" in (r.fieldnames or []) else ("action" if "action" in (r.fieldnames or []) else None)
-            if not col:
-                continue
-            for row in r:
-                c[row.get(col, "")] += 1
-        except OSError:
-            pass
-    return files, c
+    if WORKERS > 1 and len(paths) > 1:
+        with ProcessPoolExecutor(WORKERS) as ex:
+            for x in ex.map(_one_manifest, paths, chunksize=32):
+                c.update(x)
+    else:
+        for m in paths:
+            c.update(_one_manifest(m))
+    return len(paths), c
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-lines", action="store_true", help="do not count lines in the big text folders")
+    ap.add_argument("--workers", type=int, default=16, help="processes for walking / reading manifests (default 16)")
     a = ap.parse_args()
+    global WORKERS
+    WORKERS = max(1, a.workers)
     say("# Record counts, %s (local outputs on the server; read only)" % time.strftime("%F %T"))
 
     # ---------------------------------------------------------- A. repositories
