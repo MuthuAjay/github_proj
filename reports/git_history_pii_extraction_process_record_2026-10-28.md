@@ -420,20 +420,97 @@ All under `diff_analysis/p1/` on the file share. Scan only the data folders; the
 | `__case2` | Rename applied when two names differ only by letter case on the share |
 | Git LFS pointer | A small stub committed instead of a large file; the content is not in the archive |
 
-## Appendix B: Main scripts
+## Appendix B: Scripts and what they do
 
-| Stage | Scripts |
-|---|---|
-| Repository list and batches | `dedupe_by_root.py`, `repo_extension_summary.py`, `make_batches.py`, `check_missing_repos.py` |
-| Counting | `all_extension_counts.py`, `extension_versions.py` |
-| Text | `file_added_lines.py`, `fill_at_head.py`, `file_delta.py`, `run_text_versions.sh` |
-| Whole files | `extract_versions.py`, `active_files.py` |
-| Group 3 | `pdf_page_merge.py`, `pkl_to_text.py`, `run_group3.sh` |
-| Archives | `archive_unpack.py`, `group4_2_text.py`, `group4_2_files.py`, `group4_2_nested.py`, `group4_2_path_list.py` |
-| 4.7+4.9 | `data_to_text.py`, `bi_to_data.py`, `dedupe_text_paths.py`, `run_group4_7_9_mixed.sh`, `check_group4_7_9_mixed.py` |
-| Samples and classification | `sample_ext_files.py`, `extension_rnd.py`, `ext_path_list.py` |
-| Copy and checks | `copy_group*.sh`, `validate_group1_counts.py`, `progress.sh` |
-| Traceability | `find_blob_repos.py`, `build_whole_file_index.py` |
+All scripts are in the project repository (git history = change record), written and tested on a development machine with automated tests (`test_*.py`), and copied to the server as files with an md5 check. They run with Python 3.10 / bash on the project server. **Every script only reads the archive and the active copy; outputs go to new folders under `/data/workarea`.** Long runs are started under `nohup` and resume after an interruption.
+
+### B.1 Preparation: inventory, repository checks, diagnostics (Sep)
+
+Used to understand the storage, choose the sources and fix the repository list. Not part of the delivered data.
+
+| Script | What it does | Used for |
+|---|---|---|
+| `inventory.py`, `file_inventory.py`, `explore_input_csv.py`, `analyse_file_summary.py` | List / profile every file under a tree or in a big file list | First look at the repositories and the inventory |
+| `hash_inventory.py`, `hash_working_tree.py`, `hash_active_from_archive_csv.py`, `hash_merge_active_archive.py`, `compare_hashes.py`, `compare_hash_csvs.py`, `compare_inventories.py`, `repo_summary.py` | Hash files (md5, sha256, git blob id) in the archive and active copies and compare them | Checking that the archive holds the active content (archive vs active) |
+| `compare_repos.py`, `check_archive_subset.py`, `check_pack_version.py` | Blob-level comparison of two repositories; "is the archive a subset of active"; is a pack file the same as a repo's | Same |
+| `pack_count.py`, `object_stats.py`, `pack_redundancy.py`, `getunique.py`, `git_repack.py`, `dangling_commits.py` | Git object-store statistics, redundant packs, unreachable commits | Sizing and understanding the archive storage |
+| `extract_from_pack.py`, `extract_commits.py`, `summarise_extracts.py`, `file_version_diffs.py`, `simple_file_info.py`, `inspect_github_repo.py`, `build_changed_files_excel.py` | Rebuild a working tree from objects; every commit / every version of one file; per-file commit counts | Early exploration and spot checks |
+| `file_history_for_list.py` | Full commit history for every file in a big list; includes `RecoveredRepo`, which reads repositories that have git objects but no HEAD or refs | **Core library:** every later script reads the archive through it |
+| `diagnose_repo.py` | Why one repository is slow | Performance diagnosis |
+| `dedupe_by_root.py` | The inventory listed each repository under two roots; keep one copy per repository (the one with more files) | Repository file population (2.2) |
+| `repo_extension_summary.py` | Per repository: files, commits and split by the file types in scope; holds the group 1 type list | Batch weights; group 1 types |
+| `make_batches.py` | Split repositories into giant / large / medium / small batches of balanced workload; missing repositories listed in `excluded.csv` | All runs (2.3) |
+| `check_missing_repos.py` | Search the missing repositories in every storage location under exact and similar names | The 202 missing repositories (2.1) |
+| `make_input_csv.py`, `pii_secret_scan.py` | Test input builder; a gitleaks secret / PII scan of full history | Exploration only [to confirm: whether the gitleaks scan was used for any delivery] |
+
+### B.2 Counting and research (what is there, before deciding)
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `all_extension_counts.py` / `run_all_ext_counts.sh` | Every file type in the whole history: files, versions, at today's copy | Counts only, nothing extracted |
+| `extension_versions.py` / `run_ext_versions.sh` | Per type: versions of every file, sizes, Git LFS pointers; pass 2 = is a version identical to today's file | Counts only; matching in Python (`--match-in-python`) after the 4.5_R slowdown |
+| `ext_versions_analysis.py`, `extension_delta_summary.py`, `delta_by_extension.py`, `explain_file_counts.py`, `sent_duplicates.py`, `repo_extension_status.py` | Reports from the counts: per type / per repository, what history holds, what is already scanned, what is sent | Read only |
+| `validate_group1_counts.py` | Compares the group 1 extraction with the independent all-type count, down to exact paths | Found the 7-repo gap (L4) |
+| `extension_rnd.py`, `sample_ext_files.py` | Where a type is, how big, and a few real sample files per type to open and look at | Pickles inspected with `pickletools`, never unpickled; samples stay on the server |
+| `ext_path_list.py`, `group4_2_path_list.py` | Unique paths of given types per repository with their commits (path lists) | Nothing copied; used for 4.1 / 4.1_R and types inside archives |
+
+### B.3 Text route (groups 1, 2 text, 4.5, 4.5_R, 4.7+4.9 text)
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `file_added_lines.py` | One `.txt` per file path: every line any version had, once, in first-seen order; trimmed, blanks dropped; content only | Vendored paths skipped and listed (`--skip-vendored`); per-repo timeout; binary versions flagged, not sent as text |
+| `fill_at_head.py` | Marks each path as existing today or not, from the active copy | Repositories with no active copy left blank, never "no" |
+| `file_delta.py` | Removes lines still in today's file; keeps everything for files gone today | Unreadable today's file → keep all; **stops if the active-copy mount fails** |
+| `run_text_versions.sh`, `run_batches.sh` | Run the three steps over all batches; `SEND=all` variant for types never scanned (no delta) | Resumable; exit code 3 = stopped safely |
+| `history_only_files.py`, `run_history_only.sh`, `history_only_analysis.py` | For files gone today: deleted, renamed, or branch unknown; when and by which commit | Analysis only (5.1) |
+
+### B.4 Whole-file route (group 2, 4.7+4.9 whole files, tabular, mixed)
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `extract_versions.py` / `run_extract_versions.sh` | Writes every history version of the given types as a real file, each distinct content once (`files/<ext>/<ab>/<blob>.<ext>`), with a manifest of every repo / path / commit | Content checked against its git blob id; LFS pointers and empty files counted, not written; `--per-repo` variant for group 3 |
+| `active_files.py` | Adds today's files of types never scanned, from the active copy; content already taken from history is not stored twice | Reads the active copy only |
+| `run_all_versions.sh` | Both tracks (text and whole) in one go | — |
+
+### B.5 Group 3 and data types (pdf, pkl, 4.7+4.9 serialized and container data)
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `pdf_page_merge.py` | One PDF per path with every distinct page of every version; pages hashed after rendering, **original** pages merged so the text layer stays | No OCR: pages without text flagged `ocr_needed`; unreadable versions copied whole |
+| `pkl_to_text.py` | Every string a pickle holds, as text | **Never unpickled** (`pickletools` walk + raw string scan) |
+| `run_group3.sh`, `copy_group3.sh` | Group 3 from counts to share | Per repository only |
+| `data_to_text.py` / `run_group4_7_9_group3.sh` | Values of R data, pickle, joblib, NumPy, BSON, Nippy, checkpoints as text; tabular formats sent whole | Nothing loaded as code; numeric arrays and model weights skipped |
+| `bi_to_data.py` / `run_group4_7_9_bi.sh` | Power BI and other containers: only the data tables as text and the images | No layout, queries, code, connection strings or settings taken; the containers themselves not sent |
+| `dedupe_text_paths.py` | Removes a `.txt` built from exactly the same contents as a kept path in the same repository | Moved aside first (`_removed_duplicates`), `same_as.csv` records the kept copy |
+| `run_group4_7_9_mixed.sh`, `check_group4_7_9_mixed.py` | Mixed types routed per path by content (text / whole); programs left out; check of names against file signatures | dll / exe and ELF / MZ programs moved to `_not_sent`, listed |
+
+### B.6 Archives and packages (4.2 / 4.2_R and their contents)
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `archive_unpack.py` / `run_group4_2.sh` | Opens every version of every archive (zip, tar, gz, 7z, rar, brotli, split sets, …) and writes every file inside once per repository, with a manifest | Opened by content signature; names inside never used to write; limits 2 GB per file, 5 GB / 200× per archive, 100,000 files; damaged / encrypted archives recorded |
+| `archive_unpack_report.py` | Report of what was opened, what was inside, by route | Read only |
+| `group4_2_nested.py` / `run_group4_2_nested.sh` | Finds what stayed closed inside archives, opens it all the way down, compares before / after | Old output kept for comparison |
+| `group4_2_text.py`, `run_group4_2_text.sh` | Text types inside archives: one `.txt` per inner path, lines merged | macOS metadata, DocFX cache, vendored left out and listed |
+| `group4_2_files.py` | Whole-file types inside archives, each distinct content once | Same exclusions |
+| `run_group4_2_inner.sh`, `run_group4_7_9_inner.sh`, `run_group4_1_R.sh` | Run each group's method on the archive contents; 4.1_R path lists and samples | Reads only the unpacked output, no git |
+
+### B.7 Copy to the share and checks
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `copy_group2.sh`, `copy_group3.sh`, `copy_group4_2.sh`, `copy_group4_5_R.sh`, `copy_group4_7_9_group1.sh`, `copy_group4_7_9_group2.sh`, `copy_group4_7_9_rest.sh` | Copy each delivery to the share, several transfers in parallel (16 in the later scripts) | **Data and tracking to separate folders**; never sends `_state`, `_logs`, `_tmp`, `_not_sent`, `_removed_duplicates`; name checks (case clashes renamed `__case2` from 23 Oct); count check source = share; hash check of whole files against their names; `ONLY=verify` re-check mode |
+| `group2_tracking_files.py` | Lists / moves tracking files out of a delivery or scanner output folder | Used for the group 2 clean-up (7.4) |
+| `group4_7_9_group2_stats.py` | Per-type numbers of a delivery, including share = source | Read only |
+| `progress.sh` | Where every run stands | Read only; starts or stops nothing |
+
+### B.8 Traceability and reporting
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `find_blob_repos.py` | Repository, path and commits of whole files named by blob id, from a pasted list | Read only (manifests) |
+| `build_whole_file_index.py` | Index of every content-named whole file on the share → all its repositories, paths and commits | Read only; counts match the stores (7.2) |
+| `csv_to_xlsx.py` | CSV to Excel with standard Python only | — |
 
 ## Appendix C: Related records
 
