@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | Purpose of this document | Record for QRM / review: how the repositories and file types were chosen, how each run worked, the decisions taken, the checks made and the known limitations |
-| Status | **Draft for review**, as of 28 Oct 2026 |
-| Period covered | 18 Sep – 28 Oct 2026 |
+| Status | **Draft for review**, as of 29 Oct 2026 (29 Oct: reconciliation of every delivery against the share, section 7.7) |
+| Period covered | 18 Sep – 29 Oct 2026 |
 | Prepared by | [to confirm: name / role] |
 | Reviewed by | [to confirm] |
 | Sources | session notes (`notes/session_handoff_*.md`), team updates and reports (`reports/`), the scripts and their git history (138 commits) |
@@ -107,22 +107,22 @@ The workbook's "All Versions" column is wrong for some rows (lookup errors), so 
 
 ### 4.2 Groups and outcome
 
-| Group | Content | Route | Status (28 Oct) |
+| Group | Content | Route | Status (29 Oct) |
 |---|---|---|---|
-| 1 | 32 text types | Text, with delta | Delivered (27 Sep); 7-repo gap open (section 8) |
+| 1 | 32 text types | Text, with delta | Delivered (27 Sep; failed repositories re-run in `full_extract_delta_2`). Reconciliation 29 Oct: ≈13,400 files lost to case-only name clashes on the share, being confirmed (7.7) |
 | 2 | 27 types: 9 text + 18 whole (Office, images, email, certificates) | Text with delta / whole files minus identical-to-today | Delivered (1 Oct) |
 | 3 | pdf, pkl | PDF merged per path; pkl as text | Delivered (≈5 Oct) |
-| 4.1 | 28 database types | **Path list only** | Built (7 Oct) [to confirm: copied to the share] |
+| 4.1 | 28 database types | **Path list only** at repository level; **inside archives sent whole** (28 Oct) | Path list built (7 Oct) [to confirm: copied to the share]; inside archives delivered 28 Oct (5.5) |
 | 4.1_R | 7 database / export types (bacpac, dacpac, …) | Path list + samples | Path lists built; samples not reviewed |
 | 4.2 | 39 archive / package types | Archives opened, contents routed by group; packages listed only | Delivered (16 Oct) |
 | 4.2_R | 21 package types (19 run) | Packages opened | Delivered (16 Oct) |
 | 4.3 / 4.6 | 2,891 "do not process / unknown" + 148 types | **Classified**, then re-grouped into 4.5_R, 4.2_R and 4.7 | Classification delivered (≈10 Oct) |
 | 4.4 | Executables (25 types) | Not processed | **Out of scope** [to confirm: decision and owner] |
-| 4.5 | 756 text types | Text, with delta | Run by a team colleague on a second server [to confirm: method, numbers, delivery] |
+| 4.5 | 756 text types | Text, with delta | Run and delivered by another team on their own machine, to `group5/group4_5` (flat names `G45_<n>__<hash>.txt`); records and repository mapping held by that team (5.7) |
 | 4.5_R | 890 text types re-grouped from 4.3/4.6 | Text, with delta | Delivered (12 Oct) |
-| 4.7 + 4.9 | 376 types (merged 19 Oct) | By type: text / whole / data-to-text / containers / per path by content | Delivered in parts 23–28 Oct; 10 types being sampled |
-| 4.8 | [to confirm] | Not processed | **Out of scope** [to confirm] |
-| 5 | No extension (277,516 files: Dockerfile, `.env`, …) | Not processed | **Not done.** Samples taken; a full listing needs a script change [to confirm: in or out] |
+| 4.7 + 4.9 | 376 types (merged 19 Oct) | By type: text / whole / data-to-text / containers / per path by content | Delivered in parts 21–27 Oct; 10 types being sampled; fixes open (43 mixed text files, 2 ELF programs, 5 repositories' history, 7.7) |
+| 4.8 | 33 audio / video / design types (mp3, mp4, wav, psd, swf, …) | Repository level: not processed. **Inside archives: sent whole** (28 Oct) | Repository level **out of scope** [to confirm]; inside archives delivered 28 Oct (5.5) |
+| 5 | No extension (277,516 files: Dockerfile, `.env`, …) | Repository level: not processed. **Inside archives: sent whole** (28 Oct) | Repository level **not done**, samples taken [to confirm: in or out]; inside archives delivered 28 Oct (5.5) |
 
 ---
 
@@ -156,6 +156,12 @@ What happened to each file:
 - Of the teams' own files: 50% were deleted, 19% renamed or moved, and 31% are on branches that can't be identified, because the archive keeps no branch names.
 
 Report: `reports/history_only_update_2026-09-28.md`.
+
+**Failed repositories:** 7 repositories failed in the first extraction (`full_extract`: 6 `repo_error`, 1 `timeout`), and 4 more missed 11 files (found by `validate_group1_counts.py`, 1 Oct). They were re-run in `full_extract_delta_2`, the run that was delivered, and are all `ok` there (checked 29 Oct, `repo_errors_all_runs.py`).
+
+**Share location:** `p1/32_ext/full_extract_delta_2`. No copy log for this delivery is on the project server [to confirm: who copied it and how].
+
+**Reconciliation (29 Oct, 7.7):** 6,838,128 files to send; 6,824,673 on the share. The difference is ≈13,444 files lost to case-only name clashes (two paths differing only in letter case; the share keeps one) and 11 files not on the share. The exact counts are being confirmed by a second run that separates real losses from folder-case differences.
 
 ### 5.2 Group 2: 27 types (1 Oct)
 
@@ -226,7 +232,22 @@ Strictly per repository. Today's files included.
 **Decisions and findings:**
 - `.env.prod.br` (plain text, not brotli, likely secrets): **user chose to leave it out** (listed, not sent).
 - A GPO backup of a domain policy was seen in a 4.2 repository (security finding, reported).
-- **Copy (16 Oct):** 1,033,777 of 1,034,079 landed. **302 were overwritten by case-only name clashes** (section 7.3).
+- **Copy (16 Oct):** 1,033,777 of 1,034,079 landed. **302 were overwritten by case-only name clashes** (section 7.3). Confirmed file by file on 29 Oct (7.7).
+
+**4.1, 4.8 and no-extension files inside the archives (28 Oct).** **Decision (user):** the 4.1 (database), 4.8 (audio / video / design) and Group 5 (no extension) files found inside archives are sent **whole**, each distinct content once per repository, with the same exclusions (vendored, macOS metadata, DocFX cache). At repository level these groups stay as in 4.2 above.
+
+| Inside | 4.2: files | GB | 4.2_R: files | GB |
+|---|---:|---:|---:|---:|
+| 4.1 database | 168 | 0.73 | 7 | ~0 |
+| 4.8 audio / video / design | 164 | 0.63 | 4 | 0.73 |
+| 5 no extension | 17,764 | 6.56 | 7,339 | 5.93 |
+| **Total** | **18,096** | **7.92** | **7,350** | **6.66** |
+
+- 1,447 no-extension paths inside 4.2 (7,990 versions) were not stored by the unpacking limits and are listed.
+- **Copy (28 Oct):** 25,439 of 25,446 on the share, checked file by file.
+  - One repository's transfer was interrupted (689 files); re-run, complete.
+  - **7 files not sent (user: leave them):** in 7 repositories a ZAP plugin holds a file `LICENSE` and a folder `license/`, which the share cannot keep apart. They are licence text.
+  - 8 names contain `:`, which the share does not allow; they landed under the share's substitute character.
 
 ### 5.6 Groups 4.3 / 4.6: classification (≈10 Oct)
 
@@ -237,12 +258,12 @@ Every type in 4.3 (2,891 + 51 sheet issues) and 4.6 (148) was classified: catego
 
 ### 5.7 Group 4.5 and 4.5_R: other text types
 
-- **4.5** (756 types): run by a team colleague on a second server with the same text kit (`handover/text_rest_kit`). [to confirm: completion, numbers, delivery.] The 4.5 types *inside archives* were run by us (5.5).
+- **4.5** (756 types): run by another team on their own machine with the same text kit (`handover/text_rest_kit`), and delivered to `p1/group5/group4_5` with flat names `G45_<number>__<hash>.txt`. Its source, manifests and the mapping from each `G45_` name to its repository are on that machine, not on this project's server. [to confirm with that team: completion, numbers, reconciliation.] The 4.5 types *inside archives* were run by us (5.5).
 - **4.5_R** (890 types, 12 Oct): delta as group 1, vendored skipped and listed.
   - 356,026 files in history → **290,608 sent, 19,964,659 lines, 25 GB**.
   - 12.59 M of 32.55 M lines (38.7%) were removed as already scanned.
   - 7 repositories timed out and were re-run individually. All 13,631 completed.
-  - **Copy:** 290,551 landed; **57 lost to case-only name clashes** (section 7.3).
+  - **Copy:** 290,551 landed; **57 lost to case-only name clashes** (section 7.3). Confirmed file by file on 29 Oct (7.7).
 
 ### 5.8 Group 4.7 + 4.9 (16–28 Oct)
 
@@ -258,7 +279,7 @@ Every type in 4.3 (2,891 + 51 sheet issues) and 4.6 (148) was classified: catego
 | Serialized data → text | 11 (rds, pickle, npy, …) | `data_to_text.py`: values decoded, numeric arrays and model weights skipped, never loaded | 4,929 `.txt`, 45.7 M lines, 0.52 GB | 211 `.txt` | 27 Oct |
 | Table data (whole) | 6 (parquet, orc, avro, …) | Whole files, each distinct content once | 3,235 files, 1.56 GB | 75 files | 27 Oct |
 | Containers → data + images | 9 (pbix, dbc, twbx, …) | `bi_to_data.py`: **only the data tables as text and the images**, no layout, queries, code or connections | 13,537 `.txt` (557 GB) + 2,750 images | 96 `.txt` + 28 images | 27 Oct |
-| Mixed types, per path by content | 7 (deploy, dump, tmp, out, …) | Text where every version is readable, whole otherwise; programs left out | 4,923 `.txt` + 158 files | 12 `.txt` + 6 files | 28 Oct (copy in progress) |
+| Mixed types, per path by content | 7 (deploy, dump, tmp, out, …) | Text where every version is readable, whole otherwise; programs left out | 4,923 `.txt` + 158 files (on the share: 4,880 + 160, see below) | 12 `.txt` + 6 files (on the share: 11 + 6) | 27 Oct |
 | Credentials and keys | 16 | — | **out of scope** | — | — |
 | Proposed exclude / list only | 10 | — | **being sampled** | — | — |
 
@@ -275,6 +296,11 @@ Every type in 4.3 (2,891 + 51 sheet issues) and 4.6 (148) was classified: catego
   - 21 paths with no text not sent.
 
   A check confirmed that names and contents agree: every xsd/xml/config went as text, every image whole, and all 85 left-out dll/exe versions are programs.
+
+  **Found in the 29 Oct reconciliation (7.7), to fix:**
+  - **43 text files not sent** (1 more inside 4.2): their names contain `.tmp.` (e.g. `….tmp.txt`), and the copy's exclude of temporary files (`*.tmp.*`) skipped them. The copy's own count check used the same exclude, so it reported OK.
+  - **The 2 ELF programs were copied** (160 whole files instead of 158): the copy ran before they were moved out. They are to be removed from the share.
+- **4.7+4.9 group 1 whole files, history (29 Oct):** 5 repositories ended with `no_pass2`: the check of which old versions equal today's file was not done, so **their history versions were not extracted** (today's files were). To be run.
 
 ---
 
@@ -308,7 +334,10 @@ Every type in 4.3 (2,891 + 51 sheet issues) and 4.6 (148) was classified: catego
 | 27 Oct | Mixed types: route by content; leave out dll / exe | User | Programs, not data |
 | 28 Oct | 2 ELF programs left out like dll / exe | Project team, per the above | Same reason |
 | 28 Oct | 10 proposed-exclude types sampled before deciding | User | Verify before excluding |
-| [to confirm] | 4.4, 4.8 and Group 5 out of scope | [to confirm] | [to confirm] |
+| 28 Oct | 4.1, 4.8 and no-extension files inside archives sent whole | User | Archives never scanned (5.5) |
+| 28 Oct | 7 `LICENSE` files (file / folder case clash) not sent | User | Licence text; share cannot hold both |
+| 29 Oct | Reconcile every delivery against the share, file by file, and every repository's run status from the start | User | Section 7.7 |
+| [to confirm] | 4.4 out of scope; 4.8 and Group 5 out of scope at repository level | [to confirm] | [to confirm] |
 
 ---
 
@@ -332,12 +361,17 @@ Every type in 4.3 (2,891 + 51 sheet issues) and 4.6 (148) was classified: catego
   - Losses: 302 files in the 4.2 copy and 57 in 4.5_R.
   - **Fixed from 4.7+4.9 onward:** such files are sent as `<name>__case2.<ext>`, with the mapping in `case_renamed.csv` (71 in 4.7+4.9 group 1, 19 in the containers / Group 3 text).
   - [to confirm: the 302 (4.2) and 57 (4.5_R) re-sent]
-- **Group 2 text:** 98 of 33,302 files were missing on the share after the copy, probably for the same reason. [to confirm: resolved]
+  - **Found on 29 Oct (7.7):** Group 1 ≈13,444, Group 2 text ≈98 (the 98 missing after its copy), Group 3 PDF ≈7. Being confirmed.
+  - A file and a **folder** whose names differ only in case also clash (the 7 `LICENSE` files, 5.5). The name check now in the copies compared files only.
+- **Names the share does not allow** (`:` and others, 437 names across the deliveries) landed under the share's substitute character; none failed.
+- **Temporary-file exclude:** the copies skip `*.tmp.*` to avoid sending half-written files. Real data whose name contains `.tmp.` was skipped too (45 files, 7.7). The exclude is to be narrowed to the tools' own temporary names.
 
 ### 7.4 Tracking files scanned by mistake (group 2)
 The scanning team scanned the whole group 2 folder, our tracking files included. The 651 results for tracking files were moved out of the scanner output (26,732 data results kept; 0 left, verified).
 
 **Control added:** tracking files are always delivered to separate `*_tracking` folders, and every copy checks that no tracking file is among the data.
+
+The scanner export of 28 Oct still holds 4 results for group 2 tracking files from that first scan (`binary/manifest.csv` and 3 report CSVs: `unique_files.csv`, `repo_delta.csv`, `certificates.csv`). They list paths and file names; the results have not been opened.
 
 ### 7.5 Performance incident (4.5_R)
 A run with 890 file types lost more than 24 hours: matching types with git patterns was about 200× slower than expected. It was replaced by matching in Python (same output, verified).
@@ -349,6 +383,47 @@ A run with 890 file types lost more than 24 hours: matching types with git patte
 - **Whole files:** named by content and stored once across repositories, so **the repository is not in their path**. The manifests map each one to every repository, path and commit.
   - On 28 Oct the scanner team asked for the repository of 9 priority documents. All 9 were traced to one repository with 36 paths, within minutes.
   - A full index (`whole_file_index.csv`, 204,279 files, 568,047 rows) is being put on the share so the team can look files up themselves.
+  - **Scanner export (28 Oct, 49,148 results):** every one of the 25,603 results for whole files, the files themselves (17,251) and items inside them such as email attachments and Office embeddings (8,352), was traced to its repositories and paths (`scanner_export_repos.py`). The 23,438 results for 4.5 (`G45_` names) need the mapping held by the team that ran 4.5. 103 results are run files (`inventory.csv`, …) from `Pack files` / `daily_archives` runs dated 23 Jul – 21 Aug 2026, not from these deliveries [to confirm: their origin].
+
+### 7.7 Reconciliation of all deliveries (29 Oct)
+
+Three read-only checks were run on the project server. They change nothing, and their outputs stay on the server.
+
+| Check | What it compares | Script |
+|---|---|---|
+| Run records | Every copy's failure list, count check and end status; every name problem and case rename; every repository's status in every run | `reconcile_failures.sh` |
+| **File by file** | For each delivery, every file that was to be sent against the share: present, missing, or present with another size, and why | `reconcile_copied_files.py` |
+| Repository errors from the start | The scope step's left-out repositories, then every run's per-repository history (each attempt) and final status | `repo_errors_all_runs.py` |
+
+**File by file (first run, 29 Oct).** Exact match, every file present:
+- Group 2 whole files 195,472, Group 3 pkl 1,062.
+- 4.7+4.9: group 2 whole 5,078, tabular 3,235, container images 2,750, group 1 text 13,905 and container text 13,537 (both including their `__case2` renames).
+- Inside archives: group 2 whole and text, pkl, 4.1, 4.8, and the 4.7+4.9 steps.
+
+Gaps found:
+
+| Delivery | To send | Gap | Cause |
+|---|---:|---|---|
+| Group 1 text | 6,838,128 | ≈13,444 + 11 | case-only clashes (new finding); 11 not on the share |
+| Group 2 text | 33,302 | ≈98 | case-only clashes (the 98 of 7.3) |
+| Group 3 PDF | 28,251 | ≈7 + 1 | case-only clashes; 1 `.tmp.` name |
+| 4.5_R text | 290,608 | 57 | case-only clashes (known, 7.3) |
+| 4.2 / 4.2_R contents | 1,034,079 | 302 | case-only clashes (known, 5.5) |
+| 4.7+4.9 mixed text | 4,923 + 12 | 43 + 1 | `.tmp.` in the name (5.8) |
+| 4.2_R no extension | 7,339 | 7 | `LICENSE` file / folder clash, not sent by decision (5.5) |
+| Several | — | ≈130 files present with another size (Group 1 1,685 before the case split) | partly the other file of a case clash; being checked |
+| 4.7+4.9 group 1 whole | 334 | share folder not found by the check | to verify (the copy log says done) |
+
+- The case figures are estimates from the first run. A second run that separates real losses (two paths differing only in case) from folders whose case differs on the share is in progress.
+- The 8 copies whose logs ended "finished with problems" each match a gap above.
+
+**Repository errors from the start:**
+- Scope step: the 202 repositories left out (all `repo_missing`, 2.1).
+- 77 runs. 4 had a failure, involving 20 repositories × run:
+  - **8 fixed on a re-run** of the same run: 7 in 4.5_R (timeouts) and 1 in 4.7+4.9 group 1 text.
+  - **7 in Group 1 `full_extract`** (6 `repo_error`, 1 `timeout`): `ok` in `full_extract_delta_2`, the delivered run.
+  - **5 in 4.7+4.9 group 1 whole files, history (`no_pass2`):** history versions not extracted (5.8). **Open.**
+- No repository failed in every run that covered it.
 
 ---
 
@@ -359,32 +434,41 @@ A run with 890 file types lost more than 24 hours: matching types with git patte
 | L1 | **No OCR** | 13,449 PDF pages (Group 3) and 2,027 pages inside archives have no text layer. The scanner skipped **137,589 images** in group 2 (`skipped_ocr_required`) and 10,448 binaries with no parser, so only about 78,000 of 228,676 group 2 files were actually scanned | Listed per page / file; raised with the user (7 Oct). [to confirm: decision on OCR] |
 | L2 | **202 repositories not available** | Not analysed | Search documented (2.1) |
 | L3 | **Git LFS pointers** | Content not in the archive (20,552 versions in group 2; 1,760 parquet versions; others) | Counted and listed |
-| L4 | **Group 1: 7 repositories failed in the first extraction** (+26,800 files never sent), 4 more missed 11 files | Gap in group 1 | Validated 1 Oct (`validate_group1_counts.py`). [to confirm: re-run done?] |
+| L4 | **Group 1: 7 repositories failed in the first extraction**, 4 more missed 11 files | Was a gap in group 1 | **Closed:** re-run in `full_extract_delta_2`, all `ok` (checked 29 Oct, 5.1) |
 | L5 | **Branch information not in the archive** | 31% of history-only own files can't be placed on a branch | Content extracted regardless (P2) |
-| L6 | **Out of scope by decision:** credentials/keys (16 types), dll/exe programs, 4.4, 4.8, Group 5 (277,516 no-extension files incl. `.env`) | Not scanned | Decision log (6) |
+| L6 | **Out of scope by decision:** credentials/keys (16 types), dll/exe programs, 4.4; 4.8 and Group 5 (277,516 no-extension files incl. `.env`) at repository level | Not scanned (4.8 and Group 5 files inside archives were sent, 5.5) | Decision log (6) |
 | L7 | **Damaged or unreadable files** | Not read: 450 PDF versions, 5 damaged pbix versions, 15 archives, 1 pbix table, and others | Listed in each run's summary |
 | L8 | **Noise in pickle text** | 40.3 M raw-string lines | Accepted (26 Oct) |
 | L9 | **Archives kept closed:** dxp 7 (Spotfire, client lease data), ppkg 5 (may hold Wi-Fi keys / admin passwords), ucs 3 | Not opened | Open decision |
-| L10 | **Group 4.5 run outside this project's server** | Not verified by us | [to confirm] |
+| L10 | **Group 4.5 run and delivered by another team on their machine** | Not reconciled by us; its 23,438 scanner results cannot be traced from here | Mapping requested from that team (29 Oct) |
 | L11 | **Case-only name clashes before 23 Oct** | 302 + 57 files overwritten on the share | 7.3 |
 | L12 | **Container data is large** (557 GB, single files up to 18 GB) | Scanner load | Agreed by the scanner team |
+| L13 | **Group 1: case-only name clashes on the share** (found 29 Oct) | ≈13,444 files not scanned (estimate) | Being confirmed (7.7); re-send under `__case2` names [to confirm] |
+| L14 | **Temporary-file exclude also skipped real data** with `.tmp.` in the name | 45 files (43 + 1 mixed text, 1 Group 3 PDF) | To re-send; exclude to be narrowed (7.3) |
+| L15 | **4.7+4.9 group 1 whole files: 5 repositories' history not extracted** (`no_pass2`) | Their older versions not sent | To run (5.8) |
+| L16 | **2 ELF programs on the share** (mixed whole files) | Programs delivered, against the decision | To remove (5.8) |
 
 ---
 
-## 9. Open items (28 Oct)
+## 9. Open items (29 Oct)
 
-1. Mixed types: finish the copy and confirm the counts (4,923 + 12 `.txt`, 158 + 6 files).
-2. Whole-file index: copy it to `p1/whole_file_index_tracking/`.
-3. 10 proposed-exclude types (arff, xcuserstate, test-db, train, sublime-workspace, ftz, rsuser, 2ph, mmdb; jar1 list only): sampled 28 Oct, decision pending.
-4. 460 `.dbc` files that are plain notebook source (may hold storage keys): send as text or not.
-5. dxp / ppkg / ucs closed archives: open or not.
-6. 4.1_R samples review.
-7. Group 3 text: apply the one remaining case rename (4,928 → 4,929 on the share).
-8. Delete the removed duplicate container text from the server (317 GiB) once confirmed.
-9. [to confirm] Re-send the 302 (4.2) and 57 (4.5_R) case-clash files; the 98 group 2 text files.
-10. [to confirm] Group 1 7-repo gap.
-11. [to confirm] Group 5, 4.4, 4.8 scope; OCR.
-12. [to confirm] CyberArk `cred-dont use` files treated as credentials.
+1. **Confirm the case-clash losses** with the second reconciliation run (Group 1 ≈13,444, Group 2 text ≈98, Group 3 PDF ≈7), and the files present with another size; then re-send them under `__case2` names together with the 302 (4.2) and 57 (4.5_R) [to confirm: re-send approved].
+2. **Re-send the 45 `.tmp.`-named files** (mixed text 43 + 1, Group 3 PDF 1) and narrow the copies' temporary-file exclude.
+3. **Remove the 2 ELF programs** from `group4_7_9/mixed_binary` (after `--move-programs` on the server), then rebuild the whole-file index (204,277 files expected).
+4. **Run the 5 `no_pass2` repositories** (4.7+4.9 group 1 history) and send their files.
+5. **4.7+4.9 group 1 whole files (334):** confirm where they are on the share.
+6. **Group 1:** list the 11 files not on the share; confirm who copied Group 1 and how.
+7. **4.5:** mapping of `G45_` names to repositories, and its reconciliation, from the team that ran it.
+8. Whole-file index: copy it to `p1/whole_file_index_tracking/`.
+9. 10 proposed-exclude types (arff, xcuserstate, test-db, train, sublime-workspace, ftz, rsuser, 2ph, mmdb; jar1 list only): sampled 28 Oct, decision pending.
+10. 460 `.dbc` files that are plain notebook source (may hold storage keys): send as text or not.
+11. dxp / ppkg / ucs closed archives: open or not.
+12. 4.1_R samples review.
+13. Group 3 text: apply the one remaining case rename (4,928 → 4,929 on the share).
+14. Delete the removed duplicate container text from the server (317 GiB) once confirmed.
+15. [to confirm] Group 5, 4.4, 4.8 scope at repository level; OCR.
+16. [to confirm] CyberArk `cred-dont use` files treated as credentials.
+17. [to confirm] Origin of the 103 `Pack files` / `daily_archives` results in the scanner export.
 
 ---
 
@@ -396,12 +480,13 @@ All under `diff_analysis/p1/` on the file share. Scan only the data folders; the
 |---|---|---|
 | Group 2 | `group2/binary/files/`, `group2/text/` | `group2/binary/manifest.csv`, `group2/text/_state/` (delivered together, before P9) |
 | Group 3 | `group3/pdf/`, `group3/pkl/` | `group3_tracking/` |
-| 4.1 | — | `group4_1/` (path lists) [to confirm] |
-| 4.2 / 4.2_R | `group4_2/<step>/`, `group4_2_R/<step>/` | `group4_2_tracking/`, `group4_2_R_tracking/` |
+| 4.1 | inside archives: `group4_2/group4_1_binary/`, `group4_2_R/group4_1_binary/` | `group4_1/` (path lists) [to confirm] |
+| 4.2 / 4.2_R | `group4_2/<step>/`, `group4_2_R/<step>/` (from 28 Oct also `group4_8_binary/`, `group5_noext_binary/`) | `group4_2_tracking/`, `group4_2_R_tracking/` (copy checks of 28 Oct: `group4_2_tracking/copy_checks_g41_g48_g5/`) |
+| 4.5 | `group5/group4_5/` (delivered by another team) | held by that team |
 | 4.5_R | `group4_5_R/` | `group4_5_R_tracking/` |
 | 4.7+4.9 | `group4_7_9/{group1_text, group2_binary/files, group3_text, tabular_binary/files, bi_data/{data_text,files}, mixed_text, mixed_binary/files}`, `group4_7_9/group4_2/…`, `group4_7_9/group4_2_R/…` | `group4_7_9_tracking/` |
 | Whole-file index | — | `whole_file_index_tracking/` |
-| Group 1 | [to confirm: share location of the 27 Sep delivery] | |
+| Group 1 | `32_ext/full_extract_delta_2/` | [to confirm] |
 
 ---
 
@@ -441,7 +526,7 @@ Used to understand the storage, choose the sources and fix the repository list. 
 | `repo_extension_summary.py` | Per repository: files, commits and split by the file types in scope; holds the group 1 type list | Batch weights; group 1 types |
 | `make_batches.py` | Split repositories into giant / large / medium / small batches of balanced workload; missing repositories listed in `excluded.csv` | All runs (2.3) |
 | `check_missing_repos.py` | Search the missing repositories in every storage location under exact and similar names | The 202 missing repositories (2.1) |
-| `make_input_csv.py`, `pii_secret_scan.py` | Test input builder; a gitleaks secret / PII scan of full history | Exploration only [to confirm: whether the gitleaks scan was used for any delivery] |
+| `make_input_csv.py`, `pii_secret_scan.py` | Test input builder; a gitleaks secret / PII scan of full history | Exploration only; no gitleaks output exists on the server (checked 28 Oct), so it was not used for any delivery |
 
 ### B.2 Counting and research (what is there, before deciding)
 
@@ -511,6 +596,16 @@ Used to understand the storage, choose the sources and fix the repository list. 
 | `find_blob_repos.py` | Repository, path and commits of whole files named by blob id, from a pasted list | Read only (manifests) |
 | `build_whole_file_index.py` | Index of every content-named whole file on the share → all its repositories, paths and commits | Read only; counts match the stores (7.2) |
 | `csv_to_xlsx.py` | CSV to Excel with standard Python only | — |
+| `scanner_export_repos.py` | Every result of a scanner export → its whole file (the file itself or the file it was found inside) → all its repositories and paths | Read only (export and manifests) |
+| `collect_record_counts.py` | The exact counts for this record, from the local run outputs | Read only |
+
+### B.9 Reconciliation (29 Oct)
+
+| Script | What it does | Safeguards |
+|---|---|---|
+| `reconcile_failures.sh` | Every copy's failure list, count check and end status, every name problem and case rename, every repository's last status | Read only; writes only to the user's home folder |
+| `reconcile_copied_files.py` | File by file per delivery: what was to be sent against what is on the share, with the reason for each gap (not on the share, case overwritten, `.tmp.` name, other size) | Read only; parallel per repository / type folder |
+| `repo_errors_all_runs.py` | Every repository that failed in any run, from the scope step on, its attempts, and whether it was fixed later or in another run | Read only |
 
 ## Appendix C: Related records
 
