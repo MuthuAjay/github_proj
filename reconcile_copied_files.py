@@ -21,8 +21,12 @@ temp files (<name>.tmp.<pid>[.<n>], .tmp.copy, names starting .tmp.) are not
 data and only counted.
 
 A source file not on the share under its exact name is put down as:
-  case clash        the share holds the same path in another case (the share
-                    ignores case: one file overwrote the other)
+  case overwritten  another source file has the same path in another case
+                    (A.txt / a.txt): the share ignores case, so only one of
+                    the two is there - this one is lost
+  other-case path   (not a failure) the only source file with this path; the
+                    share holds it with a folder in another case (Src/ and
+                    src/ in the source end up in one folder on the share)
   sent as __case    the share holds it under a __case<n> name
   .tmp. in name     a real data file whose name contains .tmp. - the copies'
                     --exclude "*.tmp.*" left it out
@@ -79,6 +83,7 @@ FIXED = [
      "group4_7_9/mixed_binary/files", "types"),
 ]
 INNER_RUNS = ["group4_2", "group4_2_R"]    # every step folder with a _state
+NOT_SENT = {"4_2_extract", "counts", "unpacked"}    # work steps, never delivered
 
 
 def say(msg):
@@ -93,7 +98,7 @@ def deliveries():
         if not os.path.isdir(base):
             continue
         for step in sorted(os.listdir(base)):
-            if not os.path.isdir(os.path.join(base, step, "_state")):
+            if step in NOT_SENT or not os.path.isdir(os.path.join(base, step, "_state")):
                 continue
             # 4.7+4.9 inside the archives went under p1/group4_7_9/<run>/<step>
             dst = os.path.join(P1, "group4_7_9", run, step) if step.startswith("group4_7_9") \
@@ -151,14 +156,35 @@ def check(i, label, srcs, dst, unit, sizes):
     shr, errs = listing(os.path.join(dst, unit), sizes)
     c = Counter(share_unreadable=errs)
     miss, extra = [], []
-    low = {k.lower() for k in shr}
+    low = {k.lower(): k for k in shr}
+    src_low = Counter(r.lower() for r in src if not our_tmp(r))
     uncased = {CASE.sub("", k).lower() for k in shr if CASE.search(k)}
+    # case twins (same path but for case): the share holds one file for the
+    # group - the survivor is the twin of that name and size, else of that size
+    groups = defaultdict(list)
+    for r in src:
+        if src_low[r.lower()] > 1:
+            groups[r.lower()].append(r)
+    survivor = {}
+    for L, g in groups.items():
+        if L in low:
+            k = low[L]
+            same = [r for r in g if not sizes or src[r][1] == shr[k]]
+            survivor[L] = k if k in same else (same[0] if same else None)
     for rel, (full, n) in src.items():
         if our_tmp(rel):
             c["our_temp_in_source"] += 1
             continue
         c["source_files"] += 1
         sf = os.path.join(unit, rel)
+        twin = src_low[rel.lower()] > 1
+        if twin and CASE.sub("", rel).lower() not in uncased:
+            if survivor.get(rel.lower()) == rel:
+                c["on_share" if rel in shr else "other-case path"] += 1
+            else:
+                c["case overwritten"] += 1
+                miss.append((label, "case overwritten", full, sf, n))
+            continue
         if rel in shr:
             if sizes and shr[rel] != n:
                 c["size differs"] += 1
@@ -171,7 +197,12 @@ def check(i, label, srcs, dst, unit, sizes):
         elif CASE.sub("", rel).lower() in uncased:
             why = "sent as __case"
         elif rel.lower() in low:
-            why = "case clash"
+            if sizes and shr[low[rel.lower()]] != n:
+                c["size differs"] += 1
+                miss.append((label, "size differs", full, sf, n))
+            else:
+                c["other-case path"] += 1
+            continue
         else:
             why = "not on share"
         c[why] += 1
@@ -179,14 +210,14 @@ def check(i, label, srcs, dst, unit, sizes):
     for rel in shr:
         if our_tmp(rel):
             c["our_temp_on_share"] += 1
-        elif rel not in src:
+        elif rel not in src and rel.lower() not in src_low:
             c["extra_on_share"] += 1
             extra.append((label, os.path.join(unit, rel)))
     c["share_files"] = len(shr) - c["our_temp_on_share"]
     return i, c, miss, extra
 
 
-REASONS = ["on_share", "not on share", "case clash", "sent as __case", ".tmp. in name",
+REASONS = ["on_share", "other-case path", "not on share", "case overwritten", "sent as __case", ".tmp. in name",
            "size differs", "extra_on_share", "our_temp_in_source", "our_temp_on_share",
            "share_unreadable"]
 
@@ -252,13 +283,13 @@ def main():
         w.writerow(["delivery", "source", "share", "status", "source_files", "share_files"] + REASONS)
         for i, (lab, srcs, dst, kind) in enumerate(ds):
             c = tot[i]
-            bad = sum(c[r] for r in ("not on share", "case clash", ".tmp. in name", "size differs"))
+            bad = sum(c[r] for r in ("not on share", "case overwritten", ".tmp. in name", "size differs"))
             st = status.get(i) or ("OK" if not bad else "MISSING / DIFFERENT")
             w.writerow([lab, ",".join(srcs), dst, st, c["source_files"], c["share_files"]]
                        + [c[r] for r in REASONS])
-            say("  %-40s %-28s source %9d  share %9d  on share %9d  not %6d  case %5d  __case %4d  .tmp. %4d  size %4d  extra %6d"
+            say("  %-40s %-28s source %9d  share %9d  on share %9d  not %6d  case lost %5d  __case %4d  .tmp. %4d  size %4d  extra %6d"
                 % (lab, st, c["source_files"], c["share_files"], c["on_share"], c["not on share"],
-                   c["case clash"], c["sent as __case"], c[".tmp. in name"], c["size differs"],
+                   c["case overwritten"], c["sent as __case"], c[".tmp. in name"], c["size differs"],
                    c["extra_on_share"]))
     say("done -> %s" % a.out)
 
