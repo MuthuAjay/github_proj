@@ -1,42 +1,51 @@
 #!/usr/bin/env python3
 """Send again the data files reconcile_copied_files.py found missing on the
-share, from its --out folder (summary.csv: delivery -> share folder,
-missing_files.csv: delivery, reason, source_file, share_file, bytes).
+share - into a NEW folder, rerun, on the server and on the share; the first
+deliveries are not touched. Reads its --out folder (summary.csv: delivery ->
+share folder, missing_files.csv: delivery, reason, source_file, share_file,
+bytes).
 
-DRY RUN unless --go: writes resend_plan.csv to --rec and prints the counts,
-copies nothing. With --go it copies (the share needs sudo):
+    server   /data/workarea/rerun/<delivery folder under p1>/<path>
+    share    $P1/rerun/<delivery folder under p1>/<path>       (the same tree)
+    tracking /data/workarea/rerun_tracking/ and $P1/rerun_tracking/
+             (never inside rerun: the scanner takes every file there as data)
+
+e.g. Group 1's  p1/32_ext/full_extract_delta_2/<org>/<repo>/<path>.txt
+         ->     p1/rerun/32_ext/full_extract_delta_2/<org>/<repo>/<path>.txt
+
+DRY RUN unless --go: writes the plan to the server's tracking folder and
+prints the counts, copies nothing. --go copies to the server folder, then
+rsyncs it to the share, then checks share against server (the share needs
+sudo, the whole command inside sudo bash -c):
 
     python3 resend_missing.py --rec /home/ganeshk/reconcile_files2
-    sudo nohup python3 resend_missing.py --rec /home/ganeshk/reconcile_files2 --go \
-        > /home/ganeshk/resend.out 2>&1 &
+    sudo bash -c 'cd /data/workarea/scripts && nohup python3 resend_missing.py \
+        --rec /home/ganeshk/reconcile_files2 --go > /data/workarea/rerun.out 2>&1 &'
 
-By reason:
-  not on share       copied to its path on the share
-  .tmp. in name      the same (the copies' '*.tmp.*' exclude skipped them)
-  case overwritten   copied under <name>__case<n>.<ext> beside the survivor
-                     (n from 2, the first name the folder does not hold in
-                     any case), the way the copy scripts do it; old -> new
-                     in case_renamed_resend.csv
-  size differs       only with --size-differs: the share's file is REPLACED.
-                     Look at the dry run's list of them first.
-Left, and listed in the plan with the reason:
-  blocked            the share holds a folder where the file goes (or a file
-                     where a folder goes) under another case - LICENSE vs
-                     license/ - nothing written
-  source gone        the source file is no longer there
+Sent (reasons of missing_files.csv): not on share, .tmp. in name (the
+copies' '*.tmp.*' exclude skipped them), case overwritten (the share kept
+its twin), size differs (the share's file is left as it is; this is the
+source's). --skip REASON leaves a reason out, --only LABEL limits it to
+deliveries of summary.csv. A source file no longer there is listed, not sent.
 
---only LABEL (repeatable) limits it to deliveries of summary.csv.
-Files go through <dest>.tmp.copy and a rename; a file already on the share
-at the same size is skipped, so after a stop run the same command again.
-Writes to --rec (CRLF): resend_plan.csv (delivery, reason, source_file,
-share_dest, bytes, action), with --go resend_done.csv (+ result) and
-case_renamed_resend.csv (delivery, source_file, share_dest). Tracking only,
-never on the share's data folders.
+Names: the share ignores case, so two files sent here whose paths differ only
+by case (or a file where another sent path has a folder - LICENSE vs
+license/) would land on one: the first (sorted) keeps its name, the others
+go as <name>__case<n>.<ext>, the same name on the server and the share; old
+-> new in case_renamed.csv. Files go through <dest>.tmp.copy and a rename;
+a file already there at the same size is skipped, so after a stop run the
+same command again.
+
+Tracking (CRLF): plan.csv (delivery, reason, source_file, rerun_path, bytes,
+action), case_renamed.csv, with --go staged.csv (+ result) and check.csv
+(path, problem) and check.txt.
 """
 import argparse
 import csv
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
@@ -44,50 +53,43 @@ from concurrent.futures import ThreadPoolExecutor
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 KW = dict(newline="", encoding="utf-8", errors="surrogateescape")
-PLAIN = ("not on share", ".tmp. in name")
+SEND = ["not on share", ".tmp. in name", "case overwritten", "size differs"]
+OUR_TMP = re.compile(r"\.tmp\.(\d+(\.\d+)?|copy)$")
+P1 = "/home/ganeshk/eng-gh2-data-fs/diff_analysis/p1"
+RSYNC = ["rsync", "-rt", "--no-perms", "--no-owner", "--no-group", "--partial"]
 
 
 def say(msg):
     print(time.strftime("%F %T ") + msg, flush=True)
 
 
-def blocked(dst, rel):
-    """a folder at the file's place, or a file at one of its folders' places
-    (the share ignores case, so os.path sees the other-case one)."""
-    p = os.path.join(dst, rel)
-    if os.path.isdir(p):
-        return True
-    parts = rel.split("/")[:-1]
-    for i in range(1, len(parts) + 1):
-        q = os.path.join(dst, *parts[:i])
-        if os.path.lexists(q) and not os.path.isdir(q):
-            return True
-    return False
+def our_tmp(name):
+    return bool(OUR_TMP.search(name)) or name.startswith(".tmp.")
 
 
-class Names:
-    """free __case<n> names per share folder, lower case, cached."""
-    def __init__(self):
-        self.taken = {}
-
-    def next(self, folder, base):
-        if folder not in self.taken:
-            try:
-                self.taken[folder] = {n.lower() for n in os.listdir(folder)}
-            except OSError:
-                self.taken[folder] = set()
-        t = self.taken[folder]
-        stem, dot, ext = base.rpartition(".")
-        k = 2
-        while True:
-            new = "%s__case%d.%s" % (stem, k, ext) if dot and stem else "%s__case%d" % (base, k)
-            if new.lower() not in t:
-                t.add(new.lower())
-                return new
-            k += 1
+def case_name(rel, k):
+    d, base = os.path.split(rel)
+    stem, dot, ext = base.rpartition(".")
+    new = "%s__case%d.%s" % (stem, k, ext) if dot and stem else "%s__case%d" % (base, k)
+    return os.path.join(d, new)
 
 
-def copy_one(job):
+def keep_apart(rels):
+    """rel -> rel on the share: paths equal but for case, or a file where
+    another path has a folder, get __case<n> names (first sorted keeps its)."""
+    dirs = {os.path.dirname(r).lower() for r in rels}
+    dirs = {d for x in dirs for d in [x] + [x.rsplit("/", i)[0] for i in range(1, x.count("/") + 1)]}
+    taken, out = set(dirs), {}
+    for r in sorted(rels):
+        new, k = r, 2
+        while new.lower() in taken:
+            new, k = case_name(r, k), k + 1
+        taken.add(new.lower())
+        out[r] = new
+    return out
+
+
+def stage_one(job):
     src, dest = job
     try:
         if os.path.isfile(dest) and os.path.getsize(dest) == os.path.getsize(src):
@@ -100,85 +102,150 @@ def copy_one(job):
         return "FAILED: %s" % exc
 
 
+def listing(root):
+    got = {}
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            if our_tmp(f):
+                continue
+            p = os.path.join(dp, f)
+            try:
+                got[os.path.relpath(p, root)] = os.stat(p).st_size
+            except OSError:
+                got[os.path.relpath(p, root)] = -1
+    return got
+
+
+def write_csv(path, head, rows):
+    with open(path, "w", **KW) as fh:
+        w = csv.writer(fh, lineterminator="\r\n")
+        w.writerow(head)
+        w.writerows(rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rec", required=True, help="reconcile_copied_files.py --out folder")
     ap.add_argument("--only", action="append", default=[], metavar="LABEL")
-    ap.add_argument("--size-differs", action="store_true", help="also replace the share's files of another size")
+    ap.add_argument("--skip", action="append", default=[], metavar="REASON", choices=SEND)
+    ap.add_argument("--p1", default=P1, help="the share's p1 folder")
+    ap.add_argument("--server", default="/data/workarea/rerun")
+    ap.add_argument("--name", default="rerun", help="share folder under p1 (+ _tracking)")
     ap.add_argument("--go", action="store_true", help="copy (default: dry run, plan only)")
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
+    server = a.server.rstrip("/")
+    s_track = server + "_tracking"
+    share = os.path.join(a.p1, a.name)
+    sh_track = share + "_tracking"
+    for p in (share, sh_track):
+        if os.path.realpath(p).startswith(os.path.realpath(server)):
+            sys.exit("the share folder is inside the server folder: %s" % p)
+    os.makedirs(s_track, exist_ok=True)
 
     dst_of = {}
     with open(os.path.join(a.rec, "summary.csv"), **KW) as fh:
         for r in csv.DictReader(fh):
             dst_of[r["delivery"]] = r["share"]
-    want = set(PLAIN) | {"case overwritten"} | ({"size differs"} if a.size_differs else set())
+    want = set(SEND) - set(a.skip)
 
-    # a rerun after a stop keeps the __case names the last --go gave
-    prior, cr = {}, os.path.join(a.rec, "case_renamed_resend.csv")
-    if os.path.isfile(cr):
-        with open(cr, **KW) as fh:
-            prior = {(r["delivery"], r["source_file"]): r["share_dest"] for r in csv.DictReader(fh)}
-    names, plan, c = Names(), [], Counter()
+    rows, c = [], Counter()
     with open(os.path.join(a.rec, "missing_files.csv"), **KW) as fh:
         for r in csv.DictReader(fh):
             lab, why = r["delivery"], r["reason"]
             if a.only and lab not in a.only:
                 continue
             if why not in want:
-                c[(lab, why, "not asked for")] += 1
+                c[(lab, why, "not sent (reason not asked for)")] += 1
                 continue
-            dst, rel, src = dst_of.get(lab), r["share_file"], r["source_file"]
-            if not dst:
-                act, dest = "no share folder in summary.csv", ""
-            elif not os.path.isfile(src):
-                act, dest = "left: source gone", ""
-            elif blocked(dst, rel):
-                act, dest = "left: blocked (file / folder by case)", os.path.join(dst, rel)
-            elif why == "case overwritten" and (lab, src) in prior:
-                act, dest = "send as __case", prior[(lab, src)]
-            elif why == "case overwritten":
-                folder = os.path.dirname(os.path.join(dst, rel))
-                dest = os.path.join(folder, names.next(folder, os.path.basename(rel)))
-                act = "send as __case"
-            else:
-                act, dest = "replace" if why == "size differs" else "send", os.path.join(dst, rel)
-            c[(lab, why, act)] += 1
-            plan.append([lab, why, src, dest, r["bytes"], act])
+            dst = dst_of.get(lab, "")
+            base = os.path.relpath(dst, a.p1) if dst and not os.path.relpath(dst, a.p1).startswith("..") \
+                else lab
+            rows.append([lab, why, r["source_file"], os.path.join(base, r["share_file"]), r["bytes"]])
 
-    with open(os.path.join(a.rec, "resend_plan.csv"), "w", **KW) as fh:
-        w = csv.writer(fh, lineterminator="\r\n")
-        w.writerow(["delivery", "reason", "source_file", "share_dest", "bytes", "action"])
-        w.writerows(plan)
+    names = keep_apart({x[3] for x in rows})
+    plan, renamed = [], []
+    for lab, why, src, rel, n in rows:
+        new = names[rel]
+        if not os.path.isfile(src):
+            act = "left: source gone"
+        else:
+            act = "send" if new == rel else "send as __case"
+            if new != rel:
+                renamed.append([lab, src, rel, new])
+        c[(lab, why, act)] += 1
+        plan.append([lab, why, src, new, n, act])
+    write_csv(os.path.join(s_track, "plan.csv"),
+              ["delivery", "reason", "source_file", "rerun_path", "bytes", "action"], plan)
+    write_csv(os.path.join(s_track, "case_renamed.csv"),
+              ["delivery", "source_file", "path", "rerun_path"], renamed)
+
     say("plan (%s):" % ("copying" if a.go else "DRY RUN, nothing copied"))
     for (lab, why, act), n in sorted(c.items()):
-        say("  %-40s %-18s %-40s %7d" % (lab, why, act, n))
-    todo = [p for p in plan if p[5] in ("send", "send as __case", "replace")]
-    say("to copy: %d file(s), %.1f MB -> %s/resend_plan.csv"
-        % (len(todo), sum(int(p[4] or 0) for p in todo) / 1e6, a.rec))
+        say("  %-40s %-18s %-32s %7d" % (lab, why, act, n))
+    todo = [p for p in plan if p[5].startswith("send")]
+    say("to send: %d file(s), %.1f MB, %d under a __case name" % (
+        len(todo), sum(int(p[4] or 0) for p in todo) / 1e6, len(renamed)))
+    say("  server %s, share %s, tracking %s and %s" % (server, share, s_track, sh_track))
     if not a.go:
         return
 
-    res = Counter()
-    with ThreadPoolExecutor(a.workers) as ex, \
-            open(os.path.join(a.rec, "resend_done.csv"), "w", **KW) as fd, \
-            open(os.path.join(a.rec, "case_renamed_resend.csv"), "w", **KW) as fc:
-        wd = csv.writer(fd, lineterminator="\r\n")
-        wc = csv.writer(fc, lineterminator="\r\n")
-        wd.writerow(["delivery", "reason", "source_file", "share_dest", "bytes", "action", "result"])
-        wc.writerow(["delivery", "source_file", "share_dest"])
-        for i, (p, got) in enumerate(zip(todo, ex.map(copy_one, [(p[2], p[3]) for p in todo])), 1):
-            wd.writerow(p + [got])
-            if p[5] == "send as __case" and not got.startswith("FAILED"):
-                wc.writerow([p[0], p[2], p[3]])
-            res[got if not got.startswith("FAILED") else "FAILED"] += 1
+    # ------------------------------------------------------- 1. server copy
+    say("=== 1. server copy -> %s" % server)
+    res, staged = Counter(), []
+    with ThreadPoolExecutor(a.workers) as ex:
+        jobs = [(p[2], os.path.join(server, p[3])) for p in todo]
+        for i, (p, got) in enumerate(zip(todo, ex.map(stage_one, jobs)), 1):
+            staged.append(p + [got])
+            res["FAILED" if got.startswith("FAILED") else got] += 1
             if got.startswith("FAILED"):
                 say("  %s %s" % (got, p[2]))
             if i % 2000 == 0:
                 say("  %d / %d" % (i, len(todo)))
-    say("done: %s%s" % (dict(res), " - FINISHED WITH PROBLEMS, run again to retry" if res["FAILED"] else " - ALL DONE"))
-    sys.exit(1 if res["FAILED"] else 0)
+    write_csv(os.path.join(s_track, "staged.csv"),
+              ["delivery", "reason", "source_file", "rerun_path", "bytes", "action", "result"], staged)
+    say("  %s" % dict(res))
+    if res["FAILED"]:
+        say("FINISHED WITH PROBLEMS: server copy failed for %d file(s), share not started - run again"
+            % res["FAILED"])
+        sys.exit(1)
+
+    # -------------------------------------------------------- 2. the share
+    say("=== 2. share -> %s" % share)
+    os.makedirs(share, exist_ok=True)
+    rc = subprocess.call(RSYNC + ["--exclude", "*.tmp.copy", server + "/", share + "/"])
+    say("  rsync exit %d" % rc)
+
+    # ------------------------------------------------------- 3. the check
+    say("=== 3. check: server against share")
+    srv, shr = listing(server), listing(share)
+    low = {k.lower(): k for k in shr}
+    probs = []
+    for rel, n in sorted(srv.items()):
+        k = rel if rel in shr else low.get(rel.lower())
+        if k is None:
+            probs.append([rel, "not on share"])
+        elif shr[k] != n:
+            probs.append([rel, "size differs (server %d, share %d)" % (n, shr[k])])
+    planned = {p[3] for p in todo}
+    probs += [[rel, "on the server, not in this plan (earlier run?)"] for rel in sorted(srv) if rel not in planned]
+    write_csv(os.path.join(s_track, "check.csv"), ["path", "problem"], probs)
+    bad = sum(1 for p in probs if not p[1].startswith("on the server"))
+    lines = ["server files %d, share files %d, planned %d" % (len(srv), len(shr), len(planned)),
+             "not on share / size differs: %d" % bad,
+             "on the server, not in this plan: %d" % (len(probs) - bad)]
+    with open(os.path.join(s_track, "check.txt"), "w", newline="\r\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    for l in lines:
+        say("  " + l)
+
+    # ------------------------------------------------------- 4. tracking
+    os.makedirs(sh_track, exist_ok=True)
+    rc2 = subprocess.call(RSYNC + [s_track + "/", sh_track + "/"])
+    say("=== 4. tracking -> %s (rsync exit %d)" % (sh_track, rc2))
+    ok = rc == 0 and rc2 == 0 and bad == 0
+    say("ALL DONE" if ok else "FINISHED WITH PROBLEMS - run the same command again; see check.csv")
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
