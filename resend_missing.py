@@ -36,9 +36,29 @@ go as <name>__case<n>.<ext>, the same name on the server and the share; old
 a file already there at the same size is skipped, so after a stop run the
 same command again.
 
-Tracking (CRLF): plan.csv (delivery, reason, source_file, rerun_path, bytes,
-action), case_renamed.csv, with --go staged.csv (+ result) and check.csv
-(path, problem) and check.txt.
+Repos re-extracted (--whole, e.g. the 5 no_pass2 repos of 4.7+4.9 group 1
+binary, once pass 2 and extract_versions.py --repo have run for them) send
+their whole files instead of --rec's list:
+
+    python3 resend_missing.py --whole /data/workarea/group4_7_9/group1/not_text \
+        --repos /home/ganeshk/np2.txt
+    (--go as above)
+
+  per repo of --repos (org/repo a line) the rows of <whole>/binary/_state/
+  <org>/<repo>/manifest.csv whose path is on <whole>/../not_text_paths.csv
+  (the paths sent whole - text paths and dll / exe.deploy are not): the file
+  of a `written` row (new content), and of a `deduped` row whose file is not
+  in <whole>/binary/files (another repo stored it, but it went to _not_sent:
+  never delivered) - from <whole>/binary/_not_sent/files. A deduped content
+  already in <whole>/binary/files was delivered with the first copy.
+    -> rerun/<--whole-share>/files/<ext>/<ab>/<blob>.<ext>
+       (default group4_7_9/group1_binary, where the first copy put them)
+  the repos' manifest rows go to the tracking as no_pass2_manifest.csv.
+
+Tracking (CRLF), each file named <tag>_... (tag: missing, or no_pass2 with
+--whole; --tag to change): plan.csv (delivery, reason, source_file,
+rerun_path, bytes, action), case_renamed.csv, with --go staged.csv (+ result)
+and check.csv (path, problem) and check.txt.
 """
 import argparse
 import csv
@@ -123,9 +143,58 @@ def write_csv(path, head, rows):
         w.writerows(rows)
 
 
+def whole_rows(nt, repos_file, share_rel, s_track, tag):
+    """[delivery, reason, source, rerun rel, bytes] for the repos' whole files"""
+    lab = os.path.relpath(nt, "/data/workarea") if nt.startswith("/data/workarea/") else nt
+    with open(os.path.join(os.path.dirname(nt.rstrip("/")), "not_text_paths.csv"), **KW) as fh:
+        keep = {(r["org"], r["repo"], r["path"]) for r in csv.DictReader(fh)}
+    repos = [l.strip().strip("/") for l in open(repos_file) if l.strip()]
+    rows, mrows, head, seen = [], [], None, set()
+    for orr in repos:
+        org, repo = orr.split("/", 1)
+        m = os.path.join(nt, "binary", "_state", org, repo, "manifest.csv")
+        if not os.path.isfile(m):
+            say("  %s: no manifest (extract not run or not finished) - nothing sent" % orr)
+            continue
+        with open(m, **KW) as fh:
+            rd = csv.DictReader(fh)
+            head = head or rd.fieldnames
+            got = Counter()
+            for r in rd:
+                mrows.append([r.get(k, "") for k in head])
+                st = (r.get("stored_as") or "").replace("\\", "/")
+                rel = st.split("/files/", 1)[1] if "/files/" in st else (st[6:] if st.startswith("files/") else "")
+                if not rel or (r["org"], r["repo"], r["path"]) not in keep:
+                    got["not sent: " + (r["action"] if not rel else "path not sent whole")] += 1
+                    continue
+                kept = os.path.join(nt, "binary", "files", rel)
+                if r["action"] == "written":
+                    src = kept if os.path.isfile(kept) else os.path.join(nt, "binary", "_not_sent", "files", rel)
+                elif r["action"] == "deduped" and not os.path.isfile(kept):
+                    src = os.path.join(nt, "binary", "_not_sent", "files", rel)
+                else:
+                    got["delivered before: " + r["action"]] += 1
+                    continue
+                got["send: " + r["action"]] += 1
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                rows.append([lab, "%s %s" % (tag, r["action"]), src,
+                             os.path.join(share_rel, "files", rel), r.get("bytes", "")])
+            say("  %s: %s" % (orr, dict(got)))
+    if head:
+        write_csv(os.path.join(s_track, tag + "_manifest.csv"), head, mrows)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rec", required=True, help="reconcile_copied_files.py --out folder")
+    ap.add_argument("--rec", help="reconcile_copied_files.py --out folder")
+    ap.add_argument("--whole", metavar="NOT_TEXT", help="a not_text folder: send --repos' whole files")
+    ap.add_argument("--repos", help="with --whole: org/repo a line")
+    ap.add_argument("--whole-share", default="group4_7_9/group1_binary",
+                    help="with --whole: their delivery folder under p1")
+    ap.add_argument("--tag", help="tracking file prefix (missing / no_pass2)")
     ap.add_argument("--only", action="append", default=[], metavar="LABEL")
     ap.add_argument("--skip", action="append", default=[], metavar="REASON", choices=SEND)
     ap.add_argument("--p1", default=P1, help="the share's p1 folder")
@@ -134,6 +203,9 @@ def main():
     ap.add_argument("--go", action="store_true", help="copy (default: dry run, plan only)")
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
+    if bool(a.rec) == bool(a.whole) or (a.whole and not a.repos):
+        sys.exit("give --rec, or --whole with --repos")
+    tag = a.tag or ("missing" if a.rec else "no_pass2")
     server = a.server.rstrip("/")
     s_track = server + "_tracking"
     share = os.path.join(a.p1, a.name)
@@ -143,15 +215,18 @@ def main():
             sys.exit("the share folder is inside the server folder: %s" % p)
     os.makedirs(s_track, exist_ok=True)
 
+    rows, c = [], Counter()
+    if a.whole:
+        rows = whole_rows(a.whole.rstrip("/"), a.repos, a.whole_share, s_track, tag)
     dst_of = {}
-    with open(os.path.join(a.rec, "summary.csv"), **KW) as fh:
-        for r in csv.DictReader(fh):
-            dst_of[r["delivery"]] = r["share"]
+    if a.rec:
+        with open(os.path.join(a.rec, "summary.csv"), **KW) as fh:
+            for r in csv.DictReader(fh):
+                dst_of[r["delivery"]] = r["share"]
     want = set(SEND) - set(a.skip)
 
-    rows, c = [], Counter()
-    with open(os.path.join(a.rec, "missing_files.csv"), **KW) as fh:
-        for r in csv.DictReader(fh):
+    with open(os.path.join(a.rec, "missing_files.csv"), **KW) if a.rec else open(os.devnull) as fh:
+        for r in csv.DictReader(fh) if a.rec else []:
             lab, why = r["delivery"], r["reason"]
             if a.only and lab not in a.only:
                 continue
@@ -175,9 +250,9 @@ def main():
                 renamed.append([lab, src, rel, new])
         c[(lab, why, act)] += 1
         plan.append([lab, why, src, new, n, act])
-    write_csv(os.path.join(s_track, "plan.csv"),
+    write_csv(os.path.join(s_track, tag + "_plan.csv"),
               ["delivery", "reason", "source_file", "rerun_path", "bytes", "action"], plan)
-    write_csv(os.path.join(s_track, "case_renamed.csv"),
+    write_csv(os.path.join(s_track, tag + "_case_renamed.csv"),
               ["delivery", "source_file", "path", "rerun_path"], renamed)
 
     say("plan (%s):" % ("copying" if a.go else "DRY RUN, nothing copied"))
@@ -202,7 +277,7 @@ def main():
                 say("  %s %s" % (got, p[2]))
             if i % 2000 == 0:
                 say("  %d / %d" % (i, len(todo)))
-    write_csv(os.path.join(s_track, "staged.csv"),
+    write_csv(os.path.join(s_track, tag + "_staged.csv"),
               ["delivery", "reason", "source_file", "rerun_path", "bytes", "action", "result"], staged)
     say("  %s" % dict(res))
     if res["FAILED"]:
@@ -229,12 +304,12 @@ def main():
             probs.append([rel, "size differs (server %d, share %d)" % (n, shr[k])])
     planned = {p[3] for p in todo}
     probs += [[rel, "on the server, not in this plan (earlier run?)"] for rel in sorted(srv) if rel not in planned]
-    write_csv(os.path.join(s_track, "check.csv"), ["path", "problem"], probs)
+    write_csv(os.path.join(s_track, tag + "_check.csv"), ["path", "problem"], probs)
     bad = sum(1 for p in probs if not p[1].startswith("on the server"))
     lines = ["server files %d, share files %d, planned %d" % (len(srv), len(shr), len(planned)),
              "not on share / size differs: %d" % bad,
              "on the server, not in this plan: %d" % (len(probs) - bad)]
-    with open(os.path.join(s_track, "check.txt"), "w", newline="\r\n") as fh:
+    with open(os.path.join(s_track, tag + "_check.txt"), "w", newline="\r\n") as fh:
         fh.write("\n".join(lines) + "\n")
     for l in lines:
         say("  " + l)
