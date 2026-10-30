@@ -157,11 +157,11 @@ What happened to each file:
 
 Report: `reports/history_only_update_2026-09-28.md`.
 
-**Failed repositories:** 7 repositories failed in the first extraction (`full_extract`: 6 `repo_error`, 1 `timeout`), and 4 more missed 11 files (found by `validate_group1_counts.py`, 1 Oct). **Correction (30 Oct):** an earlier version of this record said they were fixed because `full_extract_delta_2` marks them `ok`. That `ok` is empty: the delta step found nothing to process for them (`files: 0`, `lines_history: 0`, 0.0 s) because the first extraction had written nothing. Their Group 1 content (≈26,800 files: `sat-innovation-lab-program-office` 21,608, `globalpartnerworkloadtoolrevampcloud` 2,853, `iam-smime` 1,384, `ni-admrt-notification` 693, `aena-assistants-marketplace` 153, `powerbi-reports` 86, `2025-q-1-ai-powered-aml` 23) was never extracted or sent. Re-run 30 Oct, all 7 `ok` (the old `git log failed` / broken pipe errors no longer occur; the large repo, cut off at 904 s in September, took about 14 minutes with no time limit). Same steps and settings as the first run, in new folders: `file_added_lines.py` -> `full_extract_rerun` (26,734 files written, 10.3 M lines; 66 no text), `fill_at_head.py`, `file_delta.py` -> `full_extract_rerun_delta`: **25,888 files** (25,725 not in today's copy, sent whole; 163 with today's lines taken out; 846 with nothing left), 9.9 M lines. Sent to `p1/rerun/32_ext/full_extract_delta_2/<org>/<repo>/` by `resend_missing.py --repo-dirs` (23 under a `__case` name) [to confirm: copy result].
+**Failed repositories:** 7 repositories failed in the first extraction (`full_extract`: 6 `repo_error`, 1 `timeout`), and 4 more missed 11 files (found by `validate_group1_counts.py`, 1 Oct). **Correction (30 Oct):** an earlier version of this record said they were fixed because `full_extract_delta_2` marks them `ok`. That `ok` is empty: the delta step found nothing to process for them (`files: 0`, `lines_history: 0`, 0.0 s) because the first extraction had written nothing. Their Group 1 content (≈26,800 files: `sat-innovation-lab-program-office` 21,608, `globalpartnerworkloadtoolrevampcloud` 2,853, `iam-smime` 1,384, `ni-admrt-notification` 693, `aena-assistants-marketplace` 153, `powerbi-reports` 86, `2025-q-1-ai-powered-aml` 23) was never extracted or sent. Re-run 30 Oct, all 7 `ok` (the old `git log failed` / broken pipe errors no longer occur; the large repo, cut off at 904 s in September, took about 14 minutes with no time limit). Same steps and settings as the first run, in new folders: `file_added_lines.py` -> `full_extract_rerun` (26,734 files written, 10.3 M lines; 66 no text), `fill_at_head.py`, `file_delta.py` -> `full_extract_rerun_delta`: **25,888 files** (25,725 not in today's copy, sent whole; 163 with today's lines taken out; 846 with nothing left), 9.9 M lines. Sent to `p1/rerun/32_ext/full_extract_delta_2/<org>/<repo>/` by `resend_missing.py --repo-dirs` (23 under a `__case` name, 7 under a share-safe name): all 25,888 on the share at the server's size, 30 Oct (ALL DONE).
 
 **Share location:** `p1/32_ext/full_extract_delta_2`. No copy log for this delivery is on the project server [to confirm: who copied it and how].
 
-**Reconciliation (29 Oct, 7.7):** 6,838,128 files to send; 6,824,673 on the share. The difference is ≈13,444 files lost to case-only name clashes (two paths differing only in letter case; the share keeps one) and 11 files not on the share. The exact counts are being confirmed by a second run that separates real losses from folder-case differences.
+**Reconciliation (29 Oct, 7.7):** 6,838,128 files to send; 6,824,673 on the share. Confirmed by the second run (30 Oct): **13,452 files lost to case-only name clashes** (two paths differing only in letter case; the share keeps one) and **11 not on the share** (names the share refuses: `\`, `C:`, a folder name ending in a space). The 1,685 "size differs" of the first run were folder-case artefacts of the check (0 in the second run). All re-sent to `p1/rerun` (7.7).
 
 ### 5.2 Group 2: 27 types (1 Oct)
 
@@ -300,7 +300,7 @@ Every type in 4.3 (2,891 + 51 sheet issues) and 4.6 (148) was classified: catego
   **Found in the 29 Oct reconciliation (7.7), to fix:**
   - **43 text files not sent** (1 more inside 4.2): their names contain `.tmp.` (e.g. `….tmp.txt`), and the copy's exclude of temporary files (`*.tmp.*`) skipped them. The copy's own count check used the same exclude, so it reported OK.
   - **The 2 ELF programs were copied** (160 whole files instead of 158): the copy ran before they were moved out. They are to be removed from the share.
-- **4.7+4.9 group 1 whole files, history (29 Oct):** 5 repositories ended with `no_pass2`: the check of which old versions equal today's file was not done, so **their history versions were not extracted** (today's files were). To be run.
+- **4.7+4.9 group 1 whole files, history (29 Oct):** 5 repositories ended with `no_pass2`: the check of which old versions equal today's file was not done, so **their history versions were not extracted** (today's files were). **Closed 30 Oct:** pass 2 and the extract were run for the 5 (all `ok`). No history version of their whole-file paths differs from today's file (already delivered); the 4 `deduped` contents are in the delivered store; the 253 versions written belong to text paths already sent as `.txt` in `group1_text`, and were moved to `not_text/binary/_not_sent` (244 files) as the original filter does. Nothing to send.
 
 ---
 
@@ -422,7 +422,7 @@ Gaps found:
 - 77 runs. 4 had a failure, involving 20 repositories × run:
   - **8 fixed on a re-run** of the same run: 7 in 4.5_R (timeouts) and 1 in 4.7+4.9 group 1 text.
   - **7 in Group 1 `full_extract`** (6 `repo_error`, 1 `timeout`): marked `ok` in `full_extract_delta_2`, but with 0 files (nothing to take the delta of). **Open**, being re-extracted (5.1).
-  - **5 in 4.7+4.9 group 1 whole files, history (`no_pass2`):** history versions not extracted (5.8). **Open.**
+  - **5 in 4.7+4.9 group 1 whole files, history (`no_pass2`):** run 30 Oct; nothing was missing (5.8). **Closed.**
 - No repository failed in every run that covered it.
 
 ---
@@ -443,32 +443,31 @@ Gaps found:
 | L10 | **Group 4.5 run and delivered by another team on their machine** | Not reconciled by us; its 23,438 scanner results cannot be traced from here | Mapping requested from that team (29 Oct) |
 | L11 | **Case-only name clashes before 23 Oct** | 302 + 57 files overwritten on the share | 7.3 |
 | L12 | **Container data is large** (557 GB, single files up to 18 GB) | Scanner load | Agreed by the scanner team |
-| L13 | **Group 1: case-only name clashes on the share** (found 29 Oct) | ≈13,444 files not scanned (estimate) | Being confirmed (7.7); re-send under `__case2` names [to confirm] |
+| L13 | **Group 1: case-only name clashes on the share** (found 29 Oct) | 13,452 files not scanned | **Re-sent 30 Oct** to `p1/rerun` (7.7) [to confirm: scanned] |
 | L14 | **Temporary-file exclude also skipped real data** with `.tmp.` in the name | 45 files (43 + 1 mixed text, 1 Group 3 PDF) | To re-send; exclude to be narrowed (7.3) |
-| L15 | **4.7+4.9 group 1 whole files: 5 repositories' history not extracted** (`no_pass2`) | Their older versions not sent | To run (5.8) |
+| L15 | **4.7+4.9 group 1 whole files: 5 repositories' history not extracted** (`no_pass2`) | None: no differing history version on a whole-file path | **Closed 30 Oct** (5.8) |
 | L16 | **2 ELF programs on the share** (mixed whole files) | Programs delivered, against the decision | To remove (5.8) |
 
 ---
 
-## 9. Open items (29 Oct)
+## 9. Open items (30 Oct)
 
-1. **Confirm the case-clash losses** with the second reconciliation run (Group 1 ≈13,444, Group 2 text ≈98, Group 3 PDF ≈7), and the files present with another size; then re-send them under `__case2` names together with the 302 (4.2) and 57 (4.5_R) [to confirm: re-send approved].
-2. **Re-send the 45 `.tmp.`-named files** (mixed text 43 + 1, Group 3 PDF 1) and narrow the copies' temporary-file exclude.
+1. **Done 30 Oct - re-sent to `p1/rerun`** (`resend_missing.py`; same tree as the deliveries, tracking in `p1/rerun_tracking`): the 14,314 files the second reconciliation found missing (case lost 13,916, not on share 352 incl. the 334 below and 7 `LICENSE`, `.tmp.` names 45, size differs 1; 11 under a share-safe name) and the 7 Group 1 repositories (25,888). Every file checked on the share at the server's size. [to confirm: the scanner reads `p1/rerun`, not `p1/rerun_tracking`.]
+2. **Narrow the copies' temporary-file exclude** (`*.tmp.*` skipped 45 data files) and make the name check catch file-versus-folder case clashes.
 3. **Remove the 2 ELF programs** from `group4_7_9/mixed_binary` (after `--move-programs` on the server), then rebuild the whole-file index (204,277 files expected).
-4. **Run the 5 `no_pass2` repositories** (4.7+4.9 group 1 history) and send their files.
-5. **4.7+4.9 group 1 whole files (334):** confirm where they are on the share.
-6. **Group 1:** list the 11 files not on the share; confirm who copied Group 1 and how.
-7. **4.5:** mapping of `G45_` names to repositories, and its reconciliation, from the team that ran it.
-8. Whole-file index: copy it to `p1/whole_file_index_tracking/`.
-9. 10 proposed-exclude types (arff, xcuserstate, test-db, train, sublime-workspace, ftz, rsuser, 2ph, mmdb; jar1 list only): sampled 28 Oct, decision pending.
-10. 460 `.dbc` files that are plain notebook source (may hold storage keys): send as text or not.
-11. dxp / ppkg / ucs closed archives: open or not.
-12. 4.1_R samples review.
-13. Group 3 text: apply the one remaining case rename (4,928 → 4,929 on the share).
-14. Delete the removed duplicate container text from the server (317 GiB) once confirmed.
-15. [to confirm] Group 5, 4.4, 4.8 scope at repository level; OCR.
-16. [to confirm] CyberArk `cred-dont use` files treated as credentials.
-17. [to confirm] Origin of the 103 `Pack files` / `daily_archives` results in the scanner export.
+4. **4.7+4.9 group 1 whole files (334):** never copied (no share folder); sent to `p1/rerun` (item 1). [to confirm: why the copy's binary part did not run.]
+5. **Group 1:** confirm who copied Group 1 and how (the 11 files not on the share were names the share refuses; sent under share-safe names, item 1).
+6. **4.5:** mapping of `G45_` names to repositories, and its reconciliation, from the team that ran it.
+7. Whole-file index: copy it to `p1/whole_file_index_tracking/`.
+8. 10 proposed-exclude types (arff, xcuserstate, test-db, train, sublime-workspace, ftz, rsuser, 2ph, mmdb; jar1 list only): sampled 28 Oct, decision pending.
+9. 460 `.dbc` files that are plain notebook source (may hold storage keys): send as text or not.
+10. dxp / ppkg / ucs closed archives: open or not.
+11. 4.1_R samples review.
+12. Group 3 text: apply the one remaining case rename (4,928 → 4,929 on the share).
+13. Delete the removed duplicate container text from the server (317 GiB) once confirmed.
+14. [to confirm] Group 5, 4.4, 4.8 scope at repository level; OCR.
+15. [to confirm] CyberArk `cred-dont use` files treated as credentials.
+16. [to confirm] Origin of the 103 `Pack files` / `daily_archives` results in the scanner export.
 
 ---
 
