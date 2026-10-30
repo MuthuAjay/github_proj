@@ -69,9 +69,18 @@ runs already put in the server's rerun folder too (a file there under its
 own name keeps it; another case of it gets a __case name), and a rerun of
 the same command reuses its plan's names.
 
+Names the share cannot hold (it refuses \\ : * ? " < > | and control
+characters, and a name ending in a space or a dot - rsync "Invalid argument")
+are sent with each such character as _ ("Providers\\Data\\f.json.txt" ->
+"Providers_Data_f.json.txt", "C:\\Users" -> "C__Users", "python " ->
+"python_"), on the server and the share alike; old -> new in
+<tag>_case_renamed.csv with why = share name. Only this plan's files go to
+the share (rsync --files-from), and only they are checked there.
+
 Tracking (CRLF), each file named <tag>_... (tag: missing, no_pass2 with
 --whole, repos with --repo-dirs; --tag to change): plan.csv (delivery, reason, source_file,
-rerun_path, bytes, action), case_renamed.csv, with --go staged.csv (+ result)
+rerun_path, bytes, action), case_renamed.csv (+ why: case / share name),
+files.txt (the rsync list), with --go staged.csv (+ result)
 and check.csv (path, problem) and check.txt.
 """
 import argparse
@@ -99,6 +108,20 @@ def say(msg):
 
 def our_tmp(name):
     return bool(OUR_TMP.search(name)) or name.startswith(".tmp.")
+
+
+BAD_CH = re.compile(r'[\\:*?"<>|\x00-\x1f]')
+BAD_END = re.compile(r"[ .]+$")
+
+
+def share_safe(rel):
+    """each path part without what the share refuses (see the top)."""
+    parts = []
+    for x in rel.split("/"):
+        x = BAD_CH.sub("_", x)
+        x = BAD_END.sub(lambda m: "_" * len(m.group()), x)
+        parts.append(x)
+    return "/".join(parts)
 
 
 def case_name(rel, k):
@@ -289,6 +312,10 @@ def main():
                 else lab
             rows.append([lab, why, r["source_file"], os.path.join(base, r["share_file"]), r["bytes"]])
 
+    safe = {x[3]: share_safe(x[3]) for x in rows}
+    for x in rows:
+        x.append(x[3])               # the path as the source has it
+        x[3] = safe[x[3]]
     existing = listing(server) if os.path.isdir(server) else {}
     fixed, pp = {}, os.path.join(s_track, tag + "_plan.csv")
     if os.path.isfile(pp):
@@ -297,34 +324,39 @@ def main():
         by_src = {x[2]: x[3] for x in rows}
         low = {e.lower() for e in existing}
         for src, new in last:
-            if src not in by_src or not os.path.isfile(src):
+            if src not in by_src or not os.path.isfile(src) or share_safe(new) != new:
                 continue
             if new in existing and existing[new] == os.path.getsize(src) or \
                     new not in existing and new.lower() not in low:
                 fixed[by_src[src]] = new
     names = keep_apart({x[3] for x in rows}, existing, fixed)
     plan, renamed = [], []
-    for lab, why, src, rel, n in rows:
+    for lab, why, src, rel, n, orig in rows:
         new = names[rel]
         if not os.path.isfile(src):
             act = "left: source gone"
+        elif new != rel:
+            act = "send as __case"
+            renamed.append([lab, src, orig, new, "case" + (" + share name" if rel != orig else "")])
+        elif rel != orig:
+            act = "send as share name"
+            renamed.append([lab, src, orig, new, "share name"])
         else:
-            act = "send" if new == rel else "send as __case"
-            if new != rel:
-                renamed.append([lab, src, rel, new])
+            act = "send"
         c[(lab, why, act)] += 1
         plan.append([lab, why, src, new, n, act])
     write_csv(os.path.join(s_track, tag + "_plan.csv"),
               ["delivery", "reason", "source_file", "rerun_path", "bytes", "action"], plan)
     write_csv(os.path.join(s_track, tag + "_case_renamed.csv"),
-              ["delivery", "source_file", "path", "rerun_path"], renamed)
+              ["delivery", "source_file", "path", "rerun_path", "why"], renamed)
 
     say("plan (%s):" % ("copying" if a.go else "DRY RUN, nothing copied"))
     for (lab, why, act), n in sorted(c.items()):
         say("  %-40s %-18s %-32s %7d" % (lab, why, act, n))
     todo = [p for p in plan if p[5].startswith("send")]
-    say("to send: %d file(s), %.1f MB, %d under a __case name" % (
-        len(todo), sum(int(p[4] or 0) for p in todo) / 1e6, len(renamed)))
+    say("to send: %d file(s), %.1f MB, %d under a __case name, %d under a share name" % (
+        len(todo), sum(int(p[4] or 0) for p in todo) / 1e6,
+        sum(1 for p in todo if p[5] == "send as __case"), sum(1 for p in todo if p[5] == "send as share name")))
     say("  server %s, share %s, tracking %s and %s" % (server, share, s_track, sh_track))
     if not a.go:
         return
@@ -352,27 +384,32 @@ def main():
     # -------------------------------------------------------- 2. the share
     say("=== 2. share -> %s" % share)
     os.makedirs(share, exist_ok=True)
-    rc = subprocess.call(RSYNC + ["--exclude", "*.tmp.copy", server + "/", share + "/"])
-    say("  rsync exit %d" % rc)
+    fl = os.path.join(s_track, tag + "_files.txt")
+    with open(fl, "wb") as fh:
+        fh.write(b"".join(os.fsencode(p[3]) + b"\0" for p in todo))
+    rc = subprocess.call(RSYNC + ["--from0", "--files-from", fl, server + "/", share + "/"])
+    say("  rsync exit %d (%d file(s) of this plan)" % (rc, len(todo)))
 
     # ------------------------------------------------------- 3. the check
-    say("=== 3. check: server against share")
-    srv, shr = listing(server), listing(share)
-    low = {k.lower(): k for k in shr}
-    probs = []
-    for rel, n in sorted(srv.items()):
-        k = rel if rel in shr else low.get(rel.lower())
-        if k is None:
-            probs.append([rel, "not on share"])
-        elif shr[k] != n:
-            probs.append([rel, "size differs (server %d, share %d)" % (n, shr[k])])
-    planned = {p[3] for p in todo}
-    probs += [[rel, "on the server, not in this plan (earlier run?)"] for rel in sorted(srv) if rel not in planned]
+    say("=== 3. check: this plan's files, server against share")
+
+    def both(rel):
+        try:
+            n = os.stat(os.path.join(server, rel)).st_size
+        except OSError:
+            return [rel, "not on the server"]
+        try:
+            m = os.stat(os.path.join(share, rel)).st_size
+        except OSError:
+            return [rel, "not on share"]
+        return None if m == n else [rel, "size differs (server %d, share %d)" % (n, m)]
+    planned = sorted({p[3] for p in todo})
+    with ThreadPoolExecutor(a.workers) as ex:
+        probs = [x for x in ex.map(both, planned) if x]
     write_csv(os.path.join(s_track, tag + "_check.csv"), ["path", "problem"], probs)
-    bad = sum(1 for p in probs if not p[1].startswith("on the server"))
-    lines = ["server files %d, share files %d, planned %d" % (len(srv), len(shr), len(planned)),
-             "not on share / size differs: %d" % bad,
-             "on the server, not in this plan: %d" % (len(probs) - bad)]
+    bad = len(probs)
+    lines = ["planned %d, on share at the server's size %d" % (len(planned), len(planned) - bad),
+             "not on share / size differs: %d" % bad]
     with open(os.path.join(s_track, tag + "_check.txt"), "w", newline="\r\n") as fh:
         fh.write("\n".join(lines) + "\n")
     for l in lines:

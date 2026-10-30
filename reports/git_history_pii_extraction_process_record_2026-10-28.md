@@ -109,7 +109,7 @@ The workbook's "All Versions" column is wrong for some rows (lookup errors), so 
 
 | Group | Content | Route | Status (29 Oct) |
 |---|---|---|---|
-| 1 | 32 text types | Text, with delta | Delivered (27 Sep; failed repositories re-run in `full_extract_delta_2`). Reconciliation 29 Oct: ≈13,400 files lost to case-only name clashes on the share, being confirmed (7.7) |
+| 1 | 32 text types | Text, with delta | Delivered (27 Sep). 7 repositories that failed in the first extraction were never extracted (≈26,800 files, 5.1), being re-run (30 Oct). Reconciliation 30 Oct: 13,452 files lost to case-only name clashes on the share, re-sent to `rerun` (7.7) |
 | 2 | 27 types: 9 text + 18 whole (Office, images, email, certificates) | Text with delta / whole files minus identical-to-today | Delivered (1 Oct) |
 | 3 | pdf, pkl | PDF merged per path; pkl as text | Delivered (≈5 Oct) |
 | 4.1 | 28 database types | **Path list only** at repository level; **inside archives sent whole** (28 Oct) | Path list built (7 Oct) [to confirm: copied to the share]; inside archives delivered 28 Oct (5.5) |
@@ -157,7 +157,7 @@ What happened to each file:
 
 Report: `reports/history_only_update_2026-09-28.md`.
 
-**Failed repositories:** 7 repositories failed in the first extraction (`full_extract`: 6 `repo_error`, 1 `timeout`), and 4 more missed 11 files (found by `validate_group1_counts.py`, 1 Oct). They were re-run in `full_extract_delta_2`, the run that was delivered, and are all `ok` there (checked 29 Oct, `repo_errors_all_runs.py`).
+**Failed repositories:** 7 repositories failed in the first extraction (`full_extract`: 6 `repo_error`, 1 `timeout`), and 4 more missed 11 files (found by `validate_group1_counts.py`, 1 Oct). **Correction (30 Oct):** an earlier version of this record said they were fixed because `full_extract_delta_2` marks them `ok`. That `ok` is empty: the delta step found nothing to process for them (`files: 0`, `lines_history: 0`, 0.0 s) because the first extraction had written nothing. Their Group 1 content (≈26,800 files: `sat-innovation-lab-program-office` 21,608, `globalpartnerworkloadtoolrevampcloud` 2,853, `iam-smime` 1,384, `ni-admrt-notification` 693, `aena-assistants-marketplace` 153, `powerbi-reports` 86, `2025-q-1-ai-powered-aml` 23) was never extracted or sent. Re-run 30 Oct, all 7 `ok` (the old `git log failed` / broken pipe errors no longer occur; the large repo, cut off at 904 s in September, took about 14 minutes with no time limit). Same steps and settings as the first run, in new folders: `file_added_lines.py` -> `full_extract_rerun` (26,734 files written, 10.3 M lines; 66 no text), `fill_at_head.py`, `file_delta.py` -> `full_extract_rerun_delta`: **25,888 files** (25,725 not in today's copy, sent whole; 163 with today's lines taken out; 846 with nothing left), 9.9 M lines. Sent to `p1/rerun/32_ext/full_extract_delta_2/<org>/<repo>/` by `resend_missing.py --repo-dirs` (23 under a `__case` name) [to confirm: copy result].
 
 **Share location:** `p1/32_ext/full_extract_delta_2`. No copy log for this delivery is on the project server [to confirm: who copied it and how].
 
@@ -421,7 +421,7 @@ Gaps found:
 - Scope step: the 202 repositories left out (all `repo_missing`, 2.1).
 - 77 runs. 4 had a failure, involving 20 repositories × run:
   - **8 fixed on a re-run** of the same run: 7 in 4.5_R (timeouts) and 1 in 4.7+4.9 group 1 text.
-  - **7 in Group 1 `full_extract`** (6 `repo_error`, 1 `timeout`): `ok` in `full_extract_delta_2`, the delivered run.
+  - **7 in Group 1 `full_extract`** (6 `repo_error`, 1 `timeout`): marked `ok` in `full_extract_delta_2`, but with 0 files (nothing to take the delta of). **Open**, being re-extracted (5.1).
   - **5 in 4.7+4.9 group 1 whole files, history (`no_pass2`):** history versions not extracted (5.8). **Open.**
 - No repository failed in every run that covered it.
 
@@ -434,7 +434,7 @@ Gaps found:
 | L1 | **No OCR** | 13,449 PDF pages (Group 3) and 2,027 pages inside archives have no text layer. The scanner skipped **137,589 images** in group 2 (`skipped_ocr_required`) and 10,448 binaries with no parser, so only about 78,000 of 228,676 group 2 files were actually scanned | Listed per page / file; raised with the user (7 Oct). [to confirm: decision on OCR] |
 | L2 | **202 repositories not available** | Not analysed | Search documented (2.1) |
 | L3 | **Git LFS pointers** | Content not in the archive (20,552 versions in group 2; 1,760 parquet versions; others) | Counted and listed |
-| L4 | **Group 1: 7 repositories failed in the first extraction**, 4 more missed 11 files | Was a gap in group 1 | **Closed:** re-run in `full_extract_delta_2`, all `ok` (checked 29 Oct, 5.1) |
+| L4 | **Group 1: 7 repositories failed in the first extraction**, 4 more missed 11 files | Was a gap in group 1 | **Open (reopened 30 Oct):** the `ok` in `full_extract_delta_2` is empty (0 files); being re-extracted and sent to `rerun` (5.1) |
 | L5 | **Branch information not in the archive** | 31% of history-only own files can't be placed on a branch | Content extracted regardless (P2) |
 | L6 | **Out of scope by decision:** credentials/keys (16 types), dll/exe programs, 4.4; 4.8 and Group 5 (277,516 no-extension files incl. `.env`) at repository level | Not scanned (4.8 and Group 5 files inside archives were sent, 5.5) | Decision log (6) |
 | L7 | **Damaged or unreadable files** | Not read: 450 PDF versions, 5 damaged pbix versions, 15 archives, 1 pbix table, and others | Listed in each run's summary |
