@@ -55,8 +55,22 @@ their whole files instead of --rec's list:
        (default group4_7_9/group1_binary, where the first copy put them)
   the repos' manifest rows go to the tracking as no_pass2_manifest.csv.
 
-Tracking (CRLF), each file named <tag>_... (tag: missing, or no_pass2 with
---whole; --tag to change): plan.csv (delivery, reason, source_file,
+Whole repo folders (--repo-dirs, e.g. the 7 repos that failed in Group 1's
+first extraction, full_extract, and were re-run in full_extract_delta_2):
+every file under <repo-dirs>/<org>/<repo>/ for each repo of --repos, sent
+whether or not the share already has it:
+
+    python3 resend_missing.py --repo-dirs /data/workarea/full_extract_delta_2 \
+        --repos /home/ganeshk/fe7.txt
+    -> rerun/<--repo-share>/<org>/<repo>/<path>  (default 32_ext/full_extract_delta_2)
+
+The runs share one rerun tree: names are kept apart against what earlier
+runs already put in the server's rerun folder too (a file there under its
+own name keeps it; another case of it gets a __case name), and a rerun of
+the same command reuses its plan's names.
+
+Tracking (CRLF), each file named <tag>_... (tag: missing, no_pass2 with
+--whole, repos with --repo-dirs; --tag to change): plan.csv (delivery, reason, source_file,
 rerun_path, bytes, action), case_renamed.csv, with --go staged.csv (+ result)
 and check.csv (path, problem) and check.txt.
 """
@@ -94,13 +108,24 @@ def case_name(rel, k):
     return os.path.join(d, new)
 
 
-def keep_apart(rels):
+def keep_apart(rels, existing=(), fixed=None):
     """rel -> rel on the share: paths equal but for case, or a file where
-    another path has a folder, get __case<n> names (first sorted keeps its)."""
-    dirs = {os.path.dirname(r).lower() for r in rels}
+    another path has a folder, get __case<n> names (first sorted keeps its).
+    existing: rel paths already in the rerun folder (earlier runs) - one of
+    them keeps its name, another case of it is renamed; fixed: rel -> name
+    from this command's last plan, kept."""
+    fixed = fixed or {}
+    dirs = {os.path.dirname(r).lower() for r in list(rels) + list(existing)}
     dirs = {d for x in dirs for d in [x] + [x.rsplit("/", i)[0] for i in range(1, x.count("/") + 1)]}
-    taken, out = set(dirs), {}
+    taken = set(dirs) | {e.lower() for e in existing} | {v.lower() for v in fixed.values()}
+    have, out = set(existing), {}
     for r in sorted(rels):
+        if r in fixed:
+            out[r] = fixed[r]
+            continue
+        if r in have:
+            out[r] = r
+            continue
         new, k = r, 2
         while new.lower() in taken:
             new, k = case_name(r, k), k + 1
@@ -187,6 +212,27 @@ def whole_rows(nt, repos_file, share_rel, s_track, tag):
     return rows
 
 
+def repo_rows(root, repos_file, share_rel):
+    lab = os.path.relpath(root, "/data/workarea") if root.startswith("/data/workarea/") else root
+    rows = []
+    for orr in [l.strip().strip("/") for l in open(repos_file) if l.strip()]:
+        d = os.path.join(root, orr)
+        if not os.path.isdir(d):
+            say("  %s: no folder %s - nothing sent" % (orr, d))
+            continue
+        n = 0
+        for dp, _, fs in os.walk(d):
+            for f in fs:
+                if our_tmp(f):
+                    continue
+                p = os.path.join(dp, f)
+                rows.append([lab, "repo folder", p, os.path.join(share_rel, os.path.relpath(p, root)),
+                             str(os.path.getsize(p))])
+                n += 1
+        say("  %s: %d file(s)" % (orr, n))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rec", help="reconcile_copied_files.py --out folder")
@@ -194,6 +240,9 @@ def main():
     ap.add_argument("--repos", help="with --whole: org/repo a line")
     ap.add_argument("--whole-share", default="group4_7_9/group1_binary",
                     help="with --whole: their delivery folder under p1")
+    ap.add_argument("--repo-dirs", metavar="ROOT", help="send --repos' whole folders under ROOT")
+    ap.add_argument("--repo-share", default="32_ext/full_extract_delta_2",
+                    help="with --repo-dirs: their delivery folder under p1")
     ap.add_argument("--tag", help="tracking file prefix (missing / no_pass2)")
     ap.add_argument("--only", action="append", default=[], metavar="LABEL")
     ap.add_argument("--skip", action="append", default=[], metavar="REASON", choices=SEND)
@@ -203,9 +252,9 @@ def main():
     ap.add_argument("--go", action="store_true", help="copy (default: dry run, plan only)")
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
-    if bool(a.rec) == bool(a.whole) or (a.whole and not a.repos):
-        sys.exit("give --rec, or --whole with --repos")
-    tag = a.tag or ("missing" if a.rec else "no_pass2")
+    if sum(map(bool, (a.rec, a.whole, a.repo_dirs))) != 1 or (not a.rec and not a.repos):
+        sys.exit("give --rec, or --whole / --repo-dirs with --repos")
+    tag = a.tag or ("missing" if a.rec else "no_pass2" if a.whole else "repos")
     server = a.server.rstrip("/")
     s_track = server + "_tracking"
     share = os.path.join(a.p1, a.name)
@@ -218,6 +267,8 @@ def main():
     rows, c = [], Counter()
     if a.whole:
         rows = whole_rows(a.whole.rstrip("/"), a.repos, a.whole_share, s_track, tag)
+    if a.repo_dirs:
+        rows = repo_rows(a.repo_dirs.rstrip("/"), a.repos, a.repo_share)
     dst_of = {}
     if a.rec:
         with open(os.path.join(a.rec, "summary.csv"), **KW) as fh:
@@ -238,7 +289,20 @@ def main():
                 else lab
             rows.append([lab, why, r["source_file"], os.path.join(base, r["share_file"]), r["bytes"]])
 
-    names = keep_apart({x[3] for x in rows})
+    existing = listing(server) if os.path.isdir(server) else {}
+    fixed, pp = {}, os.path.join(s_track, tag + "_plan.csv")
+    if os.path.isfile(pp):
+        with open(pp, **KW) as fh:
+            last = {(r["source_file"], r["rerun_path"]) for r in csv.DictReader(fh)}
+        by_src = {x[2]: x[3] for x in rows}
+        low = {e.lower() for e in existing}
+        for src, new in last:
+            if src not in by_src or not os.path.isfile(src):
+                continue
+            if new in existing and existing[new] == os.path.getsize(src) or \
+                    new not in existing and new.lower() not in low:
+                fixed[by_src[src]] = new
+    names = keep_apart({x[3] for x in rows}, existing, fixed)
     plan, renamed = [], []
     for lab, why, src, rel, n in rows:
         new = names[rel]
